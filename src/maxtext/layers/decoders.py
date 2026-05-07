@@ -1110,7 +1110,10 @@ class Decoder(nn.Module):
 
     # When initializing with vLLM RPA attention, we need to run the output head to
     # initialize any parameters associated with it.
-    if self.is_initializing() and cfg.attention == "vllm_rpa":
+    # Register output_head params at init when forward path skips apply_output_head
+    # (vllm_rpa attention OR vocab tiling in TRAIN mode). Otherwise decoder_norm is
+    # never saved in checkpoints → inference fails on missing param.
+    if self.is_initializing() and (cfg.attention == "vllm_rpa" or cfg.num_vocab_tiling > 1 ) :
       _ = self.apply_output_head(shared_embedding, hidden_state, deterministic, model_mode)
 
     # When invoking from vLLM with RPA attention, logit computation is deferred to a later stage.
