@@ -20,8 +20,6 @@ import warnings
 from threading import current_thread
 from typing import Any, Iterable, TYPE_CHECKING
 
-from jinja2 import TemplateError
-
 if TYPE_CHECKING:
   import datasets
   import tensorflow as tf
@@ -122,7 +120,7 @@ def merge_image_columns(example, image_columns, max_num_images_per_example):
   return example
 
 
-def pre_process_image_sft(example, image_column, model_name):
+def pre_process_image_sft(example, image_column, config):
   """pre-process image for multimodal SFT"""
 
   def _process_image_fn(image):
@@ -131,7 +129,7 @@ def pre_process_image_sft(example, image_column, model_name):
     else:
       image = np.array(mm_utils.convert_to_RGB(image))
 
-    image = mm_processor.preprocess_image_for_training(image, model_name)
+    image = mm_processor.preprocess_image_for_training(image, config)
     return image
 
   example[image_column] = _process_image_fn(example[image_column])
@@ -282,12 +280,21 @@ def _get_completion_in_chat_template(tokenizer_model, round_msgs, tools=None):
   """
   Calculates the completion part of a conversation turn when formatted with a chat template.
 
-  This function handles both older and current Hugging Face tokenizers. Modern tokenizers
-  may return a `BatchEncoding` object instead of a simple list of token IDs.
+  Uses the longest-common-prefix between the full conversation tokens and the
+  generation-prompt tokens to locate where the completion starts.
+
+  For most models (Llama, Qwen, …) the generation prompt is an exact prefix of the
+  full conversation, so common_len == len(prompt_ids).
+
+  For Gemma4, add_generation_prompt=True emits thinking-channel tokens
+  (<|channel>thought\\n<channel|>) that diverge from the plain conversation
+  at the model-turn boundary. The common prefix ends just before that
+  divergence, and the completion correctly captures the thinking content
+  and response tokens.
 
   Args:
     tokenizer_model: The tokenizer instance.
-    round_msgs: A list of messages for the current conversational turn, including the assistant's response.
+    round_msgs: Messages for the current conversational turn including the assistant response.
 
   Returns:
     A string representing the completion formatted by the chat template.
@@ -300,9 +307,24 @@ def _get_completion_in_chat_template(tokenizer_model, round_msgs, tools=None):
   prompt_completion_ids = extract_token_ids(prompt_completion_tokens)
   prompt_ids = extract_token_ids(prompt_tokens)
 
-  completion_tokens = prompt_completion_ids[len(prompt_ids) :]
-  completion_in_chat_template = tokenizer_model.decode(completion_tokens, skip_special_tokens=False)
-  return completion_in_chat_template
+  # Walk forward until the two sequences diverge
+  common_len = 0
+  for full_id, prompt_id in zip(prompt_completion_ids, prompt_ids):
+    if full_id == prompt_id:
+      common_len += 1
+    else:
+      break
+
+  if common_len == 0:
+    raise ValueError(
+        "Chat template generation prompt mismatch: no common prefix tokens found.\n"
+        f"Full conversation tokens: {prompt_completion_ids} ('{tokenizer_model.decode(prompt_completion_ids)}')\n"
+        f"Generation prompt tokens: {prompt_ids} ('{tokenizer_model.decode(prompt_ids)}')\n"
+        "Cannot determine completion boundary."
+    )
+
+  completion_tokens = prompt_completion_ids[common_len:]
+  return tokenizer_model.decode(completion_tokens, skip_special_tokens=False)
 
 
 def apply_chat_template(example, tokenizer_model, data_column_name, tools_column_name=None):
@@ -664,10 +686,15 @@ def make_tfrecord_iter_dataset(path: str):
 
 @dataclasses.dataclass
 class ParseFeatures(grain.MapTransform):
-  """Parse serialized example"""
+  """Parse serialized tf.train.Example protos for arrayrecord/tfrecord datasets.
+
+  Also validates that the stored field type matches `tokenize`: raises
+  ValueError if `tokenize=True` but the column contains integers (pre-tokenized)
+  or if `tokenize=False` but the column contains bytes (raw text).
+  """
 
   def __init__(self, data_columns, tokenize):
-    self.data_columns = data_columns
+    self.data_columns = list(data_columns)
     self.tokenize = tokenize
 
   def map(self, element):
@@ -676,14 +703,36 @@ class ParseFeatures(grain.MapTransform):
     example.ParseFromString(element)
     features = example.features.feature
 
+    missing = [c for c in self.data_columns if c not in features]
+    if missing:
+      raise ValueError(
+          f"Column {missing} not found in dataset. Available columns: {sorted(features.keys())}. "
+          "Please set train_data_columns or eval_data_columns accordingly."
+      )
+
     parsed = {}
     for col in self.data_columns:
       if col in features:
         f = features[col]
-        if self.tokenize:
+
+        # Dynamically check proto field type instead of relying on the tokenize flag
+        if len(f.float_list.value) > 0:
+          parsed[col] = np.array(f.float_list.value, dtype=np.float32)
+        elif len(f.int64_list.value) > 0:
+          parsed[col] = np.array(f.int64_list.value, dtype=np.int32)
+        elif len(f.bytes_list.value) > 0:
           parsed[col] = np.array(f.bytes_list.value, dtype=object)
         else:
-          parsed[col] = np.array(f.int64_list.value, dtype=np.int32)
+          parsed[col] = np.array([])
+
+    # Reshape the flattened arrays back to 2D [seq_len, top_k]
+    seq_len = len(parsed.get("inputs", []))
+    if seq_len > 0:
+      if "top_k_logits" in parsed and len(parsed["top_k_logits"]) > 0:
+        parsed["top_k_logits"] = parsed["top_k_logits"].reshape(seq_len, -1)
+      if "top_k_indices" in parsed and len(parsed["top_k_indices"]) > 0:
+        parsed["top_k_indices"] = parsed["top_k_indices"].reshape(seq_len, -1)
+
     return parsed
 
 
@@ -704,24 +753,46 @@ class NormalizeFeatures(grain.MapTransform):
 
 @dataclasses.dataclass
 class KeepFeatures(grain.MapTransform):
-  """Keep only specified features in the dataset element.
+  """Filter dataset elements to specified features for parquet and other non-proto formats.
 
-  This transform filters the input dictionary, retaining only the keys
-  that are present in `feature_names`.
+  Retains only the keys present in `feature_names`. Validates the stored value
+  type against `tokenize`: raises ValueError if `tokenize=True` but a column
+  contains integer data (pre-tokenized), or if `tokenize=False` but a column
+  contains string/bytes data (raw text).
   """
 
-  def __init__(self, feature_names: list[str]):
-    """Initializes the KeepFeatures transform.
-
-    Args:
-      feature_names: A list of strings, where each string is the name of a
-        feature to be kept in the dataset element.
-    """
+  def __init__(self, feature_names: list[str], tokenize: bool = True):
     self.feature_names = feature_names
+    self.tokenize = tokenize
 
   def map(self, element: dict[str, Any]) -> dict[str, Any]:
     """Applies the feature filtering to the input element."""
-    return {k: v for k, v in element.items() if k in self.feature_names}
+    missing = [n for n in self.feature_names if n not in element]
+    if missing:
+      raise ValueError(
+          f"Column {missing} not found in dataset. Available columns: {sorted(element.keys())}. "
+          "Please set train_data_columns or eval_data_columns accordingly."
+      )
+    filtered = {k: v for k, v in element.items() if k in self.feature_names}
+    for col, val in filtered.items():
+      if self.tokenize:
+        if isinstance(val, np.ndarray) and np.issubdtype(val.dtype, np.integer):
+          raise ValueError(
+              f"tokenize_data=True but column '{col}' contains integer (pre-tokenized) data. "
+              "Set tokenize_train_data or tokenize_eval_data to False if your dataset is already tokenized."
+          )
+        if isinstance(val, (list, tuple)) and val and isinstance(val[0], (int, np.integer)):
+          raise ValueError(
+              f"tokenize_data=True but column '{col}' contains integer (pre-tokenized) data. "
+              "Set tokenize_train_data or tokenize_eval_data to False if your dataset is already tokenized."
+          )
+      else:
+        if isinstance(val, (str, bytes)):
+          raise ValueError(
+              f"tokenize_data=False but column '{col}' contains text data. "
+              "Set tokenize_train_data or tokenize_eval_data to True if your dataset needs tokenization."
+          )
+    return filtered
 
 
 @dataclasses.dataclass
@@ -821,6 +892,9 @@ class PadOrTrimToMaxLength(grain.MapTransform):
 
     if preprocessed_image.pixel_values is None:
       raise ValueError("Input preprocessed_image must have pixel_values to pad images.")
+
+    if self.config.model_name and self.config.model_name.startswith("qwen3-omni"):
+      return preprocessed_image
 
     # Determine the maximum number of images/masks allowed.
     image_offsets = mm_processor.get_image_offsets(self.config, preprocessed_image)

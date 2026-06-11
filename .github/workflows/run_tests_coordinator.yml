@@ -47,6 +47,15 @@ on:
         description: 'If false, maxtext_sha must be provided for checkout'
         type: boolean
         default: false
+      is_update_hlo:
+        required: false
+        type: boolean
+        default: false
+      additional_pytest_args:
+        description: 'Additional pytest arguments to pass during test execution'
+        required: false
+        type: string
+        default: ''
 
 permissions:
   contents: read
@@ -57,7 +66,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        worker_group: ${{ fromJSON(contains(inputs.flavor, 'cpu-unit') && '[1, 2]' || '[1]') }}
+        worker_group: ${{ fromJSON(contains(inputs.flavor, 'cpu-unit') && '[1, 2, 3, 4]' || '[1]') }}
 
     uses: ./.github/workflows/run_tests_against_package.yml
     with:
@@ -94,8 +103,8 @@ jobs:
           "tpu-post-training-integration": "linux-x86-ct6e-180-4tpu",
           "gpu-unit": "linux-x86-a2-48-a100-4gpu",
           "gpu-integration": "linux-x86-a2-48-a100-4gpu",
-          "cpu-unit": "linux-x86-n2-16",
-          "cpu-post-training-unit": "linux-x86-n2-16"
+          "cpu-unit": "linux-x86-n2-32",
+          "cpu-post-training-unit": "linux-x86-n2-32"
         }')[inputs.flavor] }}
       # Pytest Marker Mapping
       pytest_marker: >-
@@ -133,6 +142,7 @@ jobs:
             "cpu-unit": "--ignore=tests/post_training",
             "cpu-post-training-unit": ""
           }')[inputs.flavor] }}
+        ${{ inputs.additional_pytest_args }}
 
       # Resource Scaling
       xla_python_client_mem_fraction: "${{ contains(inputs.flavor, 'gpu') && '0.65' || '0.75' }}"
@@ -148,5 +158,6 @@ jobs:
       is_scheduled_run: ${{ inputs.is_scheduled_run }}
       maxtext_installed: ${{ inputs.maxtext_installed }}
       worker_group: ${{ matrix.worker_group }}
-      total_workers: ${{ contains(inputs.flavor, 'cpu-unit') && 2 || 1 }}
+      total_workers: ${{ contains(inputs.flavor, 'cpu-unit') && 4 || 1 }}
       maxtext_sha: ${{ inputs.maxtext_sha }}
+      is_update_hlo: ${{ inputs.is_update_hlo }}

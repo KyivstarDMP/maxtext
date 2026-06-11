@@ -3,7 +3,6 @@ aqtp
 array-record
 chex
 cloud-accelerator-diagnostics
-cloud-tpu-diagnostics!=1.1.14
 datasets
 drjax
 flax
@@ -13,7 +12,7 @@ google-cloud-aiplatform
 google-cloud-mldiagnostics
 google-cloud-monitoring
 grain[parquet]
-huggingface_hub
+huggingface_hub>=1.14.0
 jax
 jaxlib
 jaxtyping
@@ -44,6 +43,6 @@ tensorflow-text
 tensorflow
 tiktoken
 tokamax!=0.1.0
-transformers
+transformers>=5.8.0
 uvloop
-qwix
+qwix>=0.1.6

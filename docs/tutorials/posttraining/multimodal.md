@@ -38,6 +38,8 @@ Then use this command to convert an unscanned checkpoint from HuggingFace to Max
 ```shell
 # Your Hugging Face access token. Required to download gated models like Llama.
 # You can generate one at https://huggingface.co/settings/tokens.
+# We explicitly set lazy_load_tensors to False here as lazy loading of tensors
+# is not supported when use_multimodal is True.
 export HF_TOKEN=<Hugging Face access token>
 export MAXTEXT_CKPT_PATH=<Checkpoint GCS path> # gs://my-bucket/path
 python -m maxtext.checkpoint_conversion.to_maxtext \
@@ -45,7 +47,8 @@ python -m maxtext.checkpoint_conversion.to_maxtext \
     hf_access_token=${HF_TOKEN?} \
     base_output_directory=${MAXTEXT_CKPT_PATH?} \
     use_multimodal=true \
-    scan_layers=false
+    scan_layers=false \
+    --lazy_load_tensors=False
 ```
 
 For the Llama4 model family, we are using a separate checkpoint conversion script (of note, we will gradually migrate all checkpoint conversion scripts to the above consolidated tool soon):
@@ -127,10 +130,10 @@ Supervised Fine-Tuning (SFT) of multimodal LLMs in MaxText focuses specifically 
 Here, we use [ChartQA](https://huggingface.co/datasets/HuggingFaceM4/ChartQA) as an example to demonstrate SFT functionality:
 
 ```shell
-export MAXTEXT_CKPT_PATH=...  # either set to an already available MaxText ckpt or to the one we just converted in the previous step
-export BASE_OUTPUT_DIRECTORY=gs://...
+export MAXTEXT_CKPT_PATH=<your-checkpoints-path>  # either set to an already available MaxText ckpt or to the one we just converted in the previous step
+export BASE_OUTPUT_DIRECTORY=gs://<GCS_BUCKET>
 export STEPS=1000
-python -m maxtext.trainers.post_train.sft.train_sft_deprecated \
+python -m maxtext.trainers.post_train.sft.train_sft_native \
     src/maxtext/configs/post_train/sft-vision-chartqa.yml \
     run_name="chartqa-sft" \
     model_name=gemma3-4b \

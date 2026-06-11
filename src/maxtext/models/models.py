@@ -26,14 +26,13 @@ from flax import linen as nn
 from flax import nnx
 
 from maxtext.common.common_types import Config, DECODING_ACTIVE_SEQUENCE_INDICATOR, MODEL_MODE_AUTOREGRESSIVE, MODEL_MODE_TRAIN, MultimodalInput
-from maxtext.inference import page_manager
 from maxtext.layers.nnx_decoders import NNXDecoder
 from maxtext.layers import initializers
 from maxtext.layers import nnx_wrappers
 from maxtext.layers.decoders import Decoder
 from maxtext.layers.embeddings import Embed, embed_as_linen
 from maxtext.layers.encoders import AudioEncoder, VisionEncoder, audio_encoder_as_linen, vision_encoder_as_linen
-from maxtext.layers.multi_token_prediction import multi_token_prediction_block_as_linen
+from maxtext.layers.multi_token_prediction import MultiTokenPredictionBlock, multi_token_prediction_block_as_linen
 from maxtext.layers.quantizations import AqtQuantization as Quant
 from maxtext.multimodal import processor as mm_processor
 from maxtext.utils import max_utils
@@ -108,7 +107,7 @@ class TransformerLinenPure(nn.Module):
           rngs=self.make_rng("mtp_block"),
       )
 
-  def logits_from_hidden_states(self, hidden_states, deterministic, model_mode):
+  def logits_from_hidden_states_for_vocab_tiling(self, hidden_states, deterministic, model_mode):
     """
     Compute logits from hidden states (wrapping decoder.apply_output_head).
     This function is only used for vocabulary tiling.
@@ -128,13 +127,14 @@ class TransformerLinenPure(nn.Module):
       decoder_segment_ids=None,
       encoder_images: None | jnp.ndarray = None,
       encoder_image_masks: None | jnp.ndarray = None,
+      encoder_videos: None | jnp.ndarray = None,
+      encoder_video_masks: None | jnp.ndarray = None,
       encoder_audios: None | jnp.ndarray = None,
       enable_dropout=True,
       model_mode=MODEL_MODE_TRAIN,
       previous_chunk=None,
       true_length: None | int = None,
       slot: None | int = None,
-      page_state: None | page_manager.PageState = None,
       decoder_target_tokens: None | jnp.ndarray = None,
       decoder_target_mask: None | jnp.ndarray = None,
       nnx_method=None,
@@ -155,8 +155,10 @@ class TransformerLinenPure(nn.Module):
           f" which is always {DECODING_ACTIVE_SEQUENCE_INDICATOR}."
       )
 
-    bidirectional_mask = None
+    bidirectional_mask_image = None
+    bidirectional_mask_video = None
     image_embeddings = None
+    video_embeddings = None
     audio_embeddings = None
     deepstack_visual_embeds = None
 
@@ -164,8 +166,17 @@ class TransformerLinenPure(nn.Module):
       image_embeddings, deepstack_visual_embeds = self.vision_encoder(
           input_images=encoder_images, deterministic=not enable_dropout
       )
+      bidirectional_mask_image = mm_processor.get_bidirectional_mask_vision(
+          self.config, decoder_input_tokens, is_video=False
+      )
 
-      bidirectional_mask = mm_processor.get_bidirectional_mask_vision(self.config, decoder_input_tokens)
+    if self.config.use_multimodal and encoder_videos is not None:
+      video_embeddings, deepstack_visual_embeds = self.vision_encoder(
+          input_images=encoder_videos, deterministic=not enable_dropout
+      )
+      bidirectional_mask_video = mm_processor.get_bidirectional_mask_vision(
+          self.config, decoder_input_tokens, is_video=True
+      )
 
     if self.config.use_multimodal and encoder_audios is not None and self.audio_encoder is not None:
       audio_embeddings = self.audio_encoder(input_audio=encoder_audios, deterministic=not enable_dropout)
@@ -176,13 +187,16 @@ class TransformerLinenPure(nn.Module):
       audio_masks = mm_processor.get_bidirectional_mask_audio(self.config, decoder_input_tokens)
 
     multimodal_input = None
-    if image_embeddings is not None or audio_embeddings is not None:
+    if image_embeddings is not None or video_embeddings is not None or audio_embeddings is not None:
       multimodal_input = MultimodalInput(
           image_embeddings=image_embeddings,
           image_masks=encoder_image_masks,
+          video_embeddings=video_embeddings,
+          video_masks=encoder_video_masks,
           audio_embeddings=audio_embeddings,
           audio_masks=audio_masks,
-          bidirectional_mask=bidirectional_mask,
+          bidirectional_mask=bidirectional_mask_image,
+          bidirectional_mask_video=bidirectional_mask_video,
       )
 
     logits, hidden_state, kv_caches = self.decoder(
@@ -194,7 +208,6 @@ class TransformerLinenPure(nn.Module):
         model_mode=model_mode,
         previous_chunk=previous_chunk,
         slot=slot,
-        page_state=page_state,
         multimodal_input=multimodal_input,
         kv_caches=kv_caches,
         attention_metadata=attention_metadata,
@@ -386,30 +399,26 @@ class Transformer(nnx.Module):
       # For MTP, we use the DecoderLayer blueprint to ensure architectural consistency.
       # By convention, this is the last layer in the list.
       mtp_layer = layer_types[-1]
-      mtp_block_linen = multi_token_prediction_block_as_linen(
+      self.mtp_block = MultiTokenPredictionBlock(
           config=self.config,
           mesh=self.mesh,
           transformer_layer_module=mtp_layer,
           decoder=self.decoder,
           rngs=rngs,
-          name="mtp_block",
-      )
-      self.mtp_block = nnx_wrappers.ToNNX(mtp_block_linen, rngs=rngs)
-
-      self.mtp_block.lazy_init(
-          shared_embedding=self.token_embedder,
-          main_hidden_state=jnp.ones((1, 1, self.config.emb_dim), dtype=self.config.dtype),
-          input_ids=jnp.ones((1, 1), dtype=jnp.int32),
-          target_ids=jnp.ones((1, 1), dtype=jnp.int32),
-          target_mask=jnp.ones((1, 1), dtype=jnp.int32),
-          position_ids=jnp.ones((1, 1), dtype=jnp.int32),
-          decoder_segment_ids=jnp.ones((1, 1), dtype=jnp.int32),
-          deterministic=True,
       )
 
   def no_op(self, *args, **kwargs):
     """A no-op method to allow the model to be used in a lazy context."""
     return
+
+  def logits_from_hidden_states_for_vocab_tiling(self, hidden_states, deterministic, model_mode):
+    """Computes logits from hidden states; used by vocabulary tiling."""
+    return self.decoder.apply_output_head(
+        shared_embedding=self.token_embedder,
+        y=hidden_states,
+        deterministic=deterministic,
+        model_mode=model_mode,
+    )
 
   def init_cache(self, cache_size: int, batch_size: int, dtype=jnp.float32):
     """Initializes the KV cache for the Transformer.
@@ -432,13 +441,14 @@ class Transformer(nnx.Module):
       cache=None,
       encoder_images: jax.Array | None = None,
       encoder_image_masks: jax.Array | None = None,
+      encoder_videos: jax.Array | None = None,
+      encoder_video_masks: jax.Array | None = None,
       encoder_audios: jax.Array | None = None,
       enable_dropout=True,
       model_mode=MODEL_MODE_TRAIN,
       previous_chunk=None,
       true_length: int | None = None,
       slot: int | None = None,
-      page_state: page_manager.PageState | None = None,
       decoder_target_tokens: jax.Array | None = None,
       decoder_target_mask: jax.Array | None = None,
       kv_caches: list[jax.Array] | None = None,
@@ -458,7 +468,6 @@ class Transformer(nnx.Module):
       previous_chunk: Previous chunk for incremental decoding (optional).
       true_length: True length of the prompt before padding (optional).
       slot: An integer representing the decode batch index selected for this request (optional).
-      page_state: Page state for paged attention (optional).
       partition_spec: Partition specification for FSDP all-gather.
       decoder_target_tokens: Target tokens for the decoder (optional, used in MTP).
       decoder_target_mask: Target mask for the decoder (optional, used in MTP).
@@ -475,16 +484,28 @@ class Transformer(nnx.Module):
           f" which is always {DECODING_ACTIVE_SEQUENCE_INDICATOR}."
       )
 
-    bidirectional_mask = None
+    bidirectional_mask_image = None
+    bidirectional_mask_video = None
     image_embeddings = None
+    video_embeddings = None
+    audio_embeddings = None
     deepstack_visual_embeds = None
     if self.config.use_multimodal and encoder_images is not None:
       image_embeddings, deepstack_visual_embeds = self.vision_encoder(
           input_images=encoder_images, deterministic=not enable_dropout
       )
-      bidirectional_mask = mm_processor.get_bidirectional_mask_vision(self.config, decoder_input_tokens)
+      bidirectional_mask_image = mm_processor.get_bidirectional_mask_vision(
+          self.config, decoder_input_tokens, is_video=False
+      )
 
-    audio_embeddings = None
+    if self.config.use_multimodal and encoder_videos is not None:
+      video_embeddings, deepstack_visual_embeds = self.vision_encoder(
+          input_images=encoder_videos, deterministic=not enable_dropout
+      )
+      bidirectional_mask_video = mm_processor.get_bidirectional_mask_vision(
+          self.config, decoder_input_tokens, is_video=True
+      )
+
     if self.config.use_multimodal and encoder_audios is not None and self.audio_encoder is not None:
       audio_embeddings = self.audio_encoder(input_audio=encoder_audios, deterministic=not enable_dropout)
 
@@ -494,19 +515,24 @@ class Transformer(nnx.Module):
       audio_masks = mm_processor.get_bidirectional_mask_audio(self.config, decoder_input_tokens)
 
     multimodal_input = None
-    if image_embeddings is not None or audio_embeddings is not None:
+    if image_embeddings is not None or video_embeddings is not None or audio_embeddings is not None:
       multimodal_input = MultimodalInput(
           image_embeddings=image_embeddings,
           image_masks=encoder_image_masks,
+          video_embeddings=video_embeddings,
+          video_masks=encoder_video_masks,
           audio_embeddings=audio_embeddings,
           audio_masks=audio_masks,
-          bidirectional_mask=bidirectional_mask,
+          bidirectional_mask=bidirectional_mask_image,
+          bidirectional_mask_video=bidirectional_mask_video,
       )
 
     mutable_collections = []
     if self.config.record_internal_nn_metrics:
       mutable_collections.append("intermediates")
     if self.config.distill_beta > 0.0 and "intermediates" not in mutable_collections:
+      mutable_collections.append("intermediates")
+    if self.config.load_balance_loss_weight > 0.0 and "intermediates" not in mutable_collections:
       mutable_collections.append("intermediates")
 
     if self.config.pure_nnx_decoder:
@@ -519,7 +545,6 @@ class Transformer(nnx.Module):
           model_mode=model_mode,
           previous_chunk=previous_chunk,
           slot=slot,
-          page_state=page_state,
           multimodal_input=multimodal_input,
           kv_caches=kv_caches,
           attention_metadata=attention_metadata,
@@ -535,7 +560,6 @@ class Transformer(nnx.Module):
           model_mode=model_mode,
           previous_chunk=previous_chunk,
           slot=slot,
-          page_state=page_state,
           multimodal_input=multimodal_input,
           kv_caches=kv_caches,
           attention_metadata=attention_metadata,

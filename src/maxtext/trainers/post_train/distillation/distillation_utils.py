@@ -19,7 +19,6 @@ model structures with Tunix's training interfaces.
 """
 
 import abc
-import pickle
 from typing import Any, Callable, Iterator, List, Literal, Optional, Sequence
 
 import flax
@@ -28,12 +27,11 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
-import tensorflow as tf
-from array_record.python import array_record_module
 from orbax import checkpoint
 
 from maxtext.utils import max_logging
-# Reuse MaxText's native checkpointing logic
+from maxtext.utils import maxtext_utils
+# Reuse MaxText's native checkpointing logic.
 from maxtext.common.checkpointing import GrainCheckpointHandler, GrainCheckpointSave, GrainCheckpointRestore
 from tunix.sft import checkpoint_manager as tunix_checkpoint_manager
 from tunix.sft import peft_trainer
@@ -52,6 +50,10 @@ class DistillationForwardOutput:
   logits: jax.Array
   #: out_projection_activations
   out_projection_activations: jax.Array | None = None
+  #: moe load balance loss
+  moe_lb_loss: jax.Array | None = None
+  #: top-k indices for sparse offline distillation
+  top_k_indices: jax.Array | None = None
 
 
 @flax.struct.dataclass(frozen=True)
@@ -76,50 +78,6 @@ class MaxTextTrainingInput(peft_trainer.TrainingInput):
 # -----------------------------------------------------------------------------
 # Data Loading Adapter
 # -----------------------------------------------------------------------------
-
-
-class OfflineArrayRecordIterator:
-  """Reads the pre-generated global top-k logits file."""
-
-  def __init__(self, data_dir: str, epochs: int = 100):
-    self.filepath = data_dir
-
-    if not tf.io.gfile.exists(self.filepath):
-      raise FileNotFoundError(f"Offline distillation file not found: {self.filepath}")
-
-    self.reader = array_record_module.ArrayRecordReader(self.filepath)
-    self.num_records = self.reader.num_records()
-    self.epochs = epochs
-    self.current_epoch = 0
-    self.record_index = 0
-
-  def __iter__(self):
-    return self
-
-  def __next__(self):
-    if self.record_index >= self.num_records:
-      self.current_epoch += 1
-      if self.current_epoch >= self.epochs:
-        raise StopIteration
-
-      self.record_index = 0
-      self.reader = array_record_module.ArrayRecordReader(self.filepath)
-
-    record = self.reader.read()
-    self.record_index += 1
-    data = pickle.loads(record)
-
-    # Map the arrays to match MaxText's expected dictionary
-    batch = {
-        "inputs": data["tokens"],
-        "top_k_logits": data["top_k_logits"],
-        "top_k_indices": data["top_k_indices"],
-    }
-    for key in ["inputs_position", "inputs_segmentation", "targets_segmentation", "targets"]:
-      if key in data:
-        batch[key] = data[key]
-
-    return batch
 
 
 class MaxTextToTunixIterator:
@@ -189,6 +147,21 @@ class MaxTextToTunixIterator:
 # and far below fp32 exp overflow (~88).
 _PPL_CE_CAP = 20.0
 
+METRIC_TOTAL_LOSS = "distill/total_loss"
+METRIC_HARD_LOSS = "distill/hard_loss"
+METRIC_SOFT_LOSS = "distill/soft_loss"
+METRIC_TEACHER_LOSS = "distill/teacher_loss"
+METRIC_KL_DIV_T1 = "distill/kl_div_T1"
+METRIC_KL_DIV_AT_T = "distill/kl_div_at_T"
+METRIC_STUDENT_PERPLEXITY = "distill/student_perplexity"
+METRIC_TEACHER_PERPLEXITY = "distill/teacher_perplexity"
+METRIC_OUT_PROJ_FEATURE_LOSS = "distill/out_proj_feature_loss"
+METRIC_MOE_LB_LOSS = "distill/moe_lb_loss"
+METRIC_TEACHER_MOE_LB_LOSS = "distill/teacher_moe_lb_loss"
+METRIC_TEMPERATURE = "distill/temperature"
+METRIC_ALPHA = "distill/alpha"
+METRIC_BETA_FEATURE = "distill/beta_feature"
+
 
 def compute_schedule(
     step: jax.Array,
@@ -249,6 +222,35 @@ def weighted_mean(sum_count_pairs: Sequence[tuple[Any, Any]] | np.ndarray) -> fl
   return float(arr[:, 0].sum() / total)
 
 
+def calculate_distillation_tflops_per_device(
+    student_config,
+    teacher_config,
+    is_offline: bool = False,
+) -> tuple[float, float, float]:
+  """Per-step per-device TFLOPs for online distillation.
+
+  Student counts full forward + backward (matches the standard `* 3` accounting
+  in `calculate_tflops_training_per_device`). Teacher counts forward only, so we
+  divide its standard total by 3. In offline mode the teacher is not run, so its
+  contribution is zero.
+
+  Caller contract: `teacher_config`'s `per_device_batch_size`, `max_target_length`,
+  and `gradient_accumulation_steps` must already match `student_config`'s, since
+  the teacher runs on batches produced by the shared input pipeline. The
+  distillation entry point (`train_distill.main`) sets this up.
+
+  Returns:
+    (combined, student, teacher) per-step per-device TFLOPs.
+  """
+  student_tflops, _, _ = maxtext_utils.calculate_tflops_training_per_device(student_config, log=False)
+  if is_offline or teacher_config is None:
+    teacher_tflops = 0.0
+  else:
+    teacher_full, _, _ = maxtext_utils.calculate_tflops_training_per_device(teacher_config, log=False)
+    teacher_tflops = teacher_full / 3.0
+  return student_tflops + teacher_tflops, student_tflops, teacher_tflops
+
+
 class DistillationStrategy(abc.ABC):
   """Abstract base class for MaxText Distillation Strategies."""
 
@@ -275,7 +277,7 @@ class DistillationStrategy(abc.ABC):
       teacher_output: "DistillationForwardOutput",
       labels: jax.Array,
       step: jax.Array | None = None,
-  ) -> tuple[jax.Array, dict[str, jax.Array]]:
+  ) -> tuple[jax.Array, dict[str, tuple[jax.Array, jax.Array]]]:
     """Computes the distillation loss.
 
     Args:
@@ -295,7 +297,7 @@ class DistillationStrategy(abc.ABC):
       self,
       student_output: "DistillationForwardOutput",
       labels: jax.Array,
-  ) -> tuple[jax.Array, dict[str, jax.Array]]:
+  ) -> tuple[jax.Array, dict[str, tuple[jax.Array, jax.Array]]]:
     """Computes the evaluation loss (typically just the task loss).
 
     Args:
@@ -327,7 +329,7 @@ class CombinedDistillationStrategy(DistillationStrategy):
       alpha: float = 0.5,
       beta_feature: float = 0.0,
       layer_indices: Optional[List[int]] = None,
-      feature_loss_fn: Callable[[jax.Array, jax.Array], jax.Array] | None = None,
+      feature_loss_fn: Callable[[jax.Array, jax.Array, jax.Array], jax.Array] | None = None,
       feature_loss_type: Literal["cosine", "l2"] = "cosine",
       cosine_distance_axis: int | tuple[int, ...] = -1,
       vocab_size: int = 0,
@@ -350,8 +352,9 @@ class CombinedDistillationStrategy(DistillationStrategy):
         layer_indices: Layer indices to apply feature loss.
         feature_loss_type: The type of feature loss to use if `feature_loss_fn` is None.
           Can be "cosine" (default) or "l2".
-        feature_loss_fn: A function that takes two jax.Arrays (student_map,
-          teacher_map) and returns a scalar loss. Defaults to cosine distance.
+        feature_loss_fn: A function (student_features, teacher_features, mask) -> scalar
+          where features are [L, B, T, D] and mask is [B, T] (1.0 for valid tokens).
+          Defaults to a masked cosine distance with epsilon-floored safe-norm.
         cosine_distance_axis: The axis to use for cosine distance computation if
           feature_loss_fn is not provided. Defaults to -1.
         alpha_end: Target alpha value at end of training. None keeps alpha fixed.
@@ -408,16 +411,30 @@ class CombinedDistillationStrategy(DistillationStrategy):
             f"Set {param_name}_end to a target value or use schedule='constant'."
         )
 
+    # Mask keeps zero-norm pad activations out of the cosine denominator to avoid 0/0 NaN.
     self.feature_loss_fn = feature_loss_fn
     if feature_loss_fn is None:
       if feature_loss_type == "cosine":
-        self.feature_loss_fn = lambda student_features, teacher_features: jnp.mean(
-            optax.cosine_distance(student_features, teacher_features, axis=cosine_distance_axis)
-        )
+
+        def _masked_cosine(student_features, teacher_features, mask):
+          # epsilon>0 floors the safe-norm so an all-zero row can't divide by zero.
+          cd = optax.cosine_distance(
+              student_features, teacher_features, axis=cosine_distance_axis, epsilon=1e-6
+          )  # [L, B, T]
+          mask_b = mask.astype(cd.dtype)
+          num_valid_terms = jnp.maximum(jnp.sum(mask_b), 1.0) * cd.shape[0]
+          return jnp.sum(cd * mask_b[None, :, :]) / num_valid_terms
+
+        self.feature_loss_fn = _masked_cosine
       elif feature_loss_type == "l2":
-        self.feature_loss_fn = lambda student_features, teacher_features: jnp.mean(
-            optax.l2_loss(student_features, teacher_features)
-        )
+
+        def _masked_l2(student_features, teacher_features, mask):
+          sq = jnp.mean(jnp.square(student_features - teacher_features), axis=-1)  # [L, B, T]
+          mask_b = mask.astype(sq.dtype)
+          num_valid_terms = jnp.maximum(jnp.sum(mask_b), 1.0) * sq.shape[0]
+          return jnp.sum(sq * mask_b[None, :, :]) / num_valid_terms
+
+        self.feature_loss_fn = _masked_l2
       else:
         raise ValueError(f"Unsupported feature_loss_type: {feature_loss_type!r}")
 
@@ -478,12 +495,44 @@ class CombinedDistillationStrategy(DistillationStrategy):
     safe_count = jnp.maximum(valid_count, 1.0)
 
     # --- Soft loss: KL on temperature-softened distributions ---
-    log_s_T = jax.nn.log_softmax(s_logits / temperature, axis=-1)
-    t_p_T = jax.nn.softmax(t_logits / temperature, axis=-1)
-    # KL(teacher || student) per position. optax.kl_divergence(log_pred, target) = KL(target || pred).
-    kl_softened_per_pos = optax.kl_divergence(log_s_T, t_p_T)  # [B, T]
+
+    # Pre-compute Student log-probs over the full vocabulary
+    log_s_T_full = jax.nn.log_softmax(s_logits / temperature, axis=-1)
+    log_s_1_full = jax.nn.log_softmax(s_logits, axis=-1)
+
+    if getattr(teacher_output, "top_k_indices", None) is not None:
+      # --- SPARSE KL DIVERGENCE (Offline Mode) ---
+
+      # 1. Normalize teacher probabilities only over the saved Top-K subset
+      t_p_T_sparse = jax.nn.softmax(t_logits / temperature, axis=-1)
+      log_t_p_T_sparse = jax.nn.log_softmax(t_logits / temperature, axis=-1)
+
+      # 2. Gather Student unnormalized logits at the Teacher's exact Top-K indices
+      s_logits_sparse = jnp.take_along_axis(s_logits, teacher_output.top_k_indices, axis=-1)
+
+      # 3. Normalize Student probabilities only over the exact same Top-K subset
+      log_s_T_sparse = jax.nn.log_softmax(s_logits_sparse / temperature, axis=-1)
+
+      # 4. KL(T || S) = Sum_over_TopK( P_T * (log_P_T - log_P_S) )
+      kl_softened_per_pos = jnp.sum(t_p_T_sparse * (log_t_p_T_sparse - log_s_T_sparse), axis=-1)
+
+      # We don't have the full teacher logits to compute exact cross-entropy, so we zero it out
+      ce_teacher_per_pos = jnp.zeros(s_logits.shape[:-1])
+      kl_t1_sum = jnp.array(0.0)
+
+    else:
+      # --- DENSE KL DIVERGENCE (Online Mode) ---
+      t_p_T = jax.nn.softmax(t_logits / temperature, axis=-1)
+      t_p_1 = jax.nn.softmax(t_logits, axis=-1)
+
+      kl_softened_per_pos = optax.kl_divergence(log_s_T_full, t_p_T)  # [B, T]
+      kl_t1_per_pos = optax.kl_divergence(log_s_1_full, t_p_1)
+
+      ce_teacher_per_pos = optax.softmax_cross_entropy(logits=t_logits, labels=labels)
+      kl_t1_sum = jnp.sum(kl_t1_per_pos * mask)
+
+    # --- Final Loss Aggregation ---
     kl_softened_sum = jnp.sum(kl_softened_per_pos * mask)
-    # Scale by T^2 (Hinton). Apply once at the loss; logged metric is the scaled sum too.
     soft_loss_sum_scaled = kl_softened_sum * (temperature**2)
     soft_loss_mean = soft_loss_sum_scaled / safe_count
 
@@ -492,20 +541,13 @@ class CombinedDistillationStrategy(DistillationStrategy):
     ce_student_sum = jnp.sum(ce_student_per_pos * mask)
     hard_loss_mean = ce_student_sum / safe_count
 
-    # --- Teacher CE (verification metric) ---
-    ce_teacher_per_pos = optax.softmax_cross_entropy(logits=t_logits, labels=labels)
     ce_teacher_sum = jnp.sum(ce_teacher_per_pos * mask)
-
-    # --- Always-T=1 KL for cross-run / cross-anneal comparability ---
-    log_s_1 = jax.nn.log_softmax(s_logits, axis=-1)
-    t_p_1 = jax.nn.softmax(t_logits, axis=-1)
-    kl_t1_per_pos = optax.kl_divergence(log_s_1, t_p_1)
-    kl_t1_sum = jnp.sum(kl_t1_per_pos * mask)
 
     base_logit_loss = (alpha * soft_loss_mean) + ((1.0 - alpha) * hard_loss_mean)
 
     feature_loss = jnp.array(0.0, dtype=jnp.float32)
     if self.beta_feature > 0.0:
+      assert s_features is not None and t_features is not None
       if self.layer_indices is not None:
         s_features_sliced = jnp.take(s_features, self.layer_indices, axis=0)
         t_features_sliced = jnp.take(t_features, self.layer_indices, axis=0)
@@ -516,9 +558,20 @@ class CombinedDistillationStrategy(DistillationStrategy):
       s_features_sliced = s_features_sliced.astype(jnp.float32)
       t_features_sliced = t_features_sliced.astype(jnp.float32)
 
-      feature_loss = beta_feature * self.feature_loss_fn(s_features_sliced, t_features_sliced)
+      feature_loss = beta_feature * self.feature_loss_fn(s_features_sliced, t_features_sliced, mask)
 
     total_loss = base_logit_loss + feature_loss
+
+    moe_lb_loss = jnp.array(0.0)
+    if student_output.moe_lb_loss is not None:
+      # The moe_lb_loss collected from the model is already scaled by load_balance_loss_weight
+      # within the MoE layer itself (see load_balance_loss in moe.py).
+      moe_lb_loss = student_output.moe_lb_loss
+      total_loss += moe_lb_loss
+
+    teacher_moe_lb_loss = jnp.array(0.0)
+    if teacher_output.moe_lb_loss is not None:
+      teacher_moe_lb_loss = teacher_output.moe_lb_loss
 
     # Per-step next-token perplexity. Note: this is mean(exp(per-step CE)), not
     # exp(window-CE-mean) — close to true perplexity in steady state. For the exact
@@ -530,25 +583,27 @@ class CombinedDistillationStrategy(DistillationStrategy):
     one = jnp.array(1.0, dtype=jnp.float32)
     metrics: dict[str, tuple[jax.Array, jax.Array]] = {
         # Token-weighted: emit (sum, valid_count) so multi-host averaging is unbiased.
-        "distill/soft_loss": (soft_loss_sum_scaled, valid_count),
-        "distill/hard_loss": (ce_student_sum, valid_count),
-        "distill/teacher_loss": (ce_teacher_sum, valid_count),
+        METRIC_SOFT_LOSS: (soft_loss_sum_scaled, valid_count),
+        METRIC_HARD_LOSS: (ce_student_sum, valid_count),
+        METRIC_TEACHER_LOSS: (ce_teacher_sum, valid_count),
         # Next-token prediction perplexity (per-step approximation of exp(hard_loss)).
         # The headline `_train_perplexity` Tunix prints is exp(total_loss) which for
         # distillation is exp(α·soft + (1-α)·hard + β·feature) and NOT next-token PPL.
-        "distill/student_perplexity": (student_perplexity_step, one),
-        "distill/teacher_perplexity": (teacher_perplexity_step, one),
+        METRIC_STUDENT_PERPLEXITY: (student_perplexity_step, one),
+        METRIC_TEACHER_PERPLEXITY: (teacher_perplexity_step, one),
         # KL at the current (scheduled) temperature T, without the T^2 scaling
         # that soft_loss applies. Pair with kl_div_T1 to compare T vs T=1.
-        "distill/kl_div_at_T": (kl_softened_sum, valid_count),
+        METRIC_KL_DIV_AT_T: (kl_softened_sum, valid_count),
         # KL at T=1: comparable across runs / annealing schedules.
-        "distill/kl_div_T1": (kl_t1_sum, valid_count),
+        METRIC_KL_DIV_T1: (kl_t1_sum, valid_count),
         # Per-step quantities: (value, 1.0) so the aggregator yields a simple mean over steps.
-        "distill/out_proj_feature_loss": (feature_loss, one),
-        "distill/total_loss": (total_loss, one),
-        "distill/temperature": (temperature, one),
-        "distill/alpha": (alpha, one),
-        "distill/beta_feature": (beta_feature, one),
+        METRIC_OUT_PROJ_FEATURE_LOSS: (feature_loss, one),
+        METRIC_MOE_LB_LOSS: (moe_lb_loss, one),
+        METRIC_TEACHER_MOE_LB_LOSS: (teacher_moe_lb_loss, one),
+        METRIC_TOTAL_LOSS: (total_loss, one),
+        METRIC_TEMPERATURE: (temperature, one),
+        METRIC_ALPHA: (alpha, one),
+        METRIC_BETA_FEATURE: (beta_feature, one),
     }
     return total_loss, metrics
 
@@ -599,14 +654,17 @@ class MaxTextCheckpointManager(tunix_checkpoint_manager.CheckpointManager):
   def __init__(
       self,
       raw_iterator: Any | None,
-      root_directory: str | None = None,
+      root_directory: str | None,
+      student_config: Any,
       options: checkpoint.CheckpointManagerOptions | None = None,
   ):
     super().__init__(root_directory=root_directory, options=options)
+    self.student_config = student_config
     self._iterator = raw_iterator
 
     # Re-initialize internal Orbax manager with MaxText's Grain handler
     # pylint: disable=access-member-before-definition
+    # pytype: disable=attribute-error
     if self._checkpoint_manager is not None:
       root_directory = self._checkpoint_manager.directory
 
@@ -627,9 +685,18 @@ class MaxTextCheckpointManager(tunix_checkpoint_manager.CheckpointManager):
           item_handlers=item_handlers,
           options=options,
       )
+    # pytype: enable=attribute-error
     # pylint: enable=access-member-before-definition
 
-  def save(self, step, model, optimizer=None, save_only_lora_params=False, force=False, custom_metadata=None):
+  def save(
+      self,
+      step,
+      model,
+      optimizer=None,
+      save_only_lora_params=False,
+      force=False,
+      custom_metadata=None,
+  ):
     """Saves the checkpoint including the input pipeline state (if available)."""
     if self._checkpoint_manager is None:
       return False
@@ -651,7 +718,10 @@ class MaxTextCheckpointManager(tunix_checkpoint_manager.CheckpointManager):
             item=params, save_args=jax.tree.map(lambda _: default_save_args, params)
         ),
     }
-    if optimizer is not None:
+    # Exclude optimizer state if the flag is set OR if learn_to_init_mode is active.
+    exclude_opt = self.student_config.learn_to_init_mode
+
+    if optimizer is not None and not exclude_opt:
       optimizer_state = nnx.state(optimizer, nnx.optimizer.OptState)
       cp_save_args["optimizer_state"] = checkpoint.args.PyTreeSave(
           item=optimizer_state, save_args=jax.tree.map(lambda _: default_save_args, optimizer_state)

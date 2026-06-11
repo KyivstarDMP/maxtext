@@ -48,9 +48,7 @@ from tunix.rl.rollout.vllm_rollout import VllmRollout
 from vllm import LLM
 from vllm.sampling_params import SamplingParams
 from maxtext.configs import pyconfig
-
-os.environ["SKIP_JAX_PRECOMPILE"] = "1"
-os.environ["NEW_MODEL_DESIGN"] = "1"
+import maxtext.integration.vllm.maxtext_vllm_adapter as adapter
 
 
 # --- DEFINE FLAGS GLOBALLY ---
@@ -58,6 +56,15 @@ FLAGS = flags.FLAGS
 
 flags.DEFINE_bool("use_tunix", False, "Whether to use Tunix for vLLM decoding.")
 flags.DEFINE_integer("seed", 42, "Random seed for sampling.")
+
+
+def build_chat_messages(config: Config) -> list[dict[str, str]]:
+  """Builds the chat message list, prepending a system prompt when set."""
+  messages = []
+  if config.system_prompt:
+    messages.append({"role": "system", "content": config.system_prompt})
+  messages.append({"role": "user", "content": config.prompt})
+  return messages
 
 
 def decode_with_vllm(config: Config) -> None:
@@ -83,6 +90,7 @@ def decode_with_vllm(config: Config) -> None:
               "allow_split_physical_axes": True,
               "debug_sharding": config.debug_sharding,
               "prefuse_moe_weights": config.prefuse_moe_weights,
+              "scan_layers": config.scan_layers,
           },
           "sharding": {
               "sharding_strategy": {
@@ -123,11 +131,8 @@ def decode_with_vllm(config: Config) -> None:
   prompts = [config.prompt]
   if config.use_chat_template:
     # Format the prompt using chat template if specified
-    messages = [
-        {"role": "user", "content": config.prompt},
-    ]
     input_with_chat_template = tokenizer.apply_chat_template(
-        messages,
+        build_chat_messages(config),
         tokenize=False,  # Set to False to get the string
         add_generation_prompt=True,
         add_special_tokens=False,  # Prevent adding special tokens
@@ -141,11 +146,15 @@ def decode_with_vllm(config: Config) -> None:
         f"max_target_length ({config.max_target_length}) must be greater than max_prompt_length ({max_prompt_length})"
     )
 
+  # MaxText uses -1 to mean "disabled"; vLLM requires top_p in (0, 1].
+  top_p = config.decode_sampling_nucleus_p if config.decode_sampling_nucleus_p > 0 else 1.0
+  top_k = config.decode_sampling_top_k if config.decode_sampling_top_k > 0 else -1
+
   sampling_params = SamplingParams(
       temperature=config.decode_sampling_temperature,
       max_tokens=max_tokens_to_generate,
-      top_k=config.decode_sampling_top_k,
-      top_p=config.decode_sampling_nucleus_p,
+      top_k=top_k,
+      top_p=top_p,
   )
 
   outputs = llm.generate(prompts, sampling_params)
@@ -183,11 +192,8 @@ def decode_with_tunix(
   prompts = [config.prompt]
   if config.use_chat_template:
     # Format the prompt using chat template if specified
-    messages = [
-        {"role": "user", "content": config.prompt},
-    ]
     input_with_chat_template = tokenizer.apply_chat_template(
-        messages,
+        build_chat_messages(config),
         tokenize=False,  # Set to False to get the string
         add_generation_prompt=True,
         add_special_tokens=False,  # Prevent adding special tokens
@@ -232,6 +238,12 @@ def decode_with_tunix(
 
 
 def main(argv: Sequence[str]) -> None:
+  # Keep these in main(): registering the adapter and setting engine env flags
+  # at import time would leak into any process that merely imports this module.
+  adapter.register()
+  os.environ["SKIP_JAX_PRECOMPILE"] = "1"
+  os.environ["NEW_MODEL_DESIGN"] = "1"
+
   jax.config.update("jax_default_prng_impl", "unsafe_rbg")
   os.environ["TF_CPP_MIN_LOG_LEVEL"] = "0"
   if "xla_tpu_spmd_rng_bit_generator_unsafe" not in os.environ.get("LIBTPU_INIT_ARGS", ""):

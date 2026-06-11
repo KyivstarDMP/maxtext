@@ -16,16 +16,23 @@ document.addEventListener('DOMContentLoaded', () => {
     "<DATASET_PATH>",
     "<GCS_BUCKET>",
     "<HF_CKPT_PATH>",
+    "<HF_LORA_ADAPTER_PATH>",
     "<HF_MODEL>",
     "<HF_TOKEN>",
     "<IMAGE_NAME>",
     "<LAZY_LOAD>",
+    "<LEARNING_RATE>",
+    "<LORA_ALPHA>",
+    "<LORA_RANK>",
+    "<LORA_RESTORE_PATH>",
+    "<MAX_TARGET_LENGTH>",
     "<MODEL_NAME>",
     "<NUM_SLICES>",
     "<POD_NAME>",
     "<PROJECT_ID>",
     "<RUN_NAME>",
     "<STEPS>",
+    "<TEMPLATE_PATH>",
     "<TPU_TYPE>",
     "<TRAIN_SPLIT>",
     "<VENV_NAME>",
@@ -81,10 +88,25 @@ document.addEventListener('DOMContentLoaded', () => {
       }
     });
 
-    // If the user deletes everything and clicks away, restore the original placeholder
+    // Synchronize changes to other spans with the same placeholder
+    span.addEventListener('input', function () {
+      const placeholder = this.getAttribute('data-placeholder');
+      const newValue = this.textContent;
+
+      document.querySelectorAll(`.inline-input[data-placeholder="${placeholder}"]`).forEach(otherSpan => {
+        if (otherSpan !== this) {
+          otherSpan.textContent = newValue;
+        }
+      });
+    });
+
+    // If the user deletes everything and clicks away, restore the original placeholder for all matching spans
     span.addEventListener('blur', function () {
       if (this.textContent.trim() === '') {
-        this.textContent = this.getAttribute('data-placeholder');
+        const placeholder = this.getAttribute('data-placeholder');
+        document.querySelectorAll(`.inline-input[data-placeholder="${placeholder}"]`).forEach(otherSpan => {
+          otherSpan.textContent = placeholder;
+        });
       }
     });
 

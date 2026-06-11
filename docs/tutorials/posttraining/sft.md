@@ -26,7 +26,7 @@ In this tutorial we use a single host TPU VM such as `v6e-8/v5p-8`. Let's get st
 
 ## Install MaxText and Post-Training dependencies
 
-For instructions on installing MaxText with post-training dependencies on your VM, please refer to the [official documentation](https://maxtext.readthedocs.io/en/latest/install_maxtext.html) and use the `maxtext[tpu-post-train]` installation path to include all necessary post-training dependencies.
+For instructions on installing MaxText with post-training dependencies on your VM, please refer to the [official documentation](../../install_maxtext.md) and use the `maxtext[tpu-post-train]` installation path to include all necessary post-training dependencies.
 
 > **Note:** If you have previously installed MaxText with a different option (e.g., `maxtext[tpu]`), we strongly recommend using a fresh virtual environment for `maxtext[tpu-post-train]` to avoid potential library version conflicts.
 
@@ -82,7 +82,7 @@ export MAXTEXT_CKPT_PATH=<CKPT_PATH> # e.g., gs://my-bucket/my-model-checkpoint/
 
 ### Option 2: Converting a Hugging Face checkpoint
 
-Refer the steps in [Hugging Face to MaxText](https://maxtext.readthedocs.io/en/maxtext-v0.2.1/guides/checkpointing_solutions/convert_checkpoint.html#hugging-face-to-maxtext) to convert a hugging face checkpoint to MaxText. Make sure you have correct checkpoint files converted and saved. Similar as Option 1, you can set the following environment and move on.
+Refer the steps in [Hugging Face to MaxText](../../guides/checkpointing_solutions/convert_checkpoint.md#hugging-face-to-maxtext) to convert a hugging face checkpoint to MaxText. Make sure you have correct checkpoint files converted and saved. Similar as Option 1, you can set the following environment and move on.
 
 ```sh
 export MAXTEXT_CKPT_PATH=<CKPT_PATH> # e.g., gs://my-bucket/my-model-checkpoint/0/items
@@ -107,3 +107,83 @@ python3 -m maxtext.trainers.post_train.sft.train_sft \
 ```
 
 Your fine-tuned model checkpoints will be saved here: `$BASE_OUTPUT_DIRECTORY/$RUN_NAME/checkpoints`.
+
+## Dataset Customization & Chat Templates
+
+Supervised Fine-Tuning in MaxText relies on tokenizing conversational datasets using chat templates. This requires the dataset structure and templates to be aligned.
+
+### Supported Dataset Schemas
+
+By default, MaxText SFT expects one of three conversational dataset structures:
+
+- `["messages"]`: A single column containing a list of dictionaries with `role` and `content` (recommended).
+- `["prompt", "completion"]`: Separated prompt and completion columns.
+- `["question", "answer"]`: Question and answer columns (e.g., math datasets).
+
+During data processing, MaxText converts these into a unified `messages` schema (OpenAI-like format) before feeding it to the tokenizer:
+
+```json
+[
+  {"role": "user", "content": "Hello!"},
+  {"role": "assistant", "content": "Hi there!"}
+]
+```
+
+### Custom Tokenizer Chat Templates
+
+To customize the tokenizer's chat formatting (e.g., adding special tokens like `<start_of_turn>`, `<end_of_turn>`, etc.), you can provide a custom chat template using the `chat_template` or `chat_template_path` configs:
+
+- **`chat_template`**: Use this config to specify a custom Jinja2 template string directly.
+- **`chat_template_path`**: Path to a custom Jinja2 template file (e.g., `.jinja`) or a JSON file containing the template.
+- **`use_chat_template=True`**: Enables chat template formatting.
+
+### Advanced: Custom Dataset Formatter (e.g., ShareGPT)
+
+If your dataset is in a format not natively supported—such as **ShareGPT** (which uses a `conversations` column with `from` and `value` keys)—you can write a custom Python formatting function to convert it on-the-fly.
+
+#### 1. Write a custom formatting function
+
+Create a Python file in your workspace (e.g., `src/maxtext/input_pipeline/custom_formatters.py`):
+
+```python
+def format_sharegpt(example):
+    """Converts ShareGPT format (from/value) to standard messages (role/content)."""
+    role_map = {
+        "human": "user",
+        "user": "user",
+        "gpt": "assistant",
+        "assistant": "assistant",
+        "system": "system",
+    }
+
+    messages = []
+    for turn in example["conversations"]:
+        role = role_map.get(turn["from"], "user")
+        messages.append(
+            {
+                "role": role,
+                "content": turn["value"],
+            }
+        )
+
+    example["messages"] = messages
+    return example
+```
+
+#### 2. Configure MaxText to use your formatter
+
+When starting your SFT training, pass the following parameters:
+
+- `train_data_columns`: Point to the original column name in the raw dataset (`"['conversations']"`).
+- `formatting_func_path`: Point to the python import path of your formatting function (`"maxtext.input_pipeline.custom_formatters.format_sharegpt"`).
+
+```sh
+python3 -m maxtext.trainers.post_train.sft.train_sft \
+    ... \
+    train_data_columns="['conversations']" \
+    formatting_func_path="maxtext.input_pipeline.custom_formatters.format_sharegpt"
+```
+
+### Runnable Example in the Codebase
+
+For a complete, runnable SFT workflow that demonstrates how to configure the training loop and use a custom dataset formatter (`formatting_func_path` and `formatting_func_kwargs`), check out the [sft_qwen3_demo.ipynb](https://github.com/AI-Hypercomputer/maxtext/blob/main/src/maxtext/examples/sft_qwen3_demo.ipynb) Jupyter notebook.

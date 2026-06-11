@@ -1,4 +1,4 @@
-# Copyright 2023–2025 Google LLC
+# Copyright 2023–2026 Google LLC
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -25,12 +25,12 @@ import transformers
 
 import grain.python as grain
 
-import numpy as np
-
 from maxtext.input_pipeline import data_processing_utils
+from maxtext.input_pipeline import dpo_utils
 from maxtext.input_pipeline import input_pipeline_utils
 from maxtext.input_pipeline import instruction_data_processing
 from maxtext.input_pipeline import multihost_dataloading
+from maxtext.utils import elastic_utils
 
 
 def _get_pad_id(tokenizer):
@@ -58,10 +58,14 @@ def vision_sft_preprocessing_pipeline(
   assert len(text_columns) == 2, f"Need two text_columns for query and response, received {text_columns=}"
   # Tunix GA requires per-micro-batch slicing at the data level,
   # whereas Native GA processes the full batch and splits it internally.
-  if config.use_tunix_gradient_accumulation:
-    batch_size = global_batch_size // jax.process_count() // config.gradient_accumulation_steps
+  if config.elastic_enabled:
+    local_batch_size = elastic_utils.get_local_batch_size(config)
   else:
-    batch_size = global_batch_size // jax.process_count()
+    local_batch_size = global_batch_size // jax.process_count()
+  if config.use_tunix_gradient_accumulation:
+    batch_size = local_batch_size // config.gradient_accumulation_steps
+  else:
+    batch_size = local_batch_size
 
   # for multi-epoch with shuffle, shuffle each epoch with different seeds then concat
   import datasets  # pylint: disable=import-outside-toplevel
@@ -105,7 +109,7 @@ def vision_sft_preprocessing_pipeline(
 
   dataset = dataset.map(
       input_pipeline_utils.pre_process_image_sft,
-      fn_kwargs={"image_column": "images", "model_name": config.model_name},
+      fn_kwargs={"image_column": "images", "config": config},
   )
 
   tokenizer = transformers.AutoTokenizer.from_pretrained(
@@ -114,6 +118,7 @@ def vision_sft_preprocessing_pipeline(
       add_eos_token=False,
       legacy=False,
       token=config.hf_access_token,
+      extra_special_tokens={},
   )
   pad_id = _get_pad_id(tokenizer)
 
@@ -193,6 +198,7 @@ def preprocessing_pipeline(
     dataloading_host_count,
     global_mesh,
     dataset,
+    config,
     data_column_names,
     tokenize,
     tokenizer_path,
@@ -209,7 +215,7 @@ def preprocessing_pipeline(
     num_threads=1,
     drop_remainder=True,
     generate_padding_batch=False,
-    use_dpo=None,
+    use_dpo=False,
     use_sft=None,
     use_tunix_gradient_accumulation=False,
     num_microbatches=1,
@@ -227,10 +233,14 @@ def preprocessing_pipeline(
   assert global_batch_size % global_mesh.size == 0, "Batch size should be divisible by number of global devices."
   # Tunix GA requires per-micro-batch slicing at the data level,
   # whereas Native GA processes the full batch and splits it internally.
-  if use_tunix_gradient_accumulation:
-    batch_size = global_batch_size // jax.process_count() // num_microbatches
+  if config.elastic_enabled:
+    local_batch_size = elastic_utils.get_local_batch_size(config)
   else:
-    batch_size = global_batch_size // jax.process_count()
+    local_batch_size = global_batch_size // jax.process_count()
+  if use_tunix_gradient_accumulation:
+    batch_size = local_batch_size // num_microbatches
+  else:
+    batch_size = local_batch_size
 
   # for multi-epoch with shuffle, shuffle each epoch with different seeds then concat
   if shuffle and num_epoch > 1:
@@ -247,6 +257,7 @@ def preprocessing_pipeline(
       add_eos_token=add_eos if not use_sft else False,
       legacy=False,
       token=hf_access_token,
+      extra_special_tokens={},
   )
 
   dataset = dataset.select_columns(data_column_names)
@@ -329,7 +340,6 @@ def preprocessing_pipeline(
   )
   operations = []
   if use_sft:
-    input_pipeline_utils.verify_chat_template_generation_prompt_logic(tokenizer)
     operations.append(
         input_pipeline_utils.SFTPromptMasking(
             text_column_name=data_column_names[0],
@@ -339,19 +349,12 @@ def preprocessing_pipeline(
         )
     )
     data_column_names = ("inputs", "targets")
-  elif use_dpo:
-
-    def lists2array(x):
-      """Convert lists/tuples to array"""
-      return jax.tree.map(np.asarray, x, is_leaf=lambda y: isinstance(y, (list, tuple)))
-
-    operations.append(grain.MapOperation(lists2array))
-  else:
+  elif not use_dpo:
     assert len(data_column_names) == 1
     operations.append(input_pipeline_utils.HFNormalizeFeatures(data_column_names[0]))
     data_column_names = ("inputs", "targets")
 
-  if packing and not use_dpo:
+  if packing:
     length_struct = {col: max_target_length for col in data_column_names}
     max_segments = max_segments_per_seq
     if max_segments is not None and max_segments <= 0:
@@ -365,7 +368,12 @@ def preprocessing_pipeline(
     )
     operations.append(input_pipeline_utils.ReformatPacking(data_column_names))
   else:
-    operations.append(input_pipeline_utils.PadOrTrimToMaxLength(max_target_length, pad_id))
+    if use_dpo:
+      # Renames arbitrary DPO columns and performs DPO-aware padding.
+      max_prompt_length = config.dpo.max_prompt_length
+      operations.append(dpo_utils.DPODataFormatting(pad_id, max_target_length, data_column_names, max_prompt_length))
+    else:
+      operations.append(input_pipeline_utils.PadOrTrimToMaxLength(max_target_length, pad_id))
     operations.append(grain.Batch(batch_size=batch_size, drop_remainder=drop_remainder))
 
   if shift and not use_dpo:
@@ -433,6 +441,7 @@ def make_hf_train_iterator(
         dataloading_host_count=len(process_indices_train),
         global_mesh=global_mesh,
         dataset=train_ds,
+        config=config,
         data_column_names=config.train_data_columns,
         tokenize=config.tokenize_train_data,
         tokenizer_path=config.tokenizer_path,
@@ -494,6 +503,7 @@ def make_hf_eval_iterator(
         dataloading_host_count=len(process_indices_eval),
         global_mesh=global_mesh,
         dataset=eval_ds,
+        config=config,
         data_column_names=config.eval_data_columns,
         tokenize=config.tokenize_eval_data,
         tokenizer_path=config.tokenizer_path,

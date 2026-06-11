@@ -56,15 +56,19 @@ rely on the vLLM library.
 Before starting, ensure you have:
 
 - Access to a Google Cloud Project with TPU quotas.
+- **IAM Roles** required:
+  - **Kubernetes Engine Developer** (`roles/container.developer`) to submit and manage workloads on GKE.
+  - **Artifact Registry Writer** (`roles/artifactregistry.writer`) to upload Docker images.
+  - **Storage Admin** (`roles/storage.admin`) or **Storage Object Admin** (`roles/storage.objectAdmin`) combined with **Storage Legacy Bucket Reader** (`roles/storage.legacyBucketReader`) on your GCS bucket to read/write checkpoints and logs. (Note: A bucket-level read permission like `storage.buckets.get` is required by JAX/TensorStore to verify bucket existence and metadata; using `roles/storage.objectAdmin` alone will cause a misleading "bucket not found" error).
 - A Hugging Face account with an access token for downloading models.
-- Permissions for Google Artifact Registry (Artifact Registry Writer role).
 - Prerequisites for XPK installed (follow [official documentation](https://github.com/AI-Hypercomputer/xpk/blob/main/docs/installation.md#1-prerequisites)).
+  - **Important:** Modern GKE clusters require the GKE auth plugin. If you encounter `gke-gcloud-auth-plugin not found` when running `kubectl` commands, you must install it locally (e.g., `sudo apt-get install google-cloud-sdk-gke-gcloud-auth-plugin` for `apt` installations, or `gcloud components install gke-gcloud-auth-plugin` for standalone archive installations).
 - A Pathways-ready GKE cluster (see [create GKE cluster](https://docs.cloud.google.com/ai-hypercomputer/docs/workloads/pathways-on-cloud/create-gke-cluster)).
 - **Docker** installed and configured for sudoless use. Follow the steps to [configure sudoless Docker](https://docs.docker.com/engine/install/linux-postinstall/).
 
 ## Build and upload MaxText Docker image
 
-For instructions on building and uploading the MaxText Docker image with post-training dependencies, please refer to the [official documentation](https://maxtext.readthedocs.io/en/latest/build_maxtext.html).
+For instructions on building and uploading the MaxText Docker image with post-training dependencies, please refer to the [official documentation](../build_maxtext.md).
 
 ## Setup Environment Variables
 
@@ -75,7 +79,7 @@ placeholders with your actual values.
 # -- Model configuration --
 # The MaxText model name. See `src/maxtext/configs/types.py` for `ModelName` for a
 # full list of supported models.
-export MODEL=<MODEL_NAME> # e.g. 'llama3.1-70b-Instruct'
+export MODEL=<MODEL_NAME> # e.g. 'llama3.1-70b-Instruct' # replace with another model from src/maxtext/configs/types.py if needed
 
 # Your Hugging Face access token. Required to download gated models like Llama.
 # You can generate one at https://huggingface.co/settings/tokens.
@@ -138,7 +142,7 @@ export MAXTEXT_CKPT_PATH=<CKPT_PATH> # e.g., gs://my-bucket/my-model-checkpoint/
 
 ### Option 2: Converting from a Hugging Face checkpoint
 
-Refer to the steps in [Hugging Face to MaxText](../../guides/checkpointing_solutions/convert_checkpoint.md) to convert a hugging face checkpoint to MaxText. Make sure you have correct checkpoint files converted and saved. Similar as Option 1, you can set the following environment and move on.
+Refer to the steps in [Hugging Face to MaxText](../../guides/checkpointing_solutions/convert_checkpoint.md#hugging-face-to-maxtext) to convert a hugging face checkpoint to MaxText. Make sure you have correct checkpoint files converted and saved. Similar as Option 1, you can set the following environment and move on.
 
 ```bash
 export MAXTEXT_CKPT_PATH=<CKPT_PATH> # e.g., gs://my-bucket/my-model-checkpoint/0/items
@@ -163,13 +167,13 @@ xpk workload create-pathways --workload ${RUN_NAME?} \
 --docker-image ${DOCKER_IMAGE?} --cluster ${GKE_CLUSTER?} \
 --tpu-type=${TPU_TYPE?} --num-slices=1 \
 --project=${PROJECT_ID?} --priority=high \
---zone=${ZONE?} \
 --command "HF_TOKEN=${HF_TOKEN?} TF_CPP_MIN_LOG_LEVEL=0 JAX_PLATFORMS=proxy JAX_BACKEND_TARGET=grpc://127.0.0.1:29000 ENABLE_PATHWAYS_PERSISTENCE='1' \
 python3 -m maxtext.trainers.post_train.rl.train_rl \
   model_name=${MODEL?} \
   load_parameters_path=${MAXTEXT_CKPT_PATH?} \
   run_name=${RUN_NAME?} \
   base_output_directory=${BASE_OUTPUT_DIRECTORY?} \
+  rollout_tensor_parallelism=8 \
   hf_access_token=${HF_TOKEN?}"
 ```
 
@@ -180,13 +184,13 @@ xpk workload create-pathways --workload ${RUN_NAME?} \
 --docker-image ${DOCKER_IMAGE?} --cluster ${GKE_CLUSTER?} \
 --tpu-type=${TPU_TYPE?} --num-slices=1 \
 --project=${PROJECT_ID?} --priority=high \
---zone=${ZONE?} \
 --command "HF_TOKEN=${HF_TOKEN?} TF_CPP_MIN_LOG_LEVEL=0 JAX_PLATFORMS=proxy JAX_BACKEND_TARGET=grpc://127.0.0.1:29000 ENABLE_PATHWAYS_PERSISTENCE='1' \
 python3 -m maxtext.trainers.post_train.rl.train_rl \
   model_name=${MODEL?} \
   load_parameters_path=${MAXTEXT_CKPT_PATH?} \
   run_name=${RUN_NAME?} \
   base_output_directory=${BASE_OUTPUT_DIRECTORY?} \
+  rollout_tensor_parallelism=8 \
   hf_access_token=${HF_TOKEN?} \
   loss_algo=gspo-token"
 ```
@@ -214,6 +218,8 @@ python3 -m maxtext.trainers.post_train.rl.train_rl \
   installed and authentication is configured.
 - **Workload Failures**: Review the logs for specific error messages and
   ensure all environment variables are properly set.
+- **Parallelism ValueError (At most one can be -1)**: If you see `ValueError: At most one of rollout_tensor_parallelism, ... can be -1 (auto-derived)`, it means you have not explicitly defined the rollout parallelism parameters.
+  - **Solution**: Explicitly pass at least one of them in your training command (e.g., `rollout_tensor_parallelism=8` as shown in the example commands above).
 - **Workload retry / resume**:
   - **Retry (fresh run)**: Use a unique run name to avoid overwriting
     outputs: `export RUN_NAME=${RUN_NAME?}-retry1 export MAXTEXT_CKPT_PATH=${BASE_OUTPUT_DIRECTORY?}/${RUN_NAME?}/0/items`. Then
@@ -226,5 +232,5 @@ python3 -m maxtext.trainers.post_train.rl.train_rl \
     resuming.
 
 For more detailed troubleshooting, refer to the
-[MaxText documentation](https://maxtext.readthedocs.io) and
+[MaxText documentation](../../index.md) and
 [XPK documentation](https://github.com/AI-Hypercomputer/xpk).

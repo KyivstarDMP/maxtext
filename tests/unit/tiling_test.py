@@ -33,7 +33,9 @@ from maxtext.layers import quantizations
 from maxtext.models import models
 from maxtext.utils import max_utils
 from maxtext.utils import maxtext_utils
-from maxtext.utils.vocabulary_tiling import vocab_tiling_linen_loss
+from maxtext.utils import maxtext_utils_nnx
+from maxtext.utils import model_creation_utils
+from maxtext.utils.vocabulary_tiling import vocab_tiling_linen_loss, vocab_tiling_nnx_loss
 
 from tests.utils.test_helpers import get_test_config_path
 
@@ -67,7 +69,12 @@ class LossAndGradientCorrectnessTest(unittest.TestCase):
     """
     Set up common configurations and dummy data for the tests.
     """
-    self.base_config = [None, get_test_config_path()]
+    self.base_config = [
+        None,
+        get_test_config_path(),
+        "base_emb_dim=32",
+        "vocab_size=128",
+    ]
     self.rng = jax.random.PRNGKey(1234)
     self.batch_size = 1
     self.seq_len = 64
@@ -209,6 +216,8 @@ class LossAndGradientCorrectnessTest(unittest.TestCase):
         num_vocab_tiling=1,
         z_loss_multiplier=1e-4,  # Enable z-loss
     )
+    if getattr(cfg_non_tiling, "enable_nnx", False):
+      pytest.skip("We currently don't support vocab tiling on NNX module.")
     quant_non_tiling = quantizations.configure_quantization(cfg_non_tiling)
     devices_array_non_tiling = maxtext_utils.create_device_mesh(cfg_non_tiling)
     mesh_non_tiling = Mesh(devices_array_non_tiling, cfg_non_tiling.mesh_axes)
@@ -258,6 +267,51 @@ class LossAndGradientCorrectnessTest(unittest.TestCase):
     )
 
   @pytest.mark.tpu_only
+  def test_vocab_tiling_nnx_loss(self):
+    """
+    Tests loss correctness of vocab_tiling_nnx_loss on the NNX path: the tiled loss
+    should match the non-tiled cross-entropy computed from the same hidden states.
+    """
+    cfg = pyconfig.initialize(
+        self.base_config,
+        run_name="nnx_vocab_tiling_loss",
+        enable_checkpointing=False,
+        enable_dropout=False,
+        max_target_length=self.seq_len,
+        per_device_batch_size=self.batch_size,
+        logits_via_embedding=False,
+        base_num_decoder_layers=0,
+        dtype="float32",
+        matmul_precision="high",
+        num_vocab_tiling=4,
+        z_loss_multiplier=1e-4,
+        enable_nnx=True,
+        pure_nnx=True,
+    )
+    rng_model, rng_hidden, rng_targets = jax.random.split(self.rng, 3)
+    rngs = maxtext_utils_nnx.create_nnx_rngs(cfg, rng_key=rng_model)
+    mesh = maxtext_utils.get_mesh_from_config(cfg)
+    model = model_creation_utils.from_config(cfg, mesh=mesh, rngs=rngs)
+
+    hidden_states = jax.random.normal(rng_hidden, (self.batch_size, self.seq_len, cfg.emb_dim), dtype=jnp.float32)
+    data = {
+        "targets": jax.random.randint(rng_targets, (self.batch_size, self.seq_len), 0, cfg.vocab_size),
+        "targets_segmentation": jnp.ones((self.batch_size, self.seq_len)),
+    }
+
+    xent_sum_tiled, _ = vocab_tiling_nnx_loss(model, hidden_states, data, cfg, is_train=True)
+
+    # Reference: full logits with no tiling, same masking as the tiled path.
+    logits = model.logits_from_hidden_states_for_vocab_tiling(hidden_states, True, MODEL_MODE_TRAIN)
+    one_hot_targets = jax.nn.one_hot(data["targets"], cfg.vocab_size)
+    xent_ref, _ = max_utils.cross_entropy_with_logits(logits, one_hot_targets, z_loss=cfg.z_loss_multiplier)
+    xent_sum_ref = jnp.sum(xent_ref * (data["targets_segmentation"] != 0))
+
+    assert jnp.allclose(
+        xent_sum_tiled, xent_sum_ref, rtol=self.rtol, atol=self.atol
+    ), f"NNX vocab tiling loss {xent_sum_tiled} does not match non-tiled reference {xent_sum_ref}."
+
+  @pytest.mark.tpu_only
   def test_vocab_tiling_gradient_non_tied_embedding(self):
     """
     Tests loss and gradient correctness for a model with non-tied embeddings (FSDP).
@@ -275,6 +329,8 @@ class LossAndGradientCorrectnessTest(unittest.TestCase):
         matmul_precision="high",
         num_vocab_tiling=1,
     )
+    if getattr(cfg_non_tiling, "enable_nnx", False):
+      pytest.skip("We currently don't support vocab tiling on NNX module.")
     quant_non_tiling = quantizations.configure_quantization(cfg_non_tiling)
     devices_array_non_tiling = maxtext_utils.create_device_mesh(cfg_non_tiling)
     mesh_non_tiling = Mesh(devices_array_non_tiling, cfg_non_tiling.mesh_axes)
@@ -340,6 +396,8 @@ class LossAndGradientCorrectnessTest(unittest.TestCase):
         num_vocab_tiling=1,
     )
 
+    if getattr(cfg_non_tiling, "enable_nnx", False):
+      pytest.skip("We currently don't support vocab tiling on NNX module.")
     quant_non_tiling = quantizations.configure_quantization(cfg_non_tiling)
     devices_array_non_tiling = maxtext_utils.create_device_mesh(cfg_non_tiling)
     mesh_non_tiling = Mesh(devices_array_non_tiling, cfg_non_tiling.mesh_axes)
@@ -401,6 +459,8 @@ class LossAndGradientCorrectnessTest(unittest.TestCase):
         matmul_precision="high",
         num_vocab_tiling=1,
     )
+    if getattr(cfg_non_tiling, "enable_nnx", False):
+      pytest.skip("We currently don't support vocab tiling on NNX module.")
     quant_non_tiling = quantizations.configure_quantization(cfg_non_tiling)
     devices_array_non_tiling = maxtext_utils.create_device_mesh(cfg_non_tiling)
     mesh_non_tiling = Mesh(devices_array_non_tiling, cfg_non_tiling.mesh_axes)
@@ -465,6 +525,8 @@ class LossAndGradientCorrectnessTest(unittest.TestCase):
         matmul_precision="high",
         num_vocab_tiling=1,
     )
+    if getattr(cfg_non_tiling, "enable_nnx", False):
+      pytest.skip("We currently don't support vocab tiling on NNX module.")
     quant_non_tiling = quantizations.configure_quantization(cfg_non_tiling)
     devices_array_non_tiling = maxtext_utils.create_device_mesh(cfg_non_tiling)
     mesh_non_tiling = Mesh(devices_array_non_tiling, cfg_non_tiling.mesh_axes)
@@ -531,6 +593,8 @@ class LossAndGradientCorrectnessTest(unittest.TestCase):
         matmul_precision="high",
         num_vocab_tiling=1,
     )
+    if getattr(cfg_non_tiling, "enable_nnx", False):
+      pytest.skip("We currently don't support vocab tiling on NNX module.")
     quant_non_tiling = quantizations.configure_quantization(cfg_non_tiling)
     devices_array_non_tiling = maxtext_utils.create_device_mesh(cfg_non_tiling)
     mesh_non_tiling = Mesh(devices_array_non_tiling, cfg_non_tiling.mesh_axes)

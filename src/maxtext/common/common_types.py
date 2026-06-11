@@ -80,9 +80,12 @@ class MultimodalInput:
 
   image_embeddings: Array | None = None
   image_masks: Array | None = None
+  video_embeddings: Array | None = None
+  video_masks: Array | None = None
   audio_embeddings: Array | None = None
   audio_masks: Array | None = None
   bidirectional_mask: Array | None = None
+  bidirectional_mask_video: Array | None = None
 
 
 class DecoderBlockType(enum.Enum):
@@ -97,11 +100,13 @@ class DecoderBlockType(enum.Enum):
   GEMMA2 = "gemma2"
   GEMMA3 = "gemma3"
   GEMMA4 = "gemma4"
+  GEMMA4_SMALL = "gemma4_small"
   QWEN2 = "qwen2"
   QWEN3 = "qwen3"
   QWEN3_MOE = "qwen3_moe"
   QWEN3_CUSTOM_MOE = "qwen3_custom_moe"
   QWEN3_NEXT = "qwen3_next"
+  QWEN3_5 = "qwen3_5"
   GPT3 = "gpt3"
   GPT_OSS = "gpt_oss"
   SIMPLE = "simple"
@@ -115,6 +120,7 @@ class AttentionType(enum.Enum):
   LOCAL_SLIDING = "local_sliding"
   CHUNK = "chunk"
   MLA = "mla"
+  COMPRESSED = "compressed"
   FULL = "full"
 
 
@@ -137,3 +143,12 @@ class HyperConnectionType(enum.Enum):
   ATTENTION = "attention"
   MLP_MOE = "mlp_moe"
   MLP_DENSE = "mlp_dense"
+
+
+class CustomRule(enum.Enum):
+  DEFAULT = ""
+  PURE_FSDP = "pure-fsdp"
+  CP_AS_EP = "cp-as-ep"  # Support CP and EP together
+  EP_AS_CP = "ep-as-cp"  # Support EP only
+  PIPELINE_LARGE_MOE = "pipeline-large-moe"
+  FSDP_2D = "2d-fsdp"
