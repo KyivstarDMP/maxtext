@@ -53,10 +53,18 @@ def vocab_tiling_linen_loss(
     params: The model parameters.
     is_train: A boolean indicating if the model is in training mode.
   Returns:
-    A tuple of (total_loss, total_z_loss) computed via vocab tiling.
+    A tuple of (total_loss, total_z_loss, total_ul_loss) computed via vocab tiling.
+    ``total_loss`` is the summed cross-entropy (NLL, including z-loss); ``total_ul_loss``
+    is the summed token-level unlikelihood loss (0 when ``unlikelihood_alpha == 0`` or
+    not training) and is weighted by ``alpha`` at the call site.
   """
   labels = data["targets"]
   segmentation = data["targets_segmentation"]
+  use_unlikelihood = is_train and config.unlikelihood_alpha > 0
+  # Unlikelihood (scope B): negative candidates are the model's own prior output —
+  # the full `labels`/`segmentation` (targets / targets_segmentation) serve as the
+  # candidate context, since targets_segmentation is non-zero only on completion
+  # tokens. No separate `inputs` lookup is needed.
   deterministic = not config.enable_dropout if is_train else True
 
   param_spec = nn.get_partition_spec(params)
@@ -113,8 +121,8 @@ def vocab_tiling_linen_loss(
     """
     Calculates the total cross-entropy loss using vocab tiling.
     """
-    (total_loss, total_z_loss), _ = _chunked_cross_entropy_loss_fwd(gathered_params, hidden_states, labels, segmentation)
-    return total_loss, total_z_loss
+    outputs, _ = _chunked_cross_entropy_loss_fwd(gathered_params, hidden_states, labels, segmentation)
+    return outputs
 
   def _chunked_cross_entropy_loss_fwd(gathered_params, hidden_states, labels, segmentation):
     batch_size, seq_len, emb_dim = hidden_states.shape
@@ -125,11 +133,15 @@ def vocab_tiling_linen_loss(
     )
     reshaped_labels = _reshape(labels, (config.num_vocab_tiling, vocab_tile_size), reshaped_data_spec)
     reshaped_segmentation = _reshape(segmentation, (config.num_vocab_tiling, vocab_tile_size), reshaped_data_spec)
+    # Global flat positions (b * seq_len + i) for each token, tiled the same way,
+    # so the unlikelihood kernel can recover (b, i) and look up the input context.
+    flat_positions = jnp.arange(batch_size * seq_len, dtype=jnp.int32).reshape(batch_size, seq_len)
+    reshaped_positions = _reshape(flat_positions, (config.num_vocab_tiling, vocab_tile_size), reshaped_data_spec)
 
     # Scan body accumulates loss from each tile given chunked hidden states and labels
     def _fwd_scan_body(accumulators, chunk_data):
-      loss_accumulator, z_loss_accumulator = accumulators
-      hidden_chunk, label_chunk, segmentation_chunk = chunk_data
+      loss_accumulator, z_loss_accumulator, ul_accumulator = accumulators
+      hidden_chunk, label_chunk, segmentation_chunk, positions_chunk = chunk_data
       hidden_chunk = _maybe_shard_with_name(hidden_chunk, chunked_hidden_spec)
       label_chunk = _maybe_shard_with_name(label_chunk, chunked_data_spec)
       segmentation_chunk = _maybe_shard_with_name(segmentation_chunk, chunked_data_spec)
@@ -152,34 +164,60 @@ def vocab_tiling_linen_loss(
 
       loss_accumulator += masked_xent
       z_loss_accumulator += masked_z_loss
-      return (loss_accumulator, z_loss_accumulator), None
+      if use_unlikelihood:
+        ul_accumulator += max_utils.unlikelihood_loss_from_logits(
+            chunk_logits,
+            positions_chunk,
+            labels,
+            segmentation,
+            label_chunk,
+            segmentation_chunk,
+            seq_len=seq_len,
+            window=config.unlikelihood_window,
+            eps=config.unlikelihood_eps,
+        )
+      return (loss_accumulator, z_loss_accumulator, ul_accumulator), None
 
-    initial_acc = (0.0, 0.0)
-    (total_loss, total_z_loss), _ = jax.lax.scan(
-        _fwd_scan_body, initial_acc, (reshaped_hidden_states, reshaped_labels, reshaped_segmentation)
+    initial_acc = (0.0, 0.0, 0.0)
+    (total_loss, total_z_loss, total_ul_loss), _ = jax.lax.scan(
+        _fwd_scan_body,
+        initial_acc,
+        (reshaped_hidden_states, reshaped_labels, reshaped_segmentation, reshaped_positions),
     )
     residuals = (
         gathered_params,
         reshaped_hidden_states,
         reshaped_labels,
         reshaped_segmentation,
+        reshaped_positions,
         batch_size,
         seq_len,
         emb_dim,
     )
 
-    return (total_loss, total_z_loss), residuals
+    return (total_loss, total_z_loss, total_ul_loss), residuals
 
   def _chunked_cross_entropy_loss_bwd(residuals, cotangents):
     # Unpack the cotangents tuple. We ignore the z_loss cotangent since the gradients
-    # of the z_loss term are already factored into the loss_cotangent.
-    loss_cotangent, _ = cotangents
+    # of the z_loss term are already factored into the cross-entropy cotangent. The
+    # cross-entropy and unlikelihood cotangents are folded into the per-chunk loss so
+    # the chain rule produces grad(xent_cotangent * NLL + ul_cotangent * UL) directly.
+    loss_cotangent, _, ul_cotangent = cotangents
 
-    gathered_params, reshaped_hidden_states, reshaped_labels, reshaped_segmentation, batch_size, seq_len, emb_dim = (
-        residuals
-    )
+    (
+        gathered_params,
+        reshaped_hidden_states,
+        reshaped_labels,
+        reshaped_segmentation,
+        reshaped_positions,
+        batch_size,
+        seq_len,
+        emb_dim,
+    ) = residuals
 
-    def _single_chunk_loss_fn(input_params, input_hidden_chunk, input_label_chunk, input_segmentation_chunk):
+    def _single_chunk_loss_fn(
+        input_params, input_hidden_chunk, input_label_chunk, input_segmentation_chunk, input_positions_chunk
+    ):
       chunk_logits = model.apply(
           {"params": input_params["params"]},
           input_hidden_chunk,
@@ -189,10 +227,24 @@ def vocab_tiling_linen_loss(
       chunk_logits = _maybe_shard_with_name(chunk_logits, chunked_logits_spec)
       one_hot_label_chunk = jax.nn.one_hot(input_label_chunk, config.vocab_size)
       xent, _ = max_utils.cross_entropy_with_logits(chunk_logits, one_hot_label_chunk, z_loss=config.z_loss_multiplier)
-      return jnp.sum(xent * (input_segmentation_chunk != 0))
+      chunk_loss = loss_cotangent * jnp.sum(xent * (input_segmentation_chunk != 0))
+      if use_unlikelihood:
+        ul_sum = max_utils.unlikelihood_loss_from_logits(
+            chunk_logits,
+            input_positions_chunk,
+            labels,
+            segmentation,
+            input_label_chunk,
+            input_segmentation_chunk,
+            seq_len=seq_len,
+            window=config.unlikelihood_window,
+            eps=config.unlikelihood_eps,
+        )
+        chunk_loss = chunk_loss + ul_cotangent * ul_sum
+      return chunk_loss
 
     def _bwd_scan_body(grad_params_acc, chunk_data):
-      hidden_chunk, label_chunk, segmentation_chunk = chunk_data
+      hidden_chunk, label_chunk, segmentation_chunk, positions_chunk = chunk_data
 
       # Apply sharding constraints to the chunk data
       hidden_chunk = _maybe_shard_with_name(hidden_chunk, chunked_hidden_spec)
@@ -202,12 +254,12 @@ def vocab_tiling_linen_loss(
       # Create a loss function closure that captures the current chunk's labels and segmentation.
       # This gives `jax.vjp` a function with the required signature: `loss(params, hidden_states)`.
       # pylint: disable=unnecessary-lambda-assignment
-      loss_fn_for_vjp = lambda p, h: _single_chunk_loss_fn(p, h, label_chunk, segmentation_chunk)
+      loss_fn_for_vjp = lambda p, h: _single_chunk_loss_fn(p, h, label_chunk, segmentation_chunk, positions_chunk)
 
       # Get the vector-Jacobian product function wrt both params and hidden states
       _, vjp_fn = jax.vjp(loss_fn_for_vjp, gathered_params, hidden_chunk)
 
-      # 1.0 since total_loss is sum of all individual chunked loss
+      # 1.0 since the output cotangents are already folded into _single_chunk_loss_fn.
       (grad_params_update, grad_hidden_chunk) = vjp_fn(1.0)
       grad_hidden_chunk = _maybe_shard_with_name(grad_hidden_chunk, chunked_hidden_spec)
 
@@ -222,11 +274,11 @@ def vocab_tiling_linen_loss(
 
     # The scan now returns the total gradients for the params in the final carry
     grad_params, grad_reshaped_hidden_states = jax.lax.scan(
-        _bwd_scan_body, initial_grad_params_acc, (reshaped_hidden_states, reshaped_labels, reshaped_segmentation)
+        _bwd_scan_body,
+        initial_grad_params_acc,
+        (reshaped_hidden_states, reshaped_labels, reshaped_segmentation, reshaped_positions),
     )
     grad_reshaped_hidden_states = _maybe_shard_with_name(grad_reshaped_hidden_states, reshaped_hidden_spec)
-    # Chain-rule to accumulate gradients
-    grad_params = jax.tree_util.tree_map(lambda g: g * loss_cotangent, grad_params)
     # Cast cotangents back to each primal's dtype; custom_vjp requires dtype match.
     grad_params = jax.tree_util.tree_map(lambda x, y: y.astype(x.dtype), gathered_params, grad_params)
     # Give back sharding constraint
@@ -240,14 +292,14 @@ def vocab_tiling_linen_loss(
 
   chunked_cross_entropy_loss.defvjp(_chunked_cross_entropy_loss_fwd, _chunked_cross_entropy_loss_bwd)
 
-  total_loss, total_z_loss = chunked_cross_entropy_loss(
+  total_loss, total_z_loss, total_ul_loss = chunked_cross_entropy_loss(
       gathered_params,
       hidden_states,
       labels,
       segmentation,
   )
 
-  return total_loss, total_z_loss
+  return total_loss, total_z_loss, total_ul_loss
 
 
 def vocab_tiling_nnx_loss(model, hidden_states, data, config, is_train):
@@ -268,10 +320,15 @@ def vocab_tiling_nnx_loss(model, hidden_states, data, config, is_train):
     is_train: Whether the model is in training mode.
 
   Returns:
-    A tuple ``(total_loss, total_z_loss)``.
+    A tuple ``(total_loss, total_z_loss, total_ul_loss)``. ``total_ul_loss`` is the
+    summed token-level unlikelihood loss (0 when disabled) and is weighted by
+    ``alpha`` at the call site.
   """
   labels = data["targets"]
   segmentation = data["targets_segmentation"]
+  use_unlikelihood = is_train and config.unlikelihood_alpha > 0
+  # Unlikelihood (scope B): `labels`/`segmentation` are the candidate context (see
+  # vocab_tiling_linen_loss). No separate `inputs` lookup is needed.
   deterministic = not config.enable_dropout if is_train else True
   model_mode = "train"
 
@@ -328,6 +385,10 @@ def vocab_tiling_nnx_loss(model, hidden_states, data, config, is_train):
   )
   reshaped_labels = _reshape(labels, (config.num_vocab_tiling, vocab_tile_size), reshaped_data_spec)
   reshaped_segmentation = _reshape(segmentation, (config.num_vocab_tiling, vocab_tile_size), reshaped_data_spec)
+  # Global flat positions (b * seq_len + i) for each token, tiled the same way,
+  # so the unlikelihood kernel can recover (b, i) and look up the input context.
+  flat_positions = jnp.arange(batch_size * seq_len, dtype=jnp.int32).reshape(batch_size, seq_len)
+  reshaped_positions = _reshape(flat_positions, (config.num_vocab_tiling, vocab_tile_size), reshaped_data_spec)
 
   # Rebuild the model per chunk inside the scan: the output head pulls an rng stream, and
   # mutating the outer model's rng inside scan's sub-trace raises TraceContextError.
@@ -335,8 +396,8 @@ def vocab_tiling_nnx_loss(model, hidden_states, data, config, is_train):
   graphdef, model_state = nnx.split(model)
 
   def _scan_body(accumulators, chunk_data):
-    loss_accumulator, z_loss_accumulator = accumulators
-    hidden_chunk, label_chunk, segmentation_chunk = chunk_data
+    loss_accumulator, z_loss_accumulator, ul_accumulator = accumulators
+    hidden_chunk, label_chunk, segmentation_chunk, positions_chunk = chunk_data
     hidden_chunk = _maybe_shard_with_name(hidden_chunk, chunked_hidden_spec)
     label_chunk = _maybe_shard_with_name(label_chunk, chunked_data_spec)
     segmentation_chunk = _maybe_shard_with_name(segmentation_chunk, chunked_data_spec)
@@ -352,10 +413,27 @@ def vocab_tiling_nnx_loss(model, hidden_states, data, config, is_train):
     masked_xent = jnp.sum(chunk_xent * (segmentation_chunk != 0))
     masked_z_loss = jnp.sum(chunk_z_loss * (segmentation_chunk != 0))
 
-    return (loss_accumulator + masked_xent, z_loss_accumulator + masked_z_loss), None
+    ul_update = ul_accumulator
+    if use_unlikelihood:
+      ul_update = ul_accumulator + max_utils.unlikelihood_loss_from_logits(
+          chunk_logits,
+          positions_chunk,
+          labels,
+          segmentation,
+          label_chunk,
+          segmentation_chunk,
+          seq_len=seq_len,
+          window=config.unlikelihood_window,
+          eps=config.unlikelihood_eps,
+      ).astype(ul_accumulator.dtype)
+    return (loss_accumulator + masked_xent, z_loss_accumulator + masked_z_loss, ul_update), None
 
-  initial_acc = (jnp.zeros((), dtype=hidden_states.dtype), jnp.zeros((), dtype=hidden_states.dtype))
-  (total_loss, total_z_loss), _ = jax.lax.scan(
-      _scan_body, initial_acc, (reshaped_hidden_states, reshaped_labels, reshaped_segmentation)
+  initial_acc = (
+      jnp.zeros((), dtype=hidden_states.dtype),
+      jnp.zeros((), dtype=hidden_states.dtype),
+      jnp.zeros((), dtype=hidden_states.dtype),
   )
-  return total_loss, total_z_loss
+  (total_loss, total_z_loss, total_ul_loss), _ = jax.lax.scan(
+      _scan_body, initial_acc, (reshaped_hidden_states, reshaped_labels, reshaped_segmentation, reshaped_positions)
+  )
+  return total_loss, total_z_loss, total_ul_loss

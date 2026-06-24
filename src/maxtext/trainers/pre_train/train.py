@@ -80,6 +80,29 @@ def get_first_step(model, state):
   return int(state.optimizer.step.get_value())
 
 
+def _unlikelihood_loss_full(logits, data, config):
+  """Token-level unlikelihood loss on full (non-tiled) ``[B, S, V]`` logits.
+
+  Flattens the batch-sequence axis and defers to ``max_utils.unlikelihood_loss_from_logits``,
+  the same kernel used per tile in the vocab-tiling path, so the two paths agree.
+  Candidate scope B: ``targets`` / ``targets_segmentation`` are the candidate context
+  (the model's own completion tokens).
+  """
+  batch_size, seq_len = logits.shape[0], logits.shape[1]
+  positions = jnp.arange(batch_size * seq_len, dtype=jnp.int32)
+  return max_utils.unlikelihood_loss_from_logits(
+      logits.reshape(batch_size * seq_len, config.vocab_size),
+      positions,
+      data["targets"],
+      data["targets_segmentation"],
+      data["targets"].reshape(-1),
+      (data["targets_segmentation"] != 0).reshape(-1),
+      seq_len=seq_len,
+      window=config.unlikelihood_window,
+      eps=config.unlikelihood_eps,
+  )
+
+
 # -----------------------------------------------------------------------------
 # Top-level Functions
 # -----------------------------------------------------------------------------
@@ -107,6 +130,10 @@ def loss_fn(model, config, data, dropout_rng, params, sparsity_state=None, is_tr
   else:
     for k, v in data.items():
       data[k] = v[: config.micro_batch_size_to_eval_on, :]
+  # Token-level unlikelihood (anti-repetition) loss: L = L_NLL + alpha * L_UL.
+  # `ul_sum` is the (un-normalized) summed UL term; 0 unless enabled and training.
+  use_unlikelihood = is_train and config.unlikelihood_alpha > 0
+  ul_sum = 0.0
   mutable_collections = ["intermediates"]
   if config.mtp_num_layers > 0 and is_train:
     # The single model.apply call now triggers the entire chain if MTP is enabled:
@@ -156,7 +183,7 @@ def loss_fn(model, config, data, dropout_rng, params, sparsity_state=None, is_tr
     elif config.num_vocab_tiling > 1:
       hidden_state_key = ("intermediates", "decoder", "hidden_states")
       hidden_states = maxtext_utils.get_nested_value(intermediate_outputs, hidden_state_key)[0]
-      xent_sum, total_z_loss = vocab_tiling_linen_loss(hidden_states, data, config, model, params, is_train)
+      xent_sum, total_z_loss, ul_sum = vocab_tiling_linen_loss(hidden_states, data, config, model, params, is_train)
     else:
       one_hot_targets = jax.nn.one_hot(data["targets"], config.vocab_size)
       xent, z_loss = max_utils.cross_entropy_with_logits(logits, one_hot_targets, z_loss=config.z_loss_multiplier)
@@ -182,6 +209,8 @@ def loss_fn(model, config, data, dropout_rng, params, sparsity_state=None, is_tr
 
       xent_sum = jnp.sum(xent)
       total_z_loss = jnp.sum(z_loss)
+      if use_unlikelihood:
+        ul_sum = _unlikelihood_loss_full(logits, data, config)
   else:
     # Flax NNX model: forward pass, then pop Intermediates sown during it.
     logits = model(
@@ -200,7 +229,7 @@ def loss_fn(model, config, data, dropout_rng, params, sparsity_state=None, is_tr
     if config.num_vocab_tiling > 1:
       hidden_state_key = ("decoder", "hidden_states")
       hidden_states = maxtext_utils.get_nested_value(intermediate_outputs, hidden_state_key)[0]
-      xent_sum, total_z_loss = vocab_tiling_nnx_loss(model, hidden_states, data, config, is_train)
+      xent_sum, total_z_loss, ul_sum = vocab_tiling_nnx_loss(model, hidden_states, data, config, is_train)
     elif (config.use_indexer and not config.indexer_sparse_training) and is_train:
       # In Dense Warm-up stage, we skip main model loss calculation for efficiency.
       # The main model parameters are frozen and only the indexer is trained via KL divergence.
@@ -219,8 +248,15 @@ def loss_fn(model, config, data, dropout_rng, params, sparsity_state=None, is_tr
 
       xent_sum = jnp.sum(xent)
       total_z_loss = jnp.sum(z_loss)
+      if use_unlikelihood:
+        ul_sum = _unlikelihood_loss_full(logits, data, config)
 
   total_weights = jnp.sum(data["targets_segmentation"] != 0)
+  # Combine NLL with the alpha-weighted unlikelihood term: L = L_NLL + alpha * L_UL.
+  # Keeping `ul_sum` separate (it is a distinct differentiable output of the vocab-tiling
+  # custom_vjp) lets the chain rule scale its gradient by alpha automatically and keeps
+  # the pure-NLL `xent_sum` loggable on its own.
+  combined_sum = xent_sum + config.unlikelihood_alpha * ul_sum
   # If gradient accumulation is enabled, we don't need to divide xent_sum
   # by total_weights and then multiply the computed gradient by total_weights,
   # since it's equivalent to computing the gradient from xent_sum.
@@ -230,16 +266,17 @@ def loss_fn(model, config, data, dropout_rng, params, sparsity_state=None, is_tr
   # EPS was used to avoid division by zero, but it's not needed when gradient
   # accumulation is enabled since there's no division.
   if config.gradient_accumulation_steps > 1 and not config.use_tunix_gradient_accumulation:
-    loss = xent_sum
+    loss = combined_sum
   else:
     # When using Tunix gradient accumulation, we revert to standard normalization.
     # Unlike the manual accumulation path above, Tunix (via optax.MultiSteps) expects
     # a normalized loss for each step. It handles the accumulation state
     # updates and scaling internally.
-    loss = xent_sum / (total_weights + EPS)
+    loss = combined_sum / (total_weights + EPS)
 
-  # We keep z-loss normalized by total_weights.
+  # We keep z-loss and the (reported) unlikelihood loss normalized by total_weights.
   total_z_loss = total_z_loss / (total_weights + EPS)
+  ul_loss = ul_sum / (total_weights + EPS)
 
   # Calculate and Add MTP Loss
   mtp_loss = 0.0
@@ -281,6 +318,7 @@ def loss_fn(model, config, data, dropout_rng, params, sparsity_state=None, is_tr
       "intermediate_outputs": intermediate_outputs,
       "xent_sum": xent_sum,
       "z_loss": total_z_loss,
+      "ul_loss": ul_loss,
       "total_weights": total_weights,
       "moe_lb_loss": moe_lb_loss,
       "indexer_loss": indexer_loss,
@@ -398,6 +436,7 @@ def train_step(model, config, state_mesh_shardings, params_shardings, state, dat
   moe_lb_loss = aux["moe_lb_loss"]
   indexer_loss = aux.get("indexer_loss", 0.0)
   z_loss = aux.get("z_loss", 0.0)
+  ul_loss = aux.get("ul_loss", 0.0)
   moe_bias_updates = aux.get("moe_bias_updates")
   mtp_loss = aux.get("mtp_loss", 0.0)
   new_opt_state = None
@@ -493,6 +532,7 @@ def train_step(model, config, state_mesh_shardings, params_shardings, state, dat
       "learning/lm_loss": lm_loss,
       "learning/perplexity": jnp.exp(lm_loss),
       "learning/z_loss": z_loss,
+      "learning/ul_loss": ul_loss,
       "learning/moe_lb_loss": moe_lb_loss,
       "learning/indexer_loss": indexer_loss,
       "learning/mtp_loss": mtp_loss,

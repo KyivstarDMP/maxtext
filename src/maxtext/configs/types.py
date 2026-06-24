@@ -1114,6 +1114,24 @@ class Tokenizer(BaseModel):
       1,
       description="Enables memory-saving optimization by tiling cross-entropy loss computation. >1 to enable.",
   )
+  unlikelihood_alpha: float = Field(
+      0.0,
+      description=(
+          "Weight alpha of the token-level unlikelihood (anti-repetition) loss "
+          "L = L_NLL + alpha * L_UL. >0 enables it; 0 (default) disables it entirely."
+      ),
+  )
+  unlikelihood_window: int = Field(
+      0,
+      description=(
+          "Recent-context window W for unlikelihood negative candidates "
+          "(tokens already seen in the last W input positions). <=0 means the full prefix."
+      ),
+  )
+  unlikelihood_eps: float = Field(
+      1e-7,
+      description="Clamp floor for (1 - p) in the unlikelihood log term (numerical stability).",
+  )
 
 
 class DatasetGeneral(BaseModel):

@@ -642,6 +642,99 @@ def cross_entropy_with_logits(
   return loss, total_z_loss
 
 
+def unlikelihood_loss_from_logits(
+    logits,
+    positions,
+    context_ids,
+    context_segmentation,
+    gold,
+    loss_mask,
+    seq_len,
+    window,
+    eps=1e-7,
+):
+  """Token-level unlikelihood loss (Welleck et al., 2020) for a set of tokens.
+
+  Anti-repetition regularizer: for every token position it pushes *down* the
+  probability of "negative-candidate" tokens that already appeared in the recent
+  context, via ``-log(1 - p(c | x_<t))``. The penalty explodes as the model
+  becomes over-confident about repeating a context token (``p -> 1``).
+
+  This operates on a flat batch of ``m`` tokens whose full-vocabulary ``logits``
+  are given. It is shaped to drop straight into vocab tiling, where each tile
+  already materializes ``[m, V]`` logits for ``m = (B*S)/num_vocab_tiling`` tokens
+  (so it costs the same per-token memory as the chunked cross-entropy), but it is
+  equally usable on the flattened ``[B*S, V]`` logits of the non-tiled path.
+
+  Negative candidates for the token predicting ``gold[k]`` are the context tokens
+  at positions ``[i-window, i-1]`` (strictly before ``i``) of the same packed
+  example, excluding the gold token itself (so UL never fights NLL on the correct
+  token). Duplicates collapse to set semantics via the scatter.
+
+  **Candidate scope (B — self-generated).** Pass ``targets`` /
+  ``targets_segmentation`` as ``context_ids`` / ``context_segmentation``. Under
+  completion-only SFT, ``targets_segmentation`` is non-zero *only* on the model's
+  own completion tokens (its value is the packed-example id, 0 on prompt and
+  padding). The ``context_segmentation == cur_seg`` test therefore restricts
+  candidates to the model's *own* prior output within the *same* conversation —
+  prompt/user tokens and other packed examples are excluded — which targets
+  self-repetition rather than legitimate echoing of the prompt.
+
+  Args:
+    logits: ``[m, V]`` float logits over the full vocabulary.
+    positions: ``[m]`` int global flat positions ``b*seq_len + i`` of each token.
+    context_ids: ``[B, S]`` int token ids candidates are drawn from (``targets``).
+    context_segmentation: ``[B, S]`` int segment ids for ``context_ids``
+      (``targets_segmentation``); 0 marks tokens never eligible as candidates.
+    gold: ``[m]`` int gold target id of each token (excluded from candidates).
+    loss_mask: ``[m]`` mask; UL is summed only where this is non-zero (same mask
+      as the NLL / cross-entropy term, i.e. completion tokens under SFT).
+    seq_len: ``S``, the sequence length (static).
+    window: recent-context window ``W``; ``<= 0`` means the full prefix.
+    eps: clamp floor for ``1 - p`` (numerical stability of the log).
+
+  Returns:
+    A scalar: the masked sum of the per-token unlikelihood loss over ``m``.
+  """
+  m, vocab_size = logits.shape
+  s = seq_len
+  w = s if window <= 0 else min(window, s)
+
+  b = positions // s
+  i = positions % s
+
+  # Candidate positions: the W context tokens strictly before position i.
+  cand_pos = (i[:, None] - 1) - jnp.arange(w)[None, :]  # [m, w] -> [i-1, ..., i-w]
+  in_bounds = cand_pos >= 0
+  cand_pos_safe = jnp.clip(cand_pos, 0, s - 1)
+  rows_b = jnp.broadcast_to(b[:, None], cand_pos.shape)
+
+  cand_ids = context_ids[rows_b, cand_pos_safe]  # [m, w]
+  cand_seg = context_segmentation[rows_b, cand_pos_safe]  # [m, w]
+  cur_seg = context_segmentation[b, i]  # [m]
+
+  # Valid candidates: in-bounds, same segment as the current token (which also
+  # restricts to self-generated tokens — see scope B above), and not the gold
+  # token (so UL never fights the NLL term on the correct next token).
+  valid = in_bounds & (cand_seg == cur_seg[:, None]) & (cand_ids != gold[:, None])
+
+  # Scatter candidate ids into a per-token multi-hot mask over the vocabulary.
+  # Invalid candidates are routed to a sentinel column (index `vocab_size`) which
+  # is then sliced off; duplicate ids collapse to a single 1.0 (set semantics).
+  safe_ids = jnp.where(valid, cand_ids, vocab_size)  # [m, w]
+  row_idx = jnp.broadcast_to(jnp.arange(m)[:, None], safe_ids.shape)
+  neg = jnp.zeros((m, vocab_size + 1), dtype=jnp.bfloat16)
+  neg = neg.at[row_idx, safe_ids].set(jnp.asarray(1.0, dtype=jnp.bfloat16))
+  neg = neg[:, :vocab_size]  # [m, V]
+
+  # -log(1 - p) over the negative candidates, computed in fp32 for stability.
+  probs = jax.nn.softmax(logits.astype(jnp.float32), axis=-1)
+  log_one_minus_p = jnp.log(jnp.clip(1.0 - probs, eps, 1.0))
+  ul_per_token = -jnp.sum(neg.astype(jnp.float32) * log_one_minus_p, axis=-1)  # [m]
+  ul_per_token = ul_per_token * (loss_mask != 0)
+  return jnp.sum(ul_per_token)
+
+
 def _cross_entropy_with_logits_fwd(logits: jnp.ndarray, targets: jnp.ndarray, z_loss: float = 0.0) -> tuple[
     tuple[jnp.ndarray, jnp.ndarray],
     tuple[

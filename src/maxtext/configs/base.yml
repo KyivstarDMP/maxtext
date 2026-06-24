@@ -647,6 +647,16 @@ num_slices: -1
 # vocabularies (e.g., Gemma). Set to a value greater than 1 to enable.
 num_vocab_tiling: 1
 
+# Token-level unlikelihood loss (Welleck et al., 2020): anti-repetition regularizer
+# L = L_NLL + unlikelihood_alpha * L_UL, where L_UL penalizes -log(1 - p(c)) for
+# negative-candidate tokens c that already appeared in the recent input context.
+# unlikelihood_alpha=0 (default) disables it; >0 enables it (works with num_vocab_tiling>1).
+unlikelihood_alpha: 0.0
+# Recent-context window W for negative candidates; <=0 means the full prefix.
+unlikelihood_window: 0
+# Clamp floor for (1 - p) in the log term (numerical stability).
+unlikelihood_eps: 1.0e-7
+
 # Tokenizer
 vocab_size: 32_000 # powers of 2 for sharding
 tokenizer_path: ""
