@@ -657,6 +657,31 @@ unlikelihood_window: 0
 # Clamp floor for (1 - p) in the log term (numerical stability).
 unlikelihood_eps: 1.0e-7
 
+# DITTO repetition-penalization loss (Xu et al., NeurIPS 2022, "Learning to Break the
+# Loop"): paper-faithful anti-repetition fine-tuning. With probability
+# ditto_sequence_level_train_rate a step trains on a SYNTHETIC pseudo-repetition batch (a
+# completion sentence repeated to fill the answer) with a pure DITTO decay loss that pulls
+# each repeated token's probability down toward ditto_gamma * (detached prob of the same
+# token one period earlier); otherwise a normal MLE step. Teaches repetition probability to
+# decay geometrically. Works with num_vocab_tiling>1. ditto_alpha=0 (default) disables it.
+ditto_alpha: 0.0
+# Repetition-probability discount gamma (the original's rep_reduce_gamma); the decay
+# target is gamma * baseline. <1 suppresses repeats (0.5 is a strong, 0.95 a gentle setting).
+ditto_gamma: 0.5
+# Per-step probability of a (pure) DITTO step vs a normal MLE step (paper's
+# sequence-level-train-rate).
+ditto_sequence_level_train_rate: 0.5
+# Token ids that mark sentence boundaries. MUST be set when DITTO is enabled; empty -> no
+# sentences are found and DITTO is a no-op. Values below are for the project tokenizer
+# KyivstarDMP/llm-ua-morph-tokenizer-v2-gemma3 (the ids that actually realize in text):
+#   236761 = "."   236881 = "?"   236888 = "!"   107 = "\n"   108 = "\n\n"
+ditto_sentence_delim_ids: [107, 108, 236761, 236881, 236888]
+# Penalty form: "nl" (abs |p - target|, faithful default) / "nl_clip" (one-sided
+# relu(p - target), only penalize over-confidence) / "mse".
+ditto_loss_type: "nl"
+# Clamp floor for the (1 - ...) log term (numerical stability).
+ditto_eps: 1.0e-7
+
 # Tokenizer
 vocab_size: 32_000 # powers of 2 for sharding
 tokenizer_path: ""

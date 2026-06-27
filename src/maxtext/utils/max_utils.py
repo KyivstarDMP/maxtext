@@ -735,6 +735,111 @@ def unlikelihood_loss_from_logits(
   return jnp.sum(ul_per_token)
 
 
+def gold_prob_from_logits(logits, gold):
+  """Per-token probability the model assigns to the gold token.
+
+  Computes ``exp(gold_logit - logsumexp(logits))`` over the vocabulary axis in fp32.
+  Used both as the *live* current probability inside ``ditto_loss_from_logits`` and
+  (detached) to build the per-token baseline array ``gold_probs[B, S]``. Cheaper than
+  a full softmax: no ``[..., V]`` intermediate is materialized.
+
+  Args:
+    logits: ``[..., V]`` float logits over the full vocabulary.
+    gold: ``[...]`` int gold token ids.
+
+  Returns:
+    ``[...]`` fp32 gold probabilities.
+  """
+  logits = logits.astype(jnp.float32)
+  log_z = jax.scipy.special.logsumexp(logits, axis=-1)
+  gold_logit = jnp.take_along_axis(logits, gold[..., None], axis=-1)[..., 0]
+  return jnp.exp(gold_logit - log_z)
+
+
+def ditto_loss_from_logits(
+    logits,
+    positions,
+    gold,
+    gold_probs,
+    baseline_pos,
+    pen_mask,
+    seq_len,
+    gamma,
+    eps=1e-7,
+    loss_type="nl",
+):
+  """DITTO repetition-penalization loss (Xu et al., 2022) for a set of tokens.
+
+  Anti-repetition regularizer that fights the *self-reinforcement* of repetition: on a
+  synthetic pseudo-repetition sequence (a sentence repeated to fill the context), for
+  every token in the 2nd-or-later repetition it pulls the model's probability of the gold
+  (repeated) token *down* toward a geometrically decayed target ``gamma * baseline``,
+  where ``baseline`` is the model's (detached) probability of the **same token one period
+  earlier**. Iterating across repetitions drives ``p_n -> gamma * p_{n-1}`` — the
+  exponential decay DITTO teaches. See ``docs/008``.
+
+  The repetition period is **known by construction** (``build_pseudo_repetition`` in the
+  trainer), so this kernel needs no search: the baseline position and the penalized
+  positions arrive precomputed as the ``[B, S]`` maps ``baseline_pos`` (``= i - period``)
+  and ``pen_mask``. This is the original's ``obtain_rep_baseline_prob`` made exact.
+
+  Unlike the unlikelihood loss (which pushes *other* candidate tokens down and excludes
+  the gold token), DITTO acts on the **gold token itself**, deliberately opposing NLL on
+  repeat positions — that opposition is the mechanism. ``nl_clip`` only opposes NLL when
+  the model is already over the decayed target (the gentler one-sided signal).
+
+  Operates on a flat batch of ``m`` tokens whose full-vocabulary ``logits`` are given, so
+  it drops into vocab tiling (each tile materializes ``[m, V]`` logits for
+  ``m = (B*S)/num_vocab_tiling`` tokens) and is equally usable on the flattened
+  ``[B*S, V]`` non-tiled logits. The current gold probability ``p_i`` is the only
+  differentiable quantity — ``gold_probs`` (the baseline source) must be **detached** by
+  the caller (DITTO detaches the baseline).
+
+  Args:
+    logits: ``[m, V]`` float logits over the full vocabulary.
+    positions: ``[m]`` int global flat positions ``b*seq_len + i`` of each token.
+    gold: ``[m]`` int gold target id of each token (its current prob is penalized).
+    gold_probs: ``[B, S]`` fp32 **detached** per-token gold probabilities; the baseline
+      ``gamma * gold_probs[b, baseline_pos[b, i]]`` is gathered from here.
+    baseline_pos: ``[B, S]`` int position one period earlier for each token (already
+      clamped to ``[0, S-1]``); only read where ``pen_mask`` is non-zero.
+    pen_mask: ``[B, S]`` mask; the penalty is summed only where this is non-zero (the
+      2nd-or-later repetition of the pseudo-repeated, completion, valid region).
+    seq_len: ``S``, the sequence length (static).
+    gamma: repetition-probability discount ``gamma`` (the original's ``rep_reduce_gamma``).
+    eps: clamp floor for the ``1 - ...`` log term (numerical stability).
+    loss_type: ``"nl"`` (abs, faithful default) / ``"nl_clip"`` (one-sided) / ``"mse"``.
+
+  Returns:
+    A scalar: the masked sum of the per-token DITTO loss over ``m``.
+  """
+  s = seq_len
+  b = positions // s
+  i = positions % s
+
+  # Current (live) gold probability p_i; the gradient flows through this only.
+  p_i = gold_prob_from_logits(logits, gold)  # [m]
+
+  # Decayed target from the detached probability one period earlier.
+  baseline = gamma * gold_probs[b, baseline_pos[b, i]]  # [m]
+  diff = p_i - baseline  # [m]
+
+  if loss_type == "nl":
+    pen = -jnp.log(jnp.clip(1.0 - jnp.abs(diff), eps, 1.0))
+  elif loss_type == "nl_clip":
+    pen = -jnp.log(jnp.clip(1.0 - jnp.maximum(diff, 0.0), eps, 1.0))
+  elif loss_type == "mse":
+    # The original scales the MSE term by 3 (its raw magnitude is below NLL's). The
+    # original's MSE path omits the repeat mask (a latent bug penalizing every gold
+    # prob toward 0); we mask all three variants consistently.
+    pen = jnp.square(diff) * 3.0
+  else:
+    raise ValueError(f"Unknown ditto_loss_type: {loss_type!r} (expected 'nl', 'nl_clip', or 'mse').")
+
+  pen = pen * pen_mask[b, i].astype(pen.dtype)
+  return jnp.sum(pen)
+
+
 def _cross_entropy_with_logits_fwd(logits: jnp.ndarray, targets: jnp.ndarray, z_loss: float = 0.0) -> tuple[
     tuple[jnp.ndarray, jnp.ndarray],
     tuple[

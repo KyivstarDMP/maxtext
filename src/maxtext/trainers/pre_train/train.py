@@ -80,6 +80,11 @@ def get_first_step(model, state):
   return int(state.optimizer.step.get_value())
 
 
+# Constant tag folded into the per-step rng to derive DITTO's coin/sentence stream
+# without consuming the dropout rng stream.
+_DITTO_RNG_TAG = 0xD1770
+
+
 def _unlikelihood_loss_full(logits, data, config):
   """Token-level unlikelihood loss on full (non-tiled) ``[B, S, V]`` logits.
 
@@ -101,6 +106,115 @@ def _unlikelihood_loss_full(logits, data, config):
       window=config.unlikelihood_window,
       eps=config.unlikelihood_eps,
   )
+
+
+def _ditto_loss_full(logits, data, config):
+  """DITTO decay loss on full (non-tiled) ``[B, S, V]`` logits.
+
+  Flattens the batch-sequence axis and defers to ``max_utils.ditto_loss_from_logits``,
+  the same kernel used per tile in the vocab-tiling path, so the two paths agree. The
+  baseline ``gold_probs`` is the detached per-token gold probability of the *same* logits.
+  Reads the precomputed period maps ``ditto_baseline_pos`` / ``ditto_pen_mask`` from
+  ``data`` (built by :func:`build_pseudo_repetition`).
+  """
+  batch_size, seq_len = logits.shape[0], logits.shape[1]
+  flat_logits = logits.reshape(batch_size * seq_len, config.vocab_size)
+  gold = data["targets"].reshape(-1)
+  gold_probs = jax.lax.stop_gradient(max_utils.gold_prob_from_logits(flat_logits, gold)).reshape(
+      batch_size, seq_len
+  )
+  positions = jnp.arange(batch_size * seq_len, dtype=jnp.int32)
+  return max_utils.ditto_loss_from_logits(
+      flat_logits,
+      positions,
+      gold,
+      gold_probs,
+      data["ditto_baseline_pos"],
+      data["ditto_pen_mask"],
+      seq_len=seq_len,
+      gamma=config.ditto_gamma,
+      eps=config.ditto_eps,
+      loss_type=config.ditto_loss_type,
+  )
+
+
+def build_pseudo_repetition(inputs, targets, targets_segmentation, delim_ids, rng):
+  """Build a synthetic pseudo-repetition batch for a DITTO step (Xu et al., 2022).
+
+  Reproduces the paper's ``re_orgnize_sentence`` for MaxText's completion-only SFT layout
+  (``targets[i] = inputs[i+1]`` after ``shift_and_refine``, ``targets_segmentation != 0``
+  on the assistant completion). Per row it makes the assistant **start repeating one of
+  its own sentences partway through the answer**, keeping the prompt and earlier answer as
+  context. See ``docs/008``.
+
+  Args:
+    inputs: ``[B, S]`` int decoder input tokens.
+    targets: ``[B, S]`` int next-token targets (``= inputs`` shifted left).
+    targets_segmentation: ``[B, S]`` int; non-zero marks the assistant completion.
+    delim_ids: a (static) tuple of token ids that mark sentence boundaries.
+    rng: a PRNGKey used to pick the repeated sentence per row.
+
+  Returns:
+    ``(new_inputs, new_targets, baseline_pos, pen_mask)``. ``baseline_pos[b, i] = i -
+    period`` (clamped) and ``pen_mask[b, i]`` marks the 2nd-or-later repetition (the
+    positions the decay loss penalizes). Rows with < 3 completion sentences are left
+    unchanged with an all-zero ``pen_mask`` (a jit-friendly per-row relaxation of the
+    original's whole-batch skip).
+  """
+  b_dim, s_dim = inputs.shape
+  idx = jnp.arange(s_dim, dtype=jnp.int32)[None, :]  # [1, S]
+  if not delim_ids:
+    # No sentence delimiters configured -> DITTO is a no-op (empty pen_mask).
+    zeros = jnp.zeros((b_dim, s_dim), dtype=jnp.int32)
+    return inputs, targets, jnp.broadcast_to(idx, (b_dim, s_dim)).astype(jnp.int32), zeros
+
+  comp_lab = targets_segmentation != 0  # [B, S] label-space completion
+  # inputs[j] is a completion token  <=>  targets_segmentation[j-1] != 0  (shift_right).
+  cmask_in = jnp.concatenate([jnp.zeros((b_dim, 1), dtype=bool), comp_lab[:, :-1]], axis=1)
+
+  delim_arr = jnp.asarray(delim_ids, dtype=inputs.dtype)
+  is_delim = jnp.isin(inputs, delim_arr) & cmask_in  # [B, S]
+  cum = jnp.cumsum(is_delim.astype(jnp.int32), axis=1)  # [B, S]
+  num_delims = cum[:, -1]  # [B]
+  valid = num_delims >= 3  # need >= 3 delimiters to define a prefix + a repeated sentence
+
+  # Pick a 0-indexed delimiter rank r in [1, num_delims - 2] per row.
+  u = jax.random.uniform(rng, (b_dim,))
+  r = (1 + jnp.floor(u * jnp.maximum(num_delims - 2, 1)).astype(jnp.int32)).astype(jnp.int32)
+
+  def pos_of_rank(k):  # position of the k-th (0-indexed) delimiter = first j with cum[j] >= k+1
+    return jnp.argmax(cum >= (k + 1)[:, None], axis=1).astype(jnp.int32)
+
+  s_start = pos_of_rank(r)  # e_r
+  e_next = pos_of_rank(r + 1)  # e_{r+1}
+  period = jnp.maximum(e_next - s_start, 1)  # [B]
+
+  # run_end: first completion-input position after s_start that ends the run, else S.
+  after = (~cmask_in) & (idx > s_start[:, None])  # [B, S]
+  run_end = jnp.where(jnp.any(after, axis=1), jnp.argmax(after, axis=1).astype(jnp.int32), s_dim)  # [B]
+
+  # Overwrite inputs on [s_start, run_end) with the period-`period` repeat of the unit.
+  in_region = (idx >= s_start[:, None]) & (idx < run_end[:, None]) & valid[:, None]  # [B, S]
+  src = s_start[:, None] + ((idx - s_start[:, None]) % period[:, None])
+  src = jnp.clip(src, 0, s_dim - 1)
+  repeated = jnp.take_along_axis(inputs, src, axis=1)
+  new_inputs = jnp.where(in_region, repeated, inputs)
+
+  # targets[i] = new_inputs[i+1] (shift_left); only changed where i+1 is in the region.
+  shifted = jnp.concatenate([new_inputs[:, 1:], inputs[:, -1:]], axis=1)
+  tgt_changed = jnp.concatenate([in_region[:, 1:], jnp.zeros((b_dim, 1), dtype=bool)], axis=1)
+  new_targets = jnp.where(tgt_changed, shifted, targets)
+
+  # Penalize label positions in the 2nd-or-later repetition: targets[i] is repeated for
+  # i >= s_start - 1 (i.e. i+1 >= s_start); the baseline at i-period exists in the 1st
+  # repetition for i >= s_start + period - 1; and targets[i] stays in-region for i < run_end - 1.
+  pen_start = s_start + period - 1
+  pen_mask = (
+      (idx >= pen_start[:, None]) & (idx < (run_end - 1)[:, None]) & valid[:, None] & comp_lab
+  ).astype(jnp.int32)
+  baseline_pos = jnp.clip(idx - period[:, None], 0, s_dim - 1).astype(jnp.int32)
+  baseline_pos = jnp.broadcast_to(baseline_pos, (b_dim, s_dim))
+  return new_inputs, new_targets, baseline_pos, pen_mask
 
 
 # -----------------------------------------------------------------------------
@@ -130,10 +244,35 @@ def loss_fn(model, config, data, dropout_rng, params, sparsity_state=None, is_tr
   else:
     for k, v in data.items():
       data[k] = v[: config.micro_batch_size_to_eval_on, :]
-  # Token-level unlikelihood (anti-repetition) loss: L = L_NLL + alpha * L_UL.
-  # `ul_sum` is the (un-normalized) summed UL term; 0 unless enabled and training.
+  # Anti-repetition regularizers. Unlikelihood adds `alpha * L_UL` to the NLL on the real
+  # batch. DITTO (paper-faithful) instead alternates: with probability
+  # `ditto_sequence_level_train_rate` the step trains on a synthetic pseudo-repetition
+  # batch with a pure DITTO decay loss; otherwise a normal MLE step.
   use_unlikelihood = is_train and config.unlikelihood_alpha > 0
+  use_ditto = is_train and config.ditto_alpha > 0
   ul_sum = 0.0
+  ditto_sum = 0.0
+  ditto_step = jnp.array(False)
+  if use_ditto:
+    # Derive an independent per-step rng (fold_in does not consume the dropout stream).
+    base_rng = dropout_rng if dropout_rng is not None else jax.random.PRNGKey(0)
+    ditto_rng = jax.random.fold_in(base_rng, _DITTO_RNG_TAG)
+    coin_rng, sentence_rng = jax.random.split(ditto_rng)
+    ditto_step = jax.random.uniform(coin_rng, ()) < config.ditto_sequence_level_train_rate
+    pr_inputs, pr_targets, ditto_baseline_pos, ditto_pen_mask = build_pseudo_repetition(
+        data["inputs"],
+        data["targets"],
+        data["targets_segmentation"],
+        tuple(config.ditto_sentence_delim_ids),
+        sentence_rng,
+    )
+    # On a DITTO step swap in the synthetic sequence; otherwise leave the batch untouched
+    # and zero the penalty mask so the DITTO term vanishes (the loss select below also
+    # discards it, but this avoids any wasted/garbage penalty on MLE steps).
+    data["inputs"] = jnp.where(ditto_step, pr_inputs, data["inputs"])
+    data["targets"] = jnp.where(ditto_step, pr_targets, data["targets"])
+    data["ditto_baseline_pos"] = ditto_baseline_pos
+    data["ditto_pen_mask"] = jnp.where(ditto_step, ditto_pen_mask, jnp.zeros_like(ditto_pen_mask))
   mutable_collections = ["intermediates"]
   if config.mtp_num_layers > 0 and is_train:
     # The single model.apply call now triggers the entire chain if MTP is enabled:
@@ -183,7 +322,9 @@ def loss_fn(model, config, data, dropout_rng, params, sparsity_state=None, is_tr
     elif config.num_vocab_tiling > 1:
       hidden_state_key = ("intermediates", "decoder", "hidden_states")
       hidden_states = maxtext_utils.get_nested_value(intermediate_outputs, hidden_state_key)[0]
-      xent_sum, total_z_loss, ul_sum = vocab_tiling_linen_loss(hidden_states, data, config, model, params, is_train)
+      xent_sum, total_z_loss, ul_sum, ditto_sum = vocab_tiling_linen_loss(
+          hidden_states, data, config, model, params, is_train
+      )
     else:
       one_hot_targets = jax.nn.one_hot(data["targets"], config.vocab_size)
       xent, z_loss = max_utils.cross_entropy_with_logits(logits, one_hot_targets, z_loss=config.z_loss_multiplier)
@@ -211,6 +352,8 @@ def loss_fn(model, config, data, dropout_rng, params, sparsity_state=None, is_tr
       total_z_loss = jnp.sum(z_loss)
       if use_unlikelihood:
         ul_sum = _unlikelihood_loss_full(logits, data, config)
+      if use_ditto:
+        ditto_sum = _ditto_loss_full(logits, data, config)
   else:
     # Flax NNX model: forward pass, then pop Intermediates sown during it.
     logits = model(
@@ -229,7 +372,9 @@ def loss_fn(model, config, data, dropout_rng, params, sparsity_state=None, is_tr
     if config.num_vocab_tiling > 1:
       hidden_state_key = ("decoder", "hidden_states")
       hidden_states = maxtext_utils.get_nested_value(intermediate_outputs, hidden_state_key)[0]
-      xent_sum, total_z_loss, ul_sum = vocab_tiling_nnx_loss(model, hidden_states, data, config, is_train)
+      xent_sum, total_z_loss, ul_sum, ditto_sum = vocab_tiling_nnx_loss(
+          model, hidden_states, data, config, is_train
+      )
     elif (config.use_indexer and not config.indexer_sparse_training) and is_train:
       # In Dense Warm-up stage, we skip main model loss calculation for efficiency.
       # The main model parameters are frozen and only the indexer is trained via KL divergence.
@@ -250,13 +395,18 @@ def loss_fn(model, config, data, dropout_rng, params, sparsity_state=None, is_tr
       total_z_loss = jnp.sum(z_loss)
       if use_unlikelihood:
         ul_sum = _unlikelihood_loss_full(logits, data, config)
+      if use_ditto:
+        ditto_sum = _ditto_loss_full(logits, data, config)
 
   total_weights = jnp.sum(data["targets_segmentation"] != 0)
-  # Combine NLL with the alpha-weighted unlikelihood term: L = L_NLL + alpha * L_UL.
-  # Keeping `ul_sum` separate (it is a distinct differentiable output of the vocab-tiling
-  # custom_vjp) lets the chain rule scale its gradient by alpha automatically and keeps
-  # the pure-NLL `xent_sum` loggable on its own.
+  # MLE-step loss: NLL plus the optional alpha-weighted unlikelihood term. On a DITTO step
+  # we replace it with the pure DITTO decay loss (paper-faithful alternation): the data is
+  # already the synthetic pseudo-repetition batch, so the NLL there is meaningless and the
+  # `jnp.where` discards it (and its gradient). Each term is a distinct differentiable
+  # output of the vocab-tiling custom_vjp, so the chain rule scales the gradient correctly.
   combined_sum = xent_sum + config.unlikelihood_alpha * ul_sum
+  if use_ditto:
+    combined_sum = jnp.where(ditto_step, config.ditto_alpha * ditto_sum, combined_sum)
   # If gradient accumulation is enabled, we don't need to divide xent_sum
   # by total_weights and then multiply the computed gradient by total_weights,
   # since it's equivalent to computing the gradient from xent_sum.
@@ -274,9 +424,10 @@ def loss_fn(model, config, data, dropout_rng, params, sparsity_state=None, is_tr
     # updates and scaling internally.
     loss = combined_sum / (total_weights + EPS)
 
-  # We keep z-loss and the (reported) unlikelihood loss normalized by total_weights.
+  # We keep z-loss and the (reported) unlikelihood / DITTO losses normalized by total_weights.
   total_z_loss = total_z_loss / (total_weights + EPS)
   ul_loss = ul_sum / (total_weights + EPS)
+  ditto_loss = ditto_sum / (total_weights + EPS)
 
   # Calculate and Add MTP Loss
   mtp_loss = 0.0
@@ -319,6 +470,7 @@ def loss_fn(model, config, data, dropout_rng, params, sparsity_state=None, is_tr
       "xent_sum": xent_sum,
       "z_loss": total_z_loss,
       "ul_loss": ul_loss,
+      "ditto_loss": ditto_loss,
       "total_weights": total_weights,
       "moe_lb_loss": moe_lb_loss,
       "indexer_loss": indexer_loss,
@@ -352,6 +504,12 @@ def train_step(model, config, state_mesh_shardings, params_shardings, state, dat
   else:
     state = nnx.merge(model, state)  # reconstruct TrainStateNNX
     loss_model, loss_params, loss_rng = state.model, None, None
+    # The NNX path is not handed a per-step rng through the jit signature (in_shardings has
+    # no rng slot), so DITTO's coin/sentence selection would be frozen across steps. Derive
+    # a step-varying key from the optimizer step (the same accessor get_first_step uses) so
+    # the DITTO alternation works on NNX as it does on Linen. Only when DITTO is enabled.
+    if config.ditto_alpha > 0:
+      loss_rng = jax.random.fold_in(jax.random.PRNGKey(0), state.optimizer.step.get_value().astype(jnp.uint32))
 
   # --- Gradient computation ---
   if config.gradient_accumulation_steps > 1:
@@ -411,7 +569,8 @@ def train_step(model, config, state_mesh_shardings, params_shardings, state, dat
 
       def diff_wrapper(param, rest, config, data):
         local_model = nnx.merge(model_graphdef, param, rest, copy=True)
-        loss, aux = loss_fn(local_model, config, data, None, None, is_train=True)
+        # Pass the step-derived rng (loss_rng) so DITTO's per-step coin varies on NNX too.
+        loss, aux = loss_fn(local_model, config, data, loss_rng, None, is_train=True)
         _, _, new_rest = nnx.split(local_model, nnx.Param, ...)
         return loss, (aux, new_rest)
 
@@ -437,6 +596,7 @@ def train_step(model, config, state_mesh_shardings, params_shardings, state, dat
   indexer_loss = aux.get("indexer_loss", 0.0)
   z_loss = aux.get("z_loss", 0.0)
   ul_loss = aux.get("ul_loss", 0.0)
+  ditto_loss = aux.get("ditto_loss", 0.0)
   moe_bias_updates = aux.get("moe_bias_updates")
   mtp_loss = aux.get("mtp_loss", 0.0)
   new_opt_state = None
@@ -533,6 +693,7 @@ def train_step(model, config, state_mesh_shardings, params_shardings, state, dat
       "learning/perplexity": jnp.exp(lm_loss),
       "learning/z_loss": z_loss,
       "learning/ul_loss": ul_loss,
+      "learning/ditto_loss": ditto_loss,
       "learning/moe_lb_loss": moe_lb_loss,
       "learning/indexer_loss": indexer_loss,
       "learning/mtp_loss": mtp_loss,

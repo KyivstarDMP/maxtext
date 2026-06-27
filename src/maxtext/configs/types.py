@@ -1132,6 +1132,42 @@ class Tokenizer(BaseModel):
       1e-7,
       description="Clamp floor for (1 - p) in the unlikelihood log term (numerical stability).",
   )
+  ditto_alpha: float = Field(
+      0.0,
+      description=(
+          "Weight alpha of the DITTO repetition-penalization decay loss (Xu et al., 2022). "
+          ">0 enables paper-faithful DITTO fine-tuning; 0 (default) disables it entirely."
+      ),
+  )
+  ditto_gamma: float = Field(
+      0.5,
+      description=(
+          "Repetition-probability discount gamma (the original's rep_reduce_gamma); the DITTO "
+          "decay target is gamma * (detached prob one period earlier)."
+      ),
+  )
+  ditto_sequence_level_train_rate: float = Field(
+      0.5,
+      description="Per-step probability of a (pure) DITTO step on synthetic pseudo-repetition data vs a normal MLE step.",
+  )
+  ditto_sentence_delim_ids: list[int] = Field(
+      default_factory=list,
+      description=(
+          "Token ids that mark sentence boundaries for building pseudo-repetition data "
+          "(e.g. ids of '.' '!' '?' newline). Must be set when DITTO is enabled; empty -> no-op."
+      ),
+  )
+  ditto_loss_type: str = Field(
+      "nl",
+      description=(
+          "DITTO penalty form: 'nl' (abs, faithful default) / 'nl_clip' (one-sided, "
+          "penalize only over-confidence) / 'mse'."
+      ),
+  )
+  ditto_eps: float = Field(
+      1e-7,
+      description="Clamp floor for the (1 - ...) DITTO log term (numerical stability).",
+  )
 
 
 class DatasetGeneral(BaseModel):

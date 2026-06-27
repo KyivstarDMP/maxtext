@@ -53,18 +53,24 @@ def vocab_tiling_linen_loss(
     params: The model parameters.
     is_train: A boolean indicating if the model is in training mode.
   Returns:
-    A tuple of (total_loss, total_z_loss, total_ul_loss) computed via vocab tiling.
-    ``total_loss`` is the summed cross-entropy (NLL, including z-loss); ``total_ul_loss``
-    is the summed token-level unlikelihood loss (0 when ``unlikelihood_alpha == 0`` or
-    not training) and is weighted by ``alpha`` at the call site.
+    A tuple of (total_loss, total_z_loss, total_ul_loss, total_ditto_loss) computed via
+    vocab tiling. ``total_loss`` is the summed cross-entropy (NLL, including z-loss);
+    ``total_ul_loss`` is the summed token-level unlikelihood loss and ``total_ditto_loss``
+    the summed DITTO repetition-penalization loss (each 0 when its ``*_alpha == 0`` or not
+    training), weighted by their respective ``alpha`` at the call site.
   """
   labels = data["targets"]
   segmentation = data["targets_segmentation"]
   use_unlikelihood = is_train and config.unlikelihood_alpha > 0
-  # Unlikelihood (scope B): negative candidates are the model's own prior output —
-  # the full `labels`/`segmentation` (targets / targets_segmentation) serve as the
-  # candidate context, since targets_segmentation is non-zero only on completion
-  # tokens. No separate `inputs` lookup is needed.
+  use_ditto = is_train and config.ditto_alpha > 0
+  # Unlikelihood (scope B): the negative candidates are the model's own prior output —
+  # the full `labels`/`segmentation` serve as the candidate context, since
+  # targets_segmentation is non-zero only on completion tokens.
+  # DITTO operates on a synthetic pseudo-repetition `data` (built in the trainer) with a
+  # known period: `ditto_baseline_pos[b,i] = i - period` and `ditto_pen_mask[b,i]` (the
+  # 2nd-or-later repetition) arrive precomputed in `data`.
+  ditto_baseline_pos = data["ditto_baseline_pos"] if use_ditto else None
+  ditto_pen_mask = data["ditto_pen_mask"] if use_ditto else None
   deterministic = not config.enable_dropout if is_train else True
 
   param_spec = nn.get_partition_spec(params)
@@ -112,8 +118,43 @@ def vocab_tiling_linen_loss(
   hidden_states = _maybe_shard_with_name(hidden_states, hidden_spec)
   labels = _maybe_shard_with_name(labels, label_spec)
   segmentation = _maybe_shard_with_name(segmentation, label_spec)
+  if use_ditto:
+    ditto_baseline_pos = _maybe_shard_with_name(ditto_baseline_pos, label_spec)
+    ditto_pen_mask = _maybe_shard_with_name(ditto_pen_mask, label_spec)
   # TODO (chengnuojin) all gather only embedding table instead of all params after NNX module is enabled
   gathered_params = all_gather_over_fsdp(params, param_spec, model.mesh, config.logical_axis_rules, config.shard_mode)
+
+  def _gold_probs_linen():
+    """Detached per-token gold probabilities ``[B, S]`` via a forward-only tiled scan.
+
+    The DITTO baseline (the previous-occurrence probability the penalty decays toward)
+    may live in an earlier tile, so it is precomputed once here over the whole batch and
+    captured in the custom_vjp closure like ``labels``. Wrapped in ``stop_gradient`` —
+    DITTO detaches the baseline — so it contributes no gradient. Costs one extra forward
+    over the logits when DITTO is enabled.
+    """
+    bsz, slen, edim = hidden_states.shape
+    tile = (bsz * slen) // config.num_vocab_tiling
+    rh = _reshape(hidden_states, (config.num_vocab_tiling, tile, edim), reshaped_hidden_spec)
+    rl = _reshape(labels, (config.num_vocab_tiling, tile), reshaped_data_spec)
+
+    def _gp_body(_, chunk):
+      h, gp_label = chunk
+      h = _maybe_shard_with_name(h, chunked_hidden_spec)
+      gp_label = _maybe_shard_with_name(gp_label, chunked_data_spec)
+      logits = model.apply(
+          {"params": gathered_params["params"]},
+          h,
+          deterministic=deterministic,
+          method="logits_from_hidden_states_for_vocab_tiling",
+      )
+      logits = _maybe_shard_with_name(logits, chunked_logits_spec)
+      return None, max_utils.gold_prob_from_logits(logits, gp_label)
+
+    _, gp_tiles = jax.lax.scan(_gp_body, None, (rh, rl))
+    return jax.lax.stop_gradient(_reshape(gp_tiles, (bsz, slen), label_spec))
+
+  gold_probs = _gold_probs_linen() if use_ditto else None
 
   # Customized forward and backward maps for the embedding tiling
   @jax.custom_vjp
@@ -140,7 +181,7 @@ def vocab_tiling_linen_loss(
 
     # Scan body accumulates loss from each tile given chunked hidden states and labels
     def _fwd_scan_body(accumulators, chunk_data):
-      loss_accumulator, z_loss_accumulator, ul_accumulator = accumulators
+      loss_accumulator, z_loss_accumulator, ul_accumulator, ditto_accumulator = accumulators
       hidden_chunk, label_chunk, segmentation_chunk, positions_chunk = chunk_data
       hidden_chunk = _maybe_shard_with_name(hidden_chunk, chunked_hidden_spec)
       label_chunk = _maybe_shard_with_name(label_chunk, chunked_data_spec)
@@ -176,10 +217,23 @@ def vocab_tiling_linen_loss(
             window=config.unlikelihood_window,
             eps=config.unlikelihood_eps,
         )
-      return (loss_accumulator, z_loss_accumulator, ul_accumulator), None
+      if use_ditto:
+        ditto_accumulator += max_utils.ditto_loss_from_logits(
+            chunk_logits,
+            positions_chunk,
+            label_chunk,
+            gold_probs,
+            ditto_baseline_pos,
+            ditto_pen_mask,
+            seq_len=seq_len,
+            gamma=config.ditto_gamma,
+            eps=config.ditto_eps,
+            loss_type=config.ditto_loss_type,
+        )
+      return (loss_accumulator, z_loss_accumulator, ul_accumulator, ditto_accumulator), None
 
-    initial_acc = (0.0, 0.0, 0.0)
-    (total_loss, total_z_loss, total_ul_loss), _ = jax.lax.scan(
+    initial_acc = (0.0, 0.0, 0.0, 0.0)
+    (total_loss, total_z_loss, total_ul_loss, total_ditto_loss), _ = jax.lax.scan(
         _fwd_scan_body,
         initial_acc,
         (reshaped_hidden_states, reshaped_labels, reshaped_segmentation, reshaped_positions),
@@ -195,14 +249,14 @@ def vocab_tiling_linen_loss(
         emb_dim,
     )
 
-    return (total_loss, total_z_loss, total_ul_loss), residuals
+    return (total_loss, total_z_loss, total_ul_loss, total_ditto_loss), residuals
 
   def _chunked_cross_entropy_loss_bwd(residuals, cotangents):
     # Unpack the cotangents tuple. We ignore the z_loss cotangent since the gradients
     # of the z_loss term are already factored into the cross-entropy cotangent. The
-    # cross-entropy and unlikelihood cotangents are folded into the per-chunk loss so
-    # the chain rule produces grad(xent_cotangent * NLL + ul_cotangent * UL) directly.
-    loss_cotangent, _, ul_cotangent = cotangents
+    # cross-entropy, unlikelihood and DITTO cotangents are folded into the per-chunk loss
+    # so the chain rule produces grad(c_xent * NLL + c_ul * UL + c_ditto * DITTO) directly.
+    loss_cotangent, _, ul_cotangent, ditto_cotangent = cotangents
 
     (
         gathered_params,
@@ -241,6 +295,20 @@ def vocab_tiling_linen_loss(
             eps=config.unlikelihood_eps,
         )
         chunk_loss = chunk_loss + ul_cotangent * ul_sum
+      if use_ditto:
+        ditto_sum = max_utils.ditto_loss_from_logits(
+            chunk_logits,
+            input_positions_chunk,
+            input_label_chunk,
+            gold_probs,
+            ditto_baseline_pos,
+            ditto_pen_mask,
+            seq_len=seq_len,
+            gamma=config.ditto_gamma,
+            eps=config.ditto_eps,
+            loss_type=config.ditto_loss_type,
+        )
+        chunk_loss = chunk_loss + ditto_cotangent * ditto_sum
       return chunk_loss
 
     def _bwd_scan_body(grad_params_acc, chunk_data):
@@ -292,14 +360,14 @@ def vocab_tiling_linen_loss(
 
   chunked_cross_entropy_loss.defvjp(_chunked_cross_entropy_loss_fwd, _chunked_cross_entropy_loss_bwd)
 
-  total_loss, total_z_loss, total_ul_loss = chunked_cross_entropy_loss(
+  total_loss, total_z_loss, total_ul_loss, total_ditto_loss = chunked_cross_entropy_loss(
       gathered_params,
       hidden_states,
       labels,
       segmentation,
   )
 
-  return total_loss, total_z_loss, total_ul_loss
+  return total_loss, total_z_loss, total_ul_loss, total_ditto_loss
 
 
 def vocab_tiling_nnx_loss(model, hidden_states, data, config, is_train):
@@ -320,15 +388,19 @@ def vocab_tiling_nnx_loss(model, hidden_states, data, config, is_train):
     is_train: Whether the model is in training mode.
 
   Returns:
-    A tuple ``(total_loss, total_z_loss, total_ul_loss)``. ``total_ul_loss`` is the
-    summed token-level unlikelihood loss (0 when disabled) and is weighted by
-    ``alpha`` at the call site.
+    A tuple ``(total_loss, total_z_loss, total_ul_loss, total_ditto_loss)``.
+    ``total_ul_loss`` / ``total_ditto_loss`` are the summed token-level unlikelihood and
+    DITTO losses (0 when disabled), weighted by their respective ``alpha`` at the call site.
   """
   labels = data["targets"]
   segmentation = data["targets_segmentation"]
   use_unlikelihood = is_train and config.unlikelihood_alpha > 0
-  # Unlikelihood (scope B): `labels`/`segmentation` are the candidate context (see
-  # vocab_tiling_linen_loss). No separate `inputs` lookup is needed.
+  use_ditto = is_train and config.ditto_alpha > 0
+  # Unlikelihood (scope B): `labels`/`segmentation` are the candidate context. DITTO uses
+  # the precomputed `ditto_baseline_pos` / `ditto_pen_mask` maps from `data` (see
+  # vocab_tiling_linen_loss).
+  ditto_baseline_pos = data["ditto_baseline_pos"] if use_ditto else None
+  ditto_pen_mask = data["ditto_pen_mask"] if use_ditto else None
   deterministic = not config.enable_dropout if is_train else True
   model_mode = "train"
 
@@ -376,6 +448,9 @@ def vocab_tiling_nnx_loss(model, hidden_states, data, config, is_train):
   hidden_states = _maybe_shard_with_name(hidden_states, hidden_spec)
   labels = _maybe_shard_with_name(labels, label_spec)
   segmentation = _maybe_shard_with_name(segmentation, label_spec)
+  if use_ditto:
+    ditto_baseline_pos = _maybe_shard_with_name(ditto_baseline_pos, label_spec)
+    ditto_pen_mask = _maybe_shard_with_name(ditto_pen_mask, label_spec)
 
   batch_size, seq_len, emb_dim = hidden_states.shape
   vocab_tile_size = (batch_size * seq_len) // config.num_vocab_tiling
@@ -395,8 +470,26 @@ def vocab_tiling_nnx_loss(model, hidden_states, data, config, is_train):
   # nnx.merge(..., copy=True) makes fresh Variables local to each iteration.
   graphdef, model_state = nnx.split(model)
 
+  # DITTO baseline: detached per-token gold probabilities [B, S] over the whole batch
+  # (the previous-occurrence probability may live in an earlier tile). Forward-only scan,
+  # stop_gradient -> no gradient contribution; one extra forward when DITTO is enabled.
+  gold_probs = None
+  if use_ditto:
+
+    def _gp_body(_, chunk):
+      h, gp_label = chunk
+      h = _maybe_shard_with_name(h, chunked_hidden_spec)
+      gp_label = _maybe_shard_with_name(gp_label, chunked_data_spec)
+      gp_model = nnx.merge(graphdef, model_state, copy=True)
+      logits = gp_model.logits_from_hidden_states_for_vocab_tiling(h, deterministic, model_mode)
+      logits = _maybe_shard_with_name(logits, chunked_logits_spec)
+      return None, max_utils.gold_prob_from_logits(logits, gp_label)
+
+    _, gp_tiles = jax.lax.scan(_gp_body, None, (reshaped_hidden_states, reshaped_labels))
+    gold_probs = jax.lax.stop_gradient(_reshape(gp_tiles, (batch_size, seq_len), label_spec))
+
   def _scan_body(accumulators, chunk_data):
-    loss_accumulator, z_loss_accumulator, ul_accumulator = accumulators
+    loss_accumulator, z_loss_accumulator, ul_accumulator, ditto_accumulator = accumulators
     hidden_chunk, label_chunk, segmentation_chunk, positions_chunk = chunk_data
     hidden_chunk = _maybe_shard_with_name(hidden_chunk, chunked_hidden_spec)
     label_chunk = _maybe_shard_with_name(label_chunk, chunked_data_spec)
@@ -426,14 +519,34 @@ def vocab_tiling_nnx_loss(model, hidden_states, data, config, is_train):
           window=config.unlikelihood_window,
           eps=config.unlikelihood_eps,
       ).astype(ul_accumulator.dtype)
-    return (loss_accumulator + masked_xent, z_loss_accumulator + masked_z_loss, ul_update), None
+    ditto_update = ditto_accumulator
+    if use_ditto:
+      ditto_update = ditto_accumulator + max_utils.ditto_loss_from_logits(
+          chunk_logits,
+          positions_chunk,
+          label_chunk,
+          gold_probs,
+          ditto_baseline_pos,
+          ditto_pen_mask,
+          seq_len=seq_len,
+          gamma=config.ditto_gamma,
+          eps=config.ditto_eps,
+          loss_type=config.ditto_loss_type,
+      ).astype(ditto_accumulator.dtype)
+    return (
+        loss_accumulator + masked_xent,
+        z_loss_accumulator + masked_z_loss,
+        ul_update,
+        ditto_update,
+    ), None
 
   initial_acc = (
       jnp.zeros((), dtype=hidden_states.dtype),
       jnp.zeros((), dtype=hidden_states.dtype),
       jnp.zeros((), dtype=hidden_states.dtype),
+      jnp.zeros((), dtype=hidden_states.dtype),
   )
-  (total_loss, total_z_loss, total_ul_loss), _ = jax.lax.scan(
+  (total_loss, total_z_loss, total_ul_loss, total_ditto_loss), _ = jax.lax.scan(
       _scan_body, initial_acc, (reshaped_hidden_states, reshaped_labels, reshaped_segmentation, reshaped_positions)
   )
-  return total_loss, total_z_loss, total_ul_loss
+  return total_loss, total_z_loss, total_ul_loss, total_ditto_loss
