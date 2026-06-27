@@ -671,6 +671,10 @@ ditto_gamma: 0.5
 # Per-step probability of a (pure) DITTO step vs a normal MLE step (paper's
 # sequence-level-train-rate).
 ditto_sequence_level_train_rate: 0.5
+# Cap on the number of repetitions of the chosen sentence in the synthetic data; <=0 fills the
+# whole completion run. Capping bounds the geometric decay gamma^n so deep repeats are not driven
+# to ~0 (uncapped + long runs taught the model to stop immediately / output nothing). ~5 is safe.
+ditto_max_reps: 0
 # Token ids that mark sentence boundaries. MUST be set when DITTO is enabled; empty -> no
 # sentences are found and DITTO is a no-op. Values below are for the project tokenizer
 # KyivstarDMP/llm-ua-morph-tokenizer-v2-gemma3 (the ids that actually realize in text):

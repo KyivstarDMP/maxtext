@@ -1150,6 +1150,13 @@ class Tokenizer(BaseModel):
       0.5,
       description="Per-step probability of a (pure) DITTO step on synthetic pseudo-repetition data vs a normal MLE step.",
   )
+  ditto_max_reps: int = Field(
+      0,
+      description=(
+          "Cap on repetitions of the chosen sentence in DITTO synthetic data (<=0 fills the run). "
+          "Bounds the geometric decay gamma^n so deep repeats are not driven to ~0; ~5 is safe."
+      ),
+  )
   ditto_sentence_delim_ids: list[int] = Field(
       default_factory=list,
       description=(

@@ -138,7 +138,7 @@ def _ditto_loss_full(logits, data, config):
   )
 
 
-def build_pseudo_repetition(inputs, targets, targets_segmentation, delim_ids, rng):
+def build_pseudo_repetition(inputs, targets, targets_segmentation, delim_ids, rng, max_reps=0):
   """Build a synthetic pseudo-repetition batch for a DITTO step (Xu et al., 2022).
 
   Reproduces the paper's ``re_orgnize_sentence`` for MaxText's completion-only SFT layout
@@ -153,6 +153,10 @@ def build_pseudo_repetition(inputs, targets, targets_segmentation, delim_ids, rn
     targets_segmentation: ``[B, S]`` int; non-zero marks the assistant completion.
     delim_ids: a (static) tuple of token ids that mark sentence boundaries.
     rng: a PRNGKey used to pick the repeated sentence per row.
+    max_reps: cap on the number of repetitions of the chosen sentence (``<= 0`` = fill the
+      whole completion run). Capping bounds the geometric decay depth ``gamma^n`` so it cannot
+      drive deep-repetition probabilities toward 0 — uncapped + a long run is what previously
+      taught the model to stop immediately (empty output). Recommended ~5.
 
   Returns:
     ``(new_inputs, new_targets, baseline_pos, pen_mask)``. ``baseline_pos[b, i] = i -
@@ -193,8 +197,13 @@ def build_pseudo_repetition(inputs, targets, targets_segmentation, delim_ids, rn
   after = (~cmask_in) & (idx > s_start[:, None])  # [B, S]
   run_end = jnp.where(jnp.any(after, axis=1), jnp.argmax(after, axis=1).astype(jnp.int32), s_dim)  # [B]
 
-  # Overwrite inputs on [s_start, run_end) with the period-`period` repeat of the unit.
-  in_region = (idx >= s_start[:, None]) & (idx < run_end[:, None]) & valid[:, None]  # [B, S]
+  # Cap the repetition depth: fill at most `max_reps` copies of the sentence, then let the
+  # original completion resume. This bounds the geometric decay `gamma^n` (a long uncapped run
+  # drives deep-repetition probabilities to ~0 -> the model learns to stop immediately).
+  fill_end = run_end if max_reps <= 0 else jnp.minimum(run_end, s_start + period * max_reps)  # [B]
+
+  # Overwrite inputs on [s_start, fill_end) with the period-`period` repeat of the unit.
+  in_region = (idx >= s_start[:, None]) & (idx < fill_end[:, None]) & valid[:, None]  # [B, S]
   src = s_start[:, None] + ((idx - s_start[:, None]) % period[:, None])
   src = jnp.clip(src, 0, s_dim - 1)
   repeated = jnp.take_along_axis(inputs, src, axis=1)
@@ -207,10 +216,10 @@ def build_pseudo_repetition(inputs, targets, targets_segmentation, delim_ids, rn
 
   # Penalize label positions in the 2nd-or-later repetition: targets[i] is repeated for
   # i >= s_start - 1 (i.e. i+1 >= s_start); the baseline at i-period exists in the 1st
-  # repetition for i >= s_start + period - 1; and targets[i] stays in-region for i < run_end - 1.
+  # repetition for i >= s_start + period - 1; and targets[i] stays in-region for i < fill_end - 1.
   pen_start = s_start + period - 1
   pen_mask = (
-      (idx >= pen_start[:, None]) & (idx < (run_end - 1)[:, None]) & valid[:, None] & comp_lab
+      (idx >= pen_start[:, None]) & (idx < (fill_end - 1)[:, None]) & valid[:, None] & comp_lab
   ).astype(jnp.int32)
   baseline_pos = jnp.clip(idx - period[:, None], 0, s_dim - 1).astype(jnp.int32)
   baseline_pos = jnp.broadcast_to(baseline_pos, (b_dim, s_dim))
@@ -265,6 +274,7 @@ def loss_fn(model, config, data, dropout_rng, params, sparsity_state=None, is_tr
         data["targets_segmentation"],
         tuple(config.ditto_sentence_delim_ids),
         sentence_rng,
+        max_reps=config.ditto_max_reps,
     )
     # On a DITTO step swap in the synthetic sequence; otherwise leave the batch untouched
     # and zero the penalty mask so the DITTO term vanishes (the loss select below also
