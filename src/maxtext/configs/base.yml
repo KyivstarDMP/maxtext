@@ -769,6 +769,16 @@ sft_window_context_cap: -1
 # are dropped and logged.
 sft_window_max_fan_out: 32
 
+# --- Per-dataset (per-mixture-component) metrics ------------------------------------------------
+# Emit per-dataset train loss/accuracy (segment-summed within each mixed batch) and per-dataset eval
+# loss/accuracy (one eval pass per dataset). Opt-in; zero-overhead when false. Requires packing=true.
+per_dataset_metrics: false
+# Comma-joined, ordered names of the train mixture components (runner fills this from the blend
+# manifest, in the same order as grain_train_files). Index i (1-based) maps to names[i-1].
+per_dataset_names: ''
+# Comma-joined, ordered names of the eval datasets; one separate eval pass is run per name.
+per_dataset_eval_names: ''
+
 # dataset_type must be synthetic, hf, grain, tfds
 # details in: https://github.com/AI-Hypercomputer/maxtext/blob/main/docs/guides/data_input_pipeline.md
 dataset_type: tfds

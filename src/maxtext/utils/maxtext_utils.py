@@ -166,6 +166,8 @@ def get_shaped_batch(config):
   shaped_batch["targets"] = jax.ShapeDtypeStruct(batch_shape, jnp.int32)
   shaped_batch["targets_position"] = jax.ShapeDtypeStruct(batch_shape, jnp.int32)
   shaped_batch["targets_segmentation"] = jax.ShapeDtypeStruct(batch_shape, jnp.int32)
+  if config.per_dataset_metrics:
+    shaped_batch["dataset_id"] = jax.ShapeDtypeStruct(batch_shape, jnp.int32)
   if config.use_multimodal:
     image_shape = mm_processor.get_dummy_image_shape_for_init(
         config.model_name, batch_size=config.micro_batch_size_to_train_on

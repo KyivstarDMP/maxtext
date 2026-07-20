@@ -1357,6 +1357,25 @@ class FineTuning(BaseModel):
       32,
       description="For 'window': hard cap on records emitted per example (runaway guard).",
   )
+  per_dataset_metrics: bool = Field(
+      False,
+      description=(
+          "If True, emit per-mixture-component (per-dataset) train loss/accuracy (segment-summed "
+          "within each mixed batch) and per-dataset eval loss/accuracy (one eval pass per dataset). "
+          "Opt-in; zero-overhead when False. Requires packing=true."
+      ),
+  )
+  per_dataset_names: str = Field(
+      "",
+      description=(
+          "Comma-joined, ordered names of the train mixture components (runner-supplied from the "
+          "blend manifest, same order as grain_train_files). Index i (1-based) maps to names[i-1]."
+      ),
+  )
+  per_dataset_eval_names: str = Field(
+      "",
+      description="Comma-joined, ordered names of eval datasets; one separate eval pass is run per name.",
+  )
   formatting_func_path: str = Field(
       "",
       description="Path to the custom data formatting function for SFT.",

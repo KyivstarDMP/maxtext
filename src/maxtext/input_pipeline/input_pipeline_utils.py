@@ -430,10 +430,13 @@ class SFTPromptMasking(grain.MapTransform):
     for i, text in enumerate(element[self.text_column_name]):
       inputs += text
       targets += [self.unk_id] * len(text) if self.completion_only and element["is_prompt"][i] else text
-    return {
+    out = {
         "inputs": np.asarray(inputs[: self.max_target_length], dtype=np.int32),
         "targets": np.asarray(targets[: self.max_target_length], dtype=np.int32),
     }
+    if "dataset_id" in element:
+      out["dataset_id"] = np.full(len(out["inputs"]), np.int32(element["dataset_id"]), dtype=np.int32)
+    return out
 
 
 @dataclasses.dataclass
@@ -489,6 +492,14 @@ class SFTPromptMaskingWindows(FlatMapTransform):
         "targets": np.asarray(targets, dtype=np.int32),
     }
 
+  def _stamp_ds(self, records, element):
+    """Attach a per-token dataset_id (constant across an example's fan-out windows)."""
+    if "dataset_id" in element:
+      ds_id = np.int32(element["dataset_id"])
+      for r in records:
+        r["dataset_id"] = np.full(len(r["inputs"]), ds_id, dtype=np.int32)
+    return records
+
   def flat_map(self, element):
     length = self.max_target_length
     segments = element[self.text_column_name]
@@ -496,7 +507,7 @@ class SFTPromptMaskingWindows(FlatMapTransform):
 
     total = sum(len(seg) for seg in segments)
     if total <= length:
-      return [self._single_record(segments, is_prompt)]
+      return self._stamp_ds([self._single_record(segments, is_prompt)], element)
 
     # Clamp window geometry so every window always leaves room for >=1 loss token:
     #   ctx (<= cap) + overlap (<= overlap_cap) + min_room <= length.
@@ -523,7 +534,7 @@ class SFTPromptMaskingWindows(FlatMapTransform):
               f"SFTPromptMaskingWindows: hit max_fan_out={self.max_fan_out}; dropping {n - i} "
               "trailing completion token(s) (including the turn terminator) for one example."
           )
-          return records
+          return self._stamp_ds(records, element)
         overlap_tokens = comp[max(0, i - overlap_cap) : i]
         room = length - len(ctx) - len(overlap_tokens)
         loss_tokens = comp[i : i + room]
@@ -537,7 +548,7 @@ class SFTPromptMaskingWindows(FlatMapTransform):
         i += len(loss_tokens)
       prefix += comp
 
-    return records
+    return self._stamp_ds(records, element)
 
 
 @dataclasses.dataclass
@@ -699,6 +710,9 @@ class ParseFeatures(grain.MapTransform):
 
   def map(self, element):
     """Parse a serialized tf.train.Example proto and extract features."""
+    dataset_id = None
+    if isinstance(element, dict) and "raw" in element:  # per_dataset_metrics: stamped upstream
+      dataset_id, element = element["dataset_id"], element["raw"]
     example = example_pb2.Example()
     example.ParseFromString(element)
     features = example.features.feature
@@ -733,6 +747,8 @@ class ParseFeatures(grain.MapTransform):
       if "top_k_indices" in parsed and len(parsed["top_k_indices"]) > 0:
         parsed["top_k_indices"] = parsed["top_k_indices"].reshape(seq_len, -1)
 
+    if dataset_id is not None:
+      parsed["dataset_id"] = np.int32(dataset_id)
     return parsed
 
 
@@ -746,9 +762,12 @@ class NormalizeFeatures(grain.MapTransform):
 
   def map(self, element):
     if self.tokenize:
-      return {col: element[col][0].decode() for col in self.column_names}
+      out = {col: element[col][0].decode() for col in self.column_names}
     else:
-      return {col: element[col] for col in self.column_names}
+      out = {col: element[col] for col in self.column_names}
+    if "dataset_id" in element:
+      out["dataset_id"] = element["dataset_id"]
+    return out
 
 
 @dataclasses.dataclass
@@ -811,6 +830,18 @@ class Rekey(grain.MapTransform):
     if not self.keep_old_keys:
       for key in old_keys:
         del element[key]
+    return element
+
+
+class DropKeys(grain.MapTransform):
+  """Remove the given keys from each element (e.g. packer-emitted junk columns)."""
+
+  def __init__(self, keys):
+    self.keys = tuple(keys)
+
+  def map(self, element):
+    for k in self.keys:
+      element.pop(k, None)
     return element
 
 
@@ -1073,6 +1104,8 @@ def shift_and_refine(x, ignored_ids, axis=1):
   """Shift inputs, set segmentation to 0 when target element is in ignored_ids if provided"""
   x["targets"] = shift_left(x["targets"], ignored_ids[0], axis=axis)
   x["targets_segmentation"] = shift_left(x["targets_segmentation"], 0, axis=axis)
+  if "dataset_id" in x:
+    x["dataset_id"] = shift_left(x["dataset_id"], 0, axis=axis)
   for ignore_id in ignored_ids:
     x["targets_segmentation"] = np.where(x["targets"] != ignore_id, x["targets_segmentation"], 0)
 

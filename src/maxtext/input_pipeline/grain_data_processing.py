@@ -80,6 +80,20 @@ def _apply_mapdataset_transforms(
   return dataset
 
 
+class _StampDatasetId(grain.MapTransform):
+  """Wrap each raw record with its 1-based mixture-component id (for per_dataset_metrics).
+
+  Applied per component *before* ``grain.IterDataset.mix`` — the only point where source identity
+  still exists. ``ParseFeatures`` unwraps ``{"raw": bytes, "dataset_id": id}`` downstream.
+  """
+
+  def __init__(self, dataset_id):
+    self.dataset_id = int(dataset_id)
+
+  def map(self, element):
+    return {"raw": element, "dataset_id": self.dataset_id}
+
+
 def get_datasets(
     data_file_pattern,
     data_file_type,
@@ -94,6 +108,7 @@ def get_datasets(
     grain_prefetch_buffer_size,
     grain_data_source_max_workers,
     mixture_config_path=None,
+    stamp_dataset_id=False,
     elastic=False,
 ):
   """Load dataset from array_record files for using with grain"""
@@ -118,7 +133,9 @@ def get_datasets(
 
       datasets_dict = dict(zip(mixture_config.keys(), dataset_list))
 
-      for name, ds in datasets_dict.items():
+      for idx, (name, ds) in enumerate(datasets_dict.items()):
+        if stamp_dataset_id:
+          ds = ds.map(_StampDatasetId(idx + 1))
         datasets_dict[name] = _apply_mapdataset_transforms(
             ds,
             shuffle,
@@ -150,6 +167,8 @@ def get_datasets(
 
       # Apply shuffle, repeat, sharding, and conversion to IterDataset to each dataset before mixing
       for d, _ in enumerate(dataset_list):
+        if stamp_dataset_id:
+          dataset_list[d] = dataset_list[d].map(_StampDatasetId(d + 1))
         dataset_list[d] = _apply_mapdataset_transforms(
             dataset_list[d],
             shuffle,
@@ -167,6 +186,8 @@ def get_datasets(
     else:
       # Single pattern case - no need for parallelization
       dataset = create_dataset_from_pattern(data_file_pattern)
+      if stamp_dataset_id:
+        dataset = dataset.map(_StampDatasetId(1))
       dataset = _apply_mapdataset_transforms(
           dataset,
           shuffle,
@@ -410,6 +431,8 @@ def sft_preprocessing_pipeline(
         )
     )
   data_columns = ("inputs", "targets")
+  if config.per_dataset_metrics:
+    data_columns = data_columns + ("dataset_id",)
 
   batch_size = data_processing_utils.get_local_batch_size(config)
   dataset = data_processing_utils.format_and_batch(
@@ -476,6 +499,7 @@ def make_grain_train_iterator(
       grain_prefetch_buffer_size=config.grain_prefetch_buffer_size,
       grain_data_source_max_workers=config.grain_data_source_max_workers,
       mixture_config_path=config.grain_train_mixture_config_path,
+      stamp_dataset_id=config.per_dataset_metrics,
       elastic=config.grain_use_elastic_iterator,
   )
 

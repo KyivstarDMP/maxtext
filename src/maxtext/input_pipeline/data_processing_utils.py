@@ -125,6 +125,13 @@ def format_and_batch(dataset, config, batch_size, pad_id, data_columns, tokenize
         "inputs_position": "inputs_positions",
     }
     dataset = dataset.map(input_pipeline_utils.Rekey(rekey_dict))
+    if config.per_dataset_metrics:
+      # grain's packer emits junk dataset_id_segment_ids/_positions; keep only the token-aligned id.
+      dataset = dataset.map(
+          input_pipeline_utils.DropKeys(
+              ("dataset_id_segment_ids", "dataset_id_positions", "dataset_id_segmentation", "dataset_id_position")
+          )
+      )
   else:
     dataset = dataset.map(input_pipeline_utils.PadOrTrimToMaxLength(config.max_target_length, pad_id))
 
