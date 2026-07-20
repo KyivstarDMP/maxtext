@@ -231,6 +231,55 @@ def build_pseudo_repetition(inputs, targets, targets_segmentation, delim_ids, rn
 # -----------------------------------------------------------------------------
 
 
+def _num_datasets_plus1(config):
+  """Static [num_datasets + 1]: slot 0 = pad/unknown, 1..num_datasets = mixture components."""
+  return len([n for n in config.per_dataset_names.split(",") if n]) + 1
+
+
+def _per_dataset_from_logits(logits, masked_xent, data, config):
+  """Non-tiled per-dataset (xent_sum, correct_count) vectors of shape [num_datasets+1].
+
+  `masked_xent` is the per-token cross-entropy already multiplied by the completion mask, so a
+  segment-sum by `dataset_id` gives each component's summed loss. `correct` is next-token accuracy
+  over the same mask. Both emit an SPMD all-reduce over the DP-sharded batch inside pjit.
+  """
+  num_seg = _num_datasets_plus1(config)
+  ids = data["dataset_id"].reshape(-1)
+  mask = data["targets_segmentation"] != 0
+  xent_sum_by_ds = jax.ops.segment_sum(masked_xent.reshape(-1), ids, num_segments=num_seg)
+  correct = (jnp.argmax(logits, axis=-1) == data["targets"]) & mask
+  correct_by_ds = jax.ops.segment_sum(correct.reshape(-1).astype(jnp.int32), ids, num_segments=num_seg)
+  return xent_sum_by_ds, correct_by_ds
+
+
+def _assemble_per_dataset_aux(config, data, xent_sum_by_ds, correct_by_ds, use_ditto, ditto_step):
+  """Per-dataset aux dict (xent_sum / correct / token_count, each [num_datasets+1]) or None.
+
+  Only for the train path (batches carry `dataset_id`); eval Option B runs per-dataset passes and
+  has no `dataset_id`, so this returns None there. DITTO steps train on synthetic data, so their
+  per-dataset train metrics are zeroed out.
+  """
+  if not (config.per_dataset_metrics and "dataset_id" in data):
+    return None
+  num_seg = _num_datasets_plus1(config)
+  ids = data["dataset_id"].reshape(-1)
+  token_count_by_ds = jax.ops.segment_sum(
+      (data["targets_segmentation"] != 0).reshape(-1).astype(jnp.int32), ids, num_segments=num_seg
+  )
+  if xent_sum_by_ds is None:  # tiled loss path not yet wired for per-dataset (Phase 2) — emit zeros
+    xent_sum_by_ds = jnp.zeros(num_seg, jnp.float32)
+    correct_by_ds = jnp.zeros(num_seg, jnp.int32)
+  if use_ditto:
+    xent_sum_by_ds = jnp.where(ditto_step, jnp.zeros(num_seg, jnp.float32), xent_sum_by_ds)
+    correct_by_ds = jnp.where(ditto_step, jnp.zeros(num_seg, jnp.int32), correct_by_ds)
+    token_count_by_ds = jnp.where(ditto_step, jnp.zeros(num_seg, jnp.int32), token_count_by_ds)
+  return {
+      "xent_sum_by_ds": xent_sum_by_ds,
+      "correct_by_ds": correct_by_ds,
+      "token_count_by_ds": token_count_by_ds,
+  }
+
+
 def loss_fn(model, config, data, dropout_rng, params, sparsity_state=None, is_train=True):
   """loss_fn for both train and eval.
 
@@ -262,6 +311,9 @@ def loss_fn(model, config, data, dropout_rng, params, sparsity_state=None, is_tr
   ul_sum = 0.0
   ditto_sum = 0.0
   ditto_step = jnp.array(False)
+  # Per-dataset (per mixture component) accumulators; filled in the non-tiled loss branch (train only).
+  xent_sum_by_ds = None
+  correct_by_ds = None
   if use_ditto:
     # Derive an independent per-step rng (fold_in does not consume the dropout stream).
     base_rng = dropout_rng if dropout_rng is not None else jax.random.PRNGKey(0)
@@ -360,6 +412,8 @@ def loss_fn(model, config, data, dropout_rng, params, sparsity_state=None, is_tr
 
       xent_sum = jnp.sum(xent)
       total_z_loss = jnp.sum(z_loss)
+      if config.per_dataset_metrics and "dataset_id" in data:
+        xent_sum_by_ds, correct_by_ds = _per_dataset_from_logits(logits, xent, data, config)
       if use_unlikelihood:
         ul_sum = _unlikelihood_loss_full(logits, data, config)
       if use_ditto:
@@ -403,12 +457,15 @@ def loss_fn(model, config, data, dropout_rng, params, sparsity_state=None, is_tr
 
       xent_sum = jnp.sum(xent)
       total_z_loss = jnp.sum(z_loss)
+      if config.per_dataset_metrics and "dataset_id" in data:
+        xent_sum_by_ds, correct_by_ds = _per_dataset_from_logits(logits, xent, data, config)
       if use_unlikelihood:
         ul_sum = _unlikelihood_loss_full(logits, data, config)
       if use_ditto:
         ditto_sum = _ditto_loss_full(logits, data, config)
 
   total_weights = jnp.sum(data["targets_segmentation"] != 0)
+  per_dataset_aux = _assemble_per_dataset_aux(config, data, xent_sum_by_ds, correct_by_ds, use_ditto, ditto_step)
   # MLE-step loss: NLL plus the optional alpha-weighted unlikelihood term. On a DITTO step
   # we replace it with the pure DITTO decay loss (paper-faithful alternation): the data is
   # already the synthetic pseudo-repetition batch, so the NLL there is meaningless and the
@@ -488,6 +545,8 @@ def loss_fn(model, config, data, dropout_rng, params, sparsity_state=None, is_tr
       "mtp_loss": mtp_loss,
       "batch_stats": (intermediate_outputs.get("batch_stats", None) if hasattr(intermediate_outputs, "get") else None),
   }
+  if per_dataset_aux is not None:
+    aux["per_dataset"] = per_dataset_aux
   return loss, aux
 
 
@@ -609,6 +668,7 @@ def train_step(model, config, state_mesh_shardings, params_shardings, state, dat
   ditto_loss = aux.get("ditto_loss", 0.0)
   moe_bias_updates = aux.get("moe_bias_updates")
   mtp_loss = aux.get("mtp_loss", 0.0)
+  per_dataset = aux.get("per_dataset")
   new_opt_state = None
 
   if isinstance(model, nn.Module):
@@ -738,6 +798,8 @@ def train_step(model, config, state_mesh_shardings, params_shardings, state, dat
       "scalar": scalar_metrics,
       "scalars": {},
   }
+  if per_dataset is not None:
+    metrics["per_dataset"] = per_dataset
   if config.record_internal_nn_metrics:
     record_activation_metrics(metrics, intermediate_outputs, config)
 

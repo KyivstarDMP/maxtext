@@ -118,6 +118,8 @@ class MetricLogger:
   def write_metrics(self, metrics, step, metric_type="train"):
     """Entry point for all metrics writing. metric_type is one of 'train', 'eval', 'running_eval'."""
     if metrics:
+      if metric_type == "train" and "per_dataset" in metrics:
+        self._expand_per_dataset_train(metrics)
       self.log_metrics(metrics, step, metric_type)
 
       if self.config.enable_tensorboard and metric_type != "running_eval":
@@ -134,6 +136,25 @@ class MetricLogger:
 
       if metric_type == "train":
         self._maybe_abort_after_write_metrics(metrics)
+
+  def _expand_per_dataset_train(self, metrics):
+    """Expand per-dataset [num_datasets+1] vectors into named per_dataset_train/ scalar keys.
+
+    Slot 0 (pad/unknown) is dropped; index i (1-based) maps to per_dataset_names[i-1]. Emits
+    loss = xent_sum/tokens, accuracy = correct/tokens (NaN when a dataset had no tokens this step),
+    and the raw token count. These land in metrics["scalar"] so TB/JSON/GCS pick them up generically.
+    """
+    pd = metrics.pop("per_dataset")
+    names = [n for n in self.config.per_dataset_names.split(",") if n]
+    xs = np.asarray(pd["xent_sum_by_ds"])
+    tk = np.asarray(pd["token_count_by_ds"])
+    ok = np.asarray(pd["correct_by_ds"])
+    scalar = metrics["scalar"]
+    for i, name in enumerate(names, start=1):
+      t = float(tk[i])
+      scalar[f"per_dataset_train/tokens/{name}"] = t
+      scalar[f"per_dataset_train/loss/{name}"] = float(xs[i]) / t if t > 0 else float("nan")
+      scalar[f"per_dataset_train/accuracy/{name}"] = float(ok[i]) / t if t > 0 else float("nan")
 
   def log_metrics(self, metrics, step, metric_type):
     """Logs metrics via max_logging."""
