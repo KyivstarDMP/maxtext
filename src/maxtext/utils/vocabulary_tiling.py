@@ -156,6 +156,49 @@ def vocab_tiling_linen_loss(
 
   gold_probs = _gold_probs_linen() if use_ditto else None
 
+  per_dataset = config.per_dataset_metrics and "dataset_id" in data
+
+  def _per_dataset_linen():
+    """Forward-only tiled per-dataset (xent_sum, correct_count) [num_datasets+1] vectors (no grad).
+
+    Mirrors :func:`_gold_probs_linen`: one extra forward over the tiled logits, wrapped in
+    stop_gradient (these are metrics, not part of the training objective). Each chunk holds full
+    per-token logits, so next-token accuracy is a per-chunk argmax; both quantities are
+    segment-summed by ``dataset_id`` and accumulated across chunks.
+    """
+    num_seg = len([n for n in config.per_dataset_names.split(",") if n]) + 1
+    bsz, slen, edim = hidden_states.shape
+    tile = (bsz * slen) // config.num_vocab_tiling
+    rh = _reshape(hidden_states, (config.num_vocab_tiling, tile, edim), reshaped_hidden_spec)
+    rl = _reshape(labels, (config.num_vocab_tiling, tile), reshaped_data_spec)
+    rs = _reshape(segmentation, (config.num_vocab_tiling, tile), reshaped_data_spec)
+    rd = _reshape(data["dataset_id"], (config.num_vocab_tiling, tile), reshaped_data_spec)
+
+    def _pd_body(acc, chunk):
+      xent_acc, correct_acc = acc
+      h, lbl, seg, dsid = chunk
+      h = _maybe_shard_with_name(h, chunked_hidden_spec)
+      logits = model.apply(
+          {"params": gathered_params["params"]},
+          h,
+          deterministic=deterministic,
+          method="logits_from_hidden_states_for_vocab_tiling",
+      )
+      logits = _maybe_shard_with_name(logits, chunked_logits_spec)
+      chunk_xent, _ = max_utils.cross_entropy_with_logits(logits, jax.nn.one_hot(lbl, config.vocab_size), z_loss=0.0)
+      m = seg != 0
+      xent_acc = xent_acc + jax.ops.segment_sum(chunk_xent * m, dsid, num_segments=num_seg)
+      correct = (jnp.argmax(logits, axis=-1) == lbl) & m
+      correct_acc = correct_acc + jax.ops.segment_sum(correct.astype(jnp.int32), dsid, num_segments=num_seg)
+      return (xent_acc, correct_acc), None
+
+    (xent_by_ds, correct_by_ds), _ = jax.lax.scan(
+        _pd_body, (jnp.zeros(num_seg, jnp.float32), jnp.zeros(num_seg, jnp.int32)), (rh, rl, rs, rd)
+    )
+    return jax.lax.stop_gradient(xent_by_ds), jax.lax.stop_gradient(correct_by_ds)
+
+  pd_xent_by_ds, pd_correct_by_ds = _per_dataset_linen() if per_dataset else (None, None)
+
   # Customized forward and backward maps for the embedding tiling
   @jax.custom_vjp
   def chunked_cross_entropy_loss(gathered_params, hidden_states, labels, segmentation):
@@ -367,6 +410,8 @@ def vocab_tiling_linen_loss(
       segmentation,
   )
 
+  if per_dataset:
+    return total_loss, total_z_loss, total_ul_loss, total_ditto_loss, pd_xent_by_ds, pd_correct_by_ds
   return total_loss, total_z_loss, total_ul_loss, total_ditto_loss
 
 

@@ -384,9 +384,14 @@ def loss_fn(model, config, data, dropout_rng, params, sparsity_state=None, is_tr
     elif config.num_vocab_tiling > 1:
       hidden_state_key = ("intermediates", "decoder", "hidden_states")
       hidden_states = maxtext_utils.get_nested_value(intermediate_outputs, hidden_state_key)[0]
-      xent_sum, total_z_loss, ul_sum, ditto_sum = vocab_tiling_linen_loss(
-          hidden_states, data, config, model, params, is_train
-      )
+      if config.per_dataset_metrics and "dataset_id" in data:
+        xent_sum, total_z_loss, ul_sum, ditto_sum, xent_sum_by_ds, correct_by_ds = vocab_tiling_linen_loss(
+            hidden_states, data, config, model, params, is_train
+        )
+      else:
+        xent_sum, total_z_loss, ul_sum, ditto_sum = vocab_tiling_linen_loss(
+            hidden_states, data, config, model, params, is_train
+        )
     else:
       one_hot_targets = jax.nn.one_hot(data["targets"], config.vocab_size)
       xent, z_loss = max_utils.cross_entropy_with_logits(logits, one_hot_targets, z_loss=config.z_loss_multiplier)
