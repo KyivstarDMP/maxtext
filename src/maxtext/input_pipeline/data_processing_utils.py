@@ -125,8 +125,10 @@ def format_and_batch(dataset, config, batch_size, pad_id, data_columns, tokenize
         "inputs_position": "inputs_positions",
     }
     dataset = dataset.map(input_pipeline_utils.Rekey(rekey_dict))
-    if config.per_dataset_metrics:
+    if "dataset_id" in data_columns:
       # grain's packer emits junk dataset_id_segment_ids/_positions; keep only the token-aligned id.
+      # Gated on the actual column set (not per_dataset_metrics) so the eval pipeline — which is
+      # never stamped — doesn't get a pointless no-op map.
       dataset = dataset.map(
           input_pipeline_utils.DropKeys(
               ("dataset_id_segment_ids", "dataset_id_positions", "dataset_id_segmentation", "dataset_id_position")

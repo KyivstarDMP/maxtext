@@ -245,6 +245,7 @@ def pretrain_preprocessing_pipeline(
     tokenize,
     grain_worker_count,
     grain_per_worker_buffer_size,
+    stamp_dataset_id=False,  # unused; accepted so all grain pipelines share one partial
 ):
   """Use grain pipeline to pre-process the dataset and return iterators for pretrain"""
   is_offline = getattr(config, "is_offline_distillation", False)
@@ -292,6 +293,7 @@ def dpo_preprocessing_pipeline(
     tokenize,
     grain_worker_count,
     grain_per_worker_buffer_size,
+    stamp_dataset_id=False,  # unused; accepted so all grain pipelines share one partial
 ):
   """Use grain to pre-process the dataset and return iterators for dpo fine-tuning"""
   dataset = data_processing_utils.parse_and_keep_features(dataset, config, data_columns, tokenize)
@@ -370,8 +372,15 @@ def sft_preprocessing_pipeline(
     tokenize,
     grain_worker_count,
     grain_per_worker_buffer_size,
+    stamp_dataset_id=False,
 ):
-  """Use grain pipeline to pre-process the dataset and return iterators for sft fine-tuning"""
+  """Use grain pipeline to pre-process the dataset and return iterators for sft fine-tuning.
+
+  ``stamp_dataset_id`` must mirror the flag given to :func:`get_datasets`: it says whether the
+  records actually carry a ``dataset_id`` column. Only the train mixture is stamped — per-dataset
+  eval (Option B) runs one pass per dataset and needs no id — so this cannot be derived from
+  ``config.per_dataset_metrics`` alone.
+  """
   dataset = data_processing_utils.parse_and_keep_features(dataset, config, data_columns, tokenize)
 
   tokenizer_model, pad_id = data_processing_utils.get_tokenizer_and_pad_id(config)
@@ -431,7 +440,9 @@ def sft_preprocessing_pipeline(
         )
     )
   data_columns = ("inputs", "targets")
-  if config.per_dataset_metrics:
+  # Only include dataset_id when the records were actually stamped (train mixture). Adding it for
+  # eval would put it in the packer's length_struct and grain would raise KeyError: 'dataset_id'.
+  if stamp_dataset_id:
     data_columns = data_columns + ("dataset_id",)
 
   batch_size = data_processing_utils.get_local_batch_size(config)
@@ -510,6 +521,8 @@ def make_grain_train_iterator(
       tokenize=config.tokenize_train_data,
       grain_worker_count=config.grain_worker_count,
       grain_per_worker_buffer_size=config.grain_per_worker_buffer_size,
+      # Matches the get_datasets(stamp_dataset_id=...) above: train records carry a dataset_id.
+      stamp_dataset_id=config.per_dataset_metrics,
   )
 
   # In the case of using colocated python for data input, partial functions such as
@@ -614,6 +627,8 @@ def make_grain_eval_iterator(
       tokenize=config.tokenize_eval_data,
       grain_worker_count=config.grain_worker_count_eval,
       grain_per_worker_buffer_size=config.grain_per_worker_buffer_size_eval,
+      # Eval is never stamped: per-dataset eval (Option B) runs one pass per dataset instead.
+      stamp_dataset_id=False,
   )
 
   if not config.colocated_python_data_input:
