@@ -100,6 +100,9 @@ class MetricLogger:
     self.performance_metric_queue = self.get_performance_metric_queue(config)
     self.learning_rate_schedule = learning_rate_schedule
     self.cumulative_eval_metrics = {"scalar": defaultdict(float)}
+    # Running [xent_sum, token_count, correct] per dataset, summed across the current log_period
+    # window; flushed as one token-weighted point per window by _expand_per_dataset_train.
+    self._per_dataset_accum = None
     # self.buffered_metrics is a polymorphic deferred-write queue. Entries are one of:
     #   ("train", train_step, metrics, step_time_delta)
     #   ("eval", eval_step, metrics, step_time_delta)
@@ -119,7 +122,7 @@ class MetricLogger:
     """Entry point for all metrics writing. metric_type is one of 'train', 'eval', 'running_eval'."""
     if metrics:
       if metric_type == "train" and "per_dataset" in metrics:
-        self._expand_per_dataset_train(metrics)
+        self._expand_per_dataset_train(metrics, step)
       self.log_metrics(metrics, step, metric_type)
 
       if self.config.enable_tensorboard and metric_type != "running_eval":
@@ -137,30 +140,51 @@ class MetricLogger:
       if metric_type == "train":
         self._maybe_abort_after_write_metrics(metrics)
 
-  def _expand_per_dataset_train(self, metrics):
-    """Expand per-dataset [num_datasets+1] vectors into named per_dataset_train/ scalar keys.
+  def _expand_per_dataset_train(self, metrics, step):
+    """Accumulate per-dataset train metrics and emit one aggregate point per log_period window.
 
-    Slot 0 (pad/unknown) is dropped; index i (1-based) maps to per_dataset_names[i-1]. Emits
-    loss = xent_sum/tokens and accuracy = correct/tokens, plus the raw token count.
+    A single packed batch covers only a handful of the mixture's components, so a per-step
+    per-dataset curve is extremely noisy (a few sequences per dataset per step) and costs one
+    scalar write per dataset per step. Instead we sum the raw [num_datasets+1] vectors across the
+    window and emit a single token-weighted point when it closes:
 
-    A single packed batch only covers a handful of the mixture's components, so most datasets
-    contribute 0 tokens on any given step. For those we emit ONLY the token count (0) and omit
-    loss/accuracy entirely rather than writing NaN: TensorBoard simply has no point at that step
-    (the curve interpolates across the gap), and we avoid flooding the logs with the summary
-    writer's "NaN or Inf found in input tensor" warning once per absent dataset per step.
+        loss     = sum(xent)    / sum(tokens)      over the window
+        accuracy = sum(correct) / sum(tokens)      over the window
+        tokens   = sum(tokens)                     over the window (coverage)
+
+    Summing first and dividing once is a ratio-of-sums, i.e. exactly the token-weighted mean —
+    never a mean-of-ratios — so it stays consistent with the aggregate `learning/lm_loss`.
+
+    Slot 0 (pad/unknown) is dropped; index i (1-based) maps to per_dataset_names[i-1]. Datasets
+    with no tokens in the whole window report only `tokens = 0`; their loss/accuracy keys are
+    omitted rather than written as NaN (writing NaN makes the summary writer log
+    "NaN or Inf found in input tensor" once per absent dataset).
     """
     pd = metrics.pop("per_dataset")
+    xs = np.asarray(pd["xent_sum_by_ds"], dtype=np.float64)
+    tk = np.asarray(pd["token_count_by_ds"], dtype=np.float64)
+    ok = np.asarray(pd["correct_by_ds"], dtype=np.float64)
+    if self._per_dataset_accum is None:
+      self._per_dataset_accum = [xs.copy(), tk.copy(), ok.copy()]
+    else:
+      self._per_dataset_accum[0] += xs
+      self._per_dataset_accum[1] += tk
+      self._per_dataset_accum[2] += ok
+
+    period = max(1, int(self.config.log_period))
+    if (step + 1) % period != 0 and step != self.config.steps - 1:
+      return  # window still open — nothing written this step
+
+    xs_w, tk_w, ok_w = self._per_dataset_accum
+    self._per_dataset_accum = None
     names = [n for n in self.config.per_dataset_names.split(",") if n]
-    xs = np.asarray(pd["xent_sum_by_ds"])
-    tk = np.asarray(pd["token_count_by_ds"])
-    ok = np.asarray(pd["correct_by_ds"])
     scalar = metrics["scalar"]
     for i, name in enumerate(names, start=1):
-      t = float(tk[i])
+      t = float(tk_w[i])
       scalar[f"per_dataset_train/tokens/{name}"] = t
       if t > 0:
-        scalar[f"per_dataset_train/loss/{name}"] = float(xs[i]) / t
-        scalar[f"per_dataset_train/accuracy/{name}"] = float(ok[i]) / t
+        scalar[f"per_dataset_train/loss/{name}"] = float(xs_w[i]) / t
+        scalar[f"per_dataset_train/accuracy/{name}"] = float(ok_w[i]) / t
 
   def write_per_dataset_eval(self, per_dataset_eval, step):
     """Write per-dataset eval metrics (Option B): {name: (xent_sum, tokens, correct)} -> named scalars.
