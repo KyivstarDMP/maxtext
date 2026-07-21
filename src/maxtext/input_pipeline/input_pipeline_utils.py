@@ -708,6 +708,11 @@ class ParseFeatures(grain.MapTransform):
     self.data_columns = list(data_columns)
     self.tokenize = tokenize
 
+  # Columns that may legitimately be absent from a record (e.g. datasets without
+  # function-calling data). Missing optional columns are skipped, not an error,
+  # so a single mixture can blend tools/non-tools datasets.
+  OPTIONAL_COLUMNS = frozenset({"tools"})
+
   def map(self, element):
     """Parse a serialized tf.train.Example proto and extract features."""
     dataset_id = None
@@ -717,7 +722,7 @@ class ParseFeatures(grain.MapTransform):
     example.ParseFromString(element)
     features = example.features.feature
 
-    missing = [c for c in self.data_columns if c not in features]
+    missing = [c for c in self.data_columns if c not in features and c not in self.OPTIONAL_COLUMNS]
     if missing:
       raise ValueError(
           f"Column {missing} not found in dataset. Available columns: {sorted(features.keys())}. "
@@ -760,11 +765,20 @@ class NormalizeFeatures(grain.MapTransform):
     self.column_names = column_names
     self.tokenize = tokenize
 
+  # Columns that may legitimately be absent from a record (e.g. datasets
+  # without function-calling data). Missing optional columns are skipped
+  # instead of raising, so a single mixture can blend tools/non-tools datasets.
+  OPTIONAL_COLUMNS = frozenset({"tools"})
+
   def map(self, element):
-    if self.tokenize:
-      out = {col: element[col][0].decode() for col in self.column_names}
-    else:
-      out = {col: element[col] for col in self.column_names}
+    """Normalize feature keys, skipping optional columns (e.g. `tools`) absent from a record."""
+    out = {}
+    for col in self.column_names:
+      if col not in element:
+        if col in self.OPTIONAL_COLUMNS:
+          continue  # e.g. a dataset that has no `tools` column
+        raise KeyError(f"Required column '{col}' missing from record. Present columns: {sorted(element.keys())}")
+      out[col] = element[col][0].decode() if self.tokenize else element[col]
     if "dataset_id" in element:
       out["dataset_id"] = element["dataset_id"]
     return out
@@ -784,9 +798,12 @@ class KeepFeatures(grain.MapTransform):
     self.feature_names = feature_names
     self.tokenize = tokenize
 
+  # See ParseFeatures.OPTIONAL_COLUMNS — absent optional columns are skipped, not an error.
+  OPTIONAL_COLUMNS = frozenset({"tools"})
+
   def map(self, element: dict[str, Any]) -> dict[str, Any]:
     """Applies the feature filtering to the input element."""
-    missing = [n for n in self.feature_names if n not in element]
+    missing = [n for n in self.feature_names if n not in element and n not in self.OPTIONAL_COLUMNS]
     if missing:
       raise ValueError(
           f"Column {missing} not found in dataset. Available columns: {sorted(element.keys())}. "
