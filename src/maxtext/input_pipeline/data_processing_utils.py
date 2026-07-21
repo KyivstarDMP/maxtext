@@ -38,9 +38,23 @@ def parse_and_keep_features(dataset, config, data_columns, tokenize):
   return dataset
 
 
+@functools.lru_cache(maxsize=None)
+def _build_tokenizer_cached(tokenizer_path, tokenizer_type, add_bos, add_eos, hf_access_token):
+  """Build a tokenizer once per distinct configuration, then reuse it.
+
+  Each preprocessing pipeline constructs its own tokenizer. That was fine with one train and one
+  eval iterator, but per-dataset eval (Option B) builds one pipeline per dataset (~59), on every
+  data-loading host. For a remote HF id every construction is a Hub API call
+  (AutoTokenizer.from_pretrained -> is_base_mistral -> model_info), so a large slice issues
+  hosts x datasets calls in one startup burst and trips the Hub rate limit (429). Caching also
+  saves the redundant load time and memory. Args are the plain hashable tokenizer identity.
+  """
+  return tokenizer.build_tokenizer(tokenizer_path, tokenizer_type, add_bos, add_eos, hf_access_token)
+
+
 def get_tokenizer_and_pad_id(config):
   """Builds tokenizer and extracts pad_id safely."""
-  tokenizer_model = tokenizer.build_tokenizer(
+  tokenizer_model = _build_tokenizer_cached(
       config.tokenizer_path,
       config.tokenizer_type,
       config.add_bos,
