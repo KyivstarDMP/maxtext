@@ -1383,6 +1383,14 @@ class FineTuning(BaseModel):
           "Each becomes its own single-dataset eval iterator (Option B: N separate passes)."
       ),
   )
+  per_dataset_log_period: int = Field(
+      0,
+      description=(
+          "Train steps to accumulate per-dataset metrics over before emitting one token-weighted "
+          "point (loss = sum(xent)/sum(tokens) across the window). Larger = smoother curves, fewer "
+          "scalar writes, better per-point coverage. <= 0 follows log_period; 1 emits every step."
+      ),
+  )
   formatting_func_path: str = Field(
       "",
       description="Path to the custom data formatting function for SFT.",

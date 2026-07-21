@@ -141,7 +141,9 @@ class MetricLogger:
         self._maybe_abort_after_write_metrics(metrics)
 
   def _expand_per_dataset_train(self, metrics, step):
-    """Accumulate per-dataset train metrics and emit one aggregate point per log_period window.
+    """Accumulate per-dataset train metrics and emit one aggregate point per window.
+
+    Window length is `per_dataset_log_period` steps, or `log_period` when that is <= 0.
 
     A single packed batch covers only a handful of the mixture's components, so a per-step
     per-dataset curve is extremely noisy (a few sequences per dataset per step) and costs one
@@ -171,7 +173,11 @@ class MetricLogger:
       self._per_dataset_accum[1] += tk
       self._per_dataset_accum[2] += ok
 
-    period = max(1, int(self.config.log_period))
+    # Window length: per_dataset_log_period when set, else fall back to the general log_period.
+    period = int(self.config.per_dataset_log_period)
+    if period <= 0:
+      period = int(self.config.log_period)
+    period = max(1, period)
     if (step + 1) % period != 0 and step != self.config.steps - 1:
       return  # window still open — nothing written this step
 

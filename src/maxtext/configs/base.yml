@@ -781,6 +781,12 @@ per_dataset_eval_names: ''
 # Semicolon-joined eval file globs, aligned 1:1 with per_dataset_eval_names (runner-filled from the
 # eval manifest). Each becomes its own single-dataset eval iterator (Option B: N separate passes).
 per_dataset_eval_files: ''
+# How many train steps to accumulate per-dataset train metrics over before emitting one
+# token-weighted point (loss = sum(xent)/sum(tokens) across the window). A single packed batch
+# covers only a few mixture components, so a per-step curve is mostly sampling noise; a larger
+# window means smoother curves, fewer scalar writes, and better per-dataset coverage per point.
+# <= 0 means "follow log_period". Set to 1 to emit every step.
+per_dataset_log_period: 0
 
 # dataset_type must be synthetic, hf, grain, tfds
 # details in: https://github.com/AI-Hypercomputer/maxtext/blob/main/docs/guides/data_input_pipeline.md
