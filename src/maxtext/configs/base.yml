@@ -778,6 +778,9 @@ per_dataset_metrics: false
 per_dataset_names: ''
 # Comma-joined, ordered names of the eval datasets; one separate eval pass is run per name.
 per_dataset_eval_names: ''
+# Semicolon-joined eval file globs, aligned 1:1 with per_dataset_eval_names (runner-filled from the
+# eval manifest). Each becomes its own single-dataset eval iterator (Option B: N separate passes).
+per_dataset_eval_files: ''
 
 # dataset_type must be synthetic, hf, grain, tfds
 # details in: https://github.com/AI-Hypercomputer/maxtext/blob/main/docs/guides/data_input_pipeline.md

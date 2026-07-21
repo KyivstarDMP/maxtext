@@ -839,18 +839,24 @@ def eval_step(model, config, state, data, dropout_rng=None):
   indexer_loss = aux.get("indexer_loss", 0.0)
   mtp_loss = aux.get("mtp_loss", 0.0)
   eval_total_loss = xent_sum
-  metrics = {
-      "scalar": {
-          "evaluation/loss": loss,
-          "evaluation/z_loss": z_loss,
-          "evaluation/total_loss": eval_total_loss,
-          "evaluation/total_weights": total_weights,
-          "evaluation/moe_lb_loss": moe_lb_loss,
-          "evaluation/indexer_loss": indexer_loss,
-          "evaluation/mtp_loss": mtp_loss,
-          "evaluation/mtp_acceptance_rate_percent": mtp_acceptance_rate,
-      },
+  eval_scalar = {
+      "evaluation/loss": loss,
+      "evaluation/z_loss": z_loss,
+      "evaluation/total_loss": eval_total_loss,
+      "evaluation/total_weights": total_weights,
+      "evaluation/moe_lb_loss": moe_lb_loss,
+      "evaluation/indexer_loss": indexer_loss,
+      "evaluation/mtp_loss": mtp_loss,
+      "evaluation/mtp_acceptance_rate_percent": mtp_acceptance_rate,
   }
+  if config.per_dataset_metrics:
+    # Full logits are always materialized in eval mode (num_vocab_tiling skips logits only in
+    # MODEL_MODE_TRAIN), so per-pass accuracy is a direct argmax for both tiled and non-tiled.
+    # `data` was sliced in place by loss_fn, so it matches the logits' micro-batch shape.
+    eval_logits = aux["intermediate_outputs"]["logits"]
+    correct = (jnp.argmax(eval_logits, axis=-1) == data["targets"]) & (data["targets_segmentation"] != 0)
+    eval_scalar["evaluation/total_correct"] = jnp.sum(correct).astype(jnp.float32)
+  metrics = {"scalar": eval_scalar}
 
   return metrics
 
@@ -958,27 +964,49 @@ def train_loop(config, recorder, state=None):
         eval_step_count = None
         if config.eval_interval > 0 and step > start_step and (step + 1) % config.eval_interval == 0:
           assert eval_data_iterator
-          # Explicitly reset the eval iterator and counters before starting the eval loop
-          eval_data_iterator.reset()
-          metric_logger_instance.reset_eval_metrics()
           max_logging.log(f"Starting eval after train step {step}")
-
-          eval_step_count = 0
-          last_eval_step_completion = datetime.datetime.now()
-          # pylint: disable=not-callable
-          for eval_batch in eval_data_iterator:
-            # Shard input eval data
-            eval_batch = jax.device_put(eval_batch, sharding.get_input_data_sharding(config, mesh))
-            if config.eval_steps > 0 and eval_step_count >= config.eval_steps:
-              break
-            with jax.set_mesh(mesh), nn_partitioning.axis_rules(config.logical_axis_rules):
-              eval_metrics = p_eval_step(state, eval_batch, *step_rng_args)
-            eval_step_time_delta = datetime.datetime.now() - last_eval_step_completion
+          _eval_sharding = sharding.get_input_data_sharding(config, mesh)
+          if isinstance(eval_data_iterator, dict):
+            # Option B: one full eval pass per dataset; each pass's aggregate is that dataset's metric.
+            per_dataset_eval = {}
+            for ds_name, ds_iter in eval_data_iterator.items():
+              ds_iter.reset()
+              xent_sum_acc, tokens_acc, correct_acc, cnt = 0.0, 0.0, 0.0, 0
+              # pylint: disable=not-callable
+              for eval_batch in ds_iter:
+                if config.eval_steps > 0 and cnt >= config.eval_steps:
+                  break
+                eval_batch = jax.device_put(eval_batch, _eval_sharding)
+                with jax.set_mesh(mesh), nn_partitioning.axis_rules(config.logical_axis_rules):
+                  em = p_eval_step(state, eval_batch, *step_rng_args)["scalar"]
+                xent_sum_acc += float(em["evaluation/total_loss"])
+                tokens_acc += float(em["evaluation/total_weights"])
+                correct_acc += float(em["evaluation/total_correct"])
+                cnt += 1
+              per_dataset_eval[ds_name] = (xent_sum_acc, tokens_acc, correct_acc)
+              max_logging.log(f"  eval[{ds_name}]: {cnt} steps, {int(tokens_acc)} loss-tokens")
+            metric_logger_instance.write_per_dataset_eval(per_dataset_eval, step)
+            eval_step_count = 0
+          else:
+            # Explicitly reset the eval iterator and counters before starting the eval loop
+            eval_data_iterator.reset()
+            metric_logger_instance.reset_eval_metrics()
+            eval_step_count = 0
             last_eval_step_completion = datetime.datetime.now()
-            metric_logger_instance.buffer_and_write_metrics(
-                eval_metrics, eval_step_count, step_time_delta=eval_step_time_delta, is_training=False
-            )
-            eval_step_count += 1
+            # pylint: disable=not-callable
+            for eval_batch in eval_data_iterator:
+              # Shard input eval data
+              eval_batch = jax.device_put(eval_batch, _eval_sharding)
+              if config.eval_steps > 0 and eval_step_count >= config.eval_steps:
+                break
+              with jax.set_mesh(mesh), nn_partitioning.axis_rules(config.logical_axis_rules):
+                eval_metrics = p_eval_step(state, eval_batch, *step_rng_args)
+              eval_step_time_delta = datetime.datetime.now() - last_eval_step_completion
+              last_eval_step_completion = datetime.datetime.now()
+              metric_logger_instance.buffer_and_write_metrics(
+                  eval_metrics, eval_step_count, step_time_delta=eval_step_time_delta, is_training=False
+              )
+              eval_step_count += 1
 
         prof.maybe_deactivate_profiler(step, state)
 

@@ -156,6 +156,29 @@ class MetricLogger:
       scalar[f"per_dataset_train/loss/{name}"] = float(xs[i]) / t if t > 0 else float("nan")
       scalar[f"per_dataset_train/accuracy/{name}"] = float(ok[i]) / t if t > 0 else float("nan")
 
+  def write_per_dataset_eval(self, per_dataset_eval, step):
+    """Write per-dataset eval metrics (Option B): {name: (xent_sum, tokens, correct)} -> named scalars.
+
+    Each dataset's aggregate over its own eval pass becomes
+    per_dataset_eval/{loss,perplexity,accuracy,tokens}/<name>. Written straight to the TB/JSON/GCS
+    sinks (bypassing the eval-aggregation path, which is keyed on the single-pass evaluation/* keys).
+    """
+    scalar = {}
+    for name, (xent_sum, tokens, correct) in per_dataset_eval.items():
+      if tokens > 0:
+        loss = xent_sum / tokens
+        scalar[f"per_dataset_eval/loss/{name}"] = loss
+        scalar[f"per_dataset_eval/perplexity/{name}"] = float(np.exp(loss))
+        scalar[f"per_dataset_eval/accuracy/{name}"] = correct / tokens
+      scalar[f"per_dataset_eval/tokens/{name}"] = tokens
+    metrics = {"scalar": scalar, "scalars": {}}
+    if self.config.enable_tensorboard:
+      self.write_metrics_to_tensorboard(metrics, step, "eval")
+    if self.config.metrics_file:
+      self.write_metrics_locally(metrics, step)
+    if self.config.gcs_metrics and jax.process_index() == 0:
+      self.write_metrics_for_gcs(metrics, step, "eval")
+
   def log_metrics(self, metrics, step, metric_type):
     """Logs metrics via max_logging."""
     if metric_type == "train":

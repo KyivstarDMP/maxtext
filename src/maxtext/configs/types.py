@@ -1376,6 +1376,13 @@ class FineTuning(BaseModel):
       "",
       description="Comma-joined, ordered names of eval datasets; one separate eval pass is run per name.",
   )
+  per_dataset_eval_files: str = Field(
+      "",
+      description=(
+          "Semicolon-joined eval file globs aligned 1:1 with per_dataset_eval_names (runner-filled). "
+          "Each becomes its own single-dataset eval iterator (Option B: N separate passes)."
+      ),
+  )
   formatting_func_path: str = Field(
       "",
       description="Path to the custom data formatting function for SFT.",

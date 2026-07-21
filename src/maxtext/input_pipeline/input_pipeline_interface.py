@@ -116,5 +116,20 @@ def create_data_iterator(config: pyconfig.HyperParameters, mesh):
 
     if config.expansion_factor_real_data > 1:
       assert len(process_indices_eval) == jax.process_count() // config.expansion_factor_real_data
-    output_eval_iterator = create_process_specific_iterator(config, mesh, process_indices_eval, eval_iterator)
+    if config.per_dataset_metrics and config.per_dataset_eval_files:
+      # Option B: one single-dataset eval iterator per component, keyed by name. jit_eval_step is
+      # shape-based, so a dict here is fine; the eval loop runs one pass per entry.
+      names = [n for n in config.per_dataset_eval_names.split(",") if n]
+      globs = [g for g in config.per_dataset_eval_files.split(";") if g]
+      assert len(names) == len(
+          globs
+      ), f"per_dataset_eval_names ({len(names)}) and per_dataset_eval_files ({len(globs)}) must align"
+      output_eval_iterator = {
+          name: create_process_specific_iterator(
+              config, mesh, process_indices_eval, functools.partial(eval_iterator, eval_files_override=glob)
+          )
+          for name, glob in zip(names, globs)
+      }
+    else:
+      output_eval_iterator = create_process_specific_iterator(config, mesh, process_indices_eval, eval_iterator)
   return output_train_iterator, output_eval_iterator

@@ -580,8 +580,13 @@ def make_grain_eval_iterator(
     config: ml_collections.ConfigDict,
     global_mesh,
     process_indices,
+    eval_files_override=None,
 ):
-  """Load, preprocess dataset and return iterators"""
+  """Load, preprocess dataset and return iterators.
+
+  ``eval_files_override`` (per_dataset_metrics Option B): use this glob instead of
+  ``config.grain_eval_files`` so one iterator can be built per eval dataset.
+  """
   assert (
       config.global_batch_size_to_load_eval % global_mesh.size == 0
   ), "Batch size should be divisible by number of global devices."
@@ -590,7 +595,7 @@ def make_grain_eval_iterator(
 
   get_ds_fn = functools.partial(
       get_datasets,
-      config.grain_eval_files,
+      eval_files_override or config.grain_eval_files,
       config.grain_file_type,
       shuffle=False,  # No shuffle for eval
       shuffle_seed=config.data_shuffle_seed,
