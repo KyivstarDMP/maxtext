@@ -141,8 +141,13 @@ class MetricLogger:
     """Expand per-dataset [num_datasets+1] vectors into named per_dataset_train/ scalar keys.
 
     Slot 0 (pad/unknown) is dropped; index i (1-based) maps to per_dataset_names[i-1]. Emits
-    loss = xent_sum/tokens, accuracy = correct/tokens (NaN when a dataset had no tokens this step),
-    and the raw token count. These land in metrics["scalar"] so TB/JSON/GCS pick them up generically.
+    loss = xent_sum/tokens and accuracy = correct/tokens, plus the raw token count.
+
+    A single packed batch only covers a handful of the mixture's components, so most datasets
+    contribute 0 tokens on any given step. For those we emit ONLY the token count (0) and omit
+    loss/accuracy entirely rather than writing NaN: TensorBoard simply has no point at that step
+    (the curve interpolates across the gap), and we avoid flooding the logs with the summary
+    writer's "NaN or Inf found in input tensor" warning once per absent dataset per step.
     """
     pd = metrics.pop("per_dataset")
     names = [n for n in self.config.per_dataset_names.split(",") if n]
@@ -153,8 +158,9 @@ class MetricLogger:
     for i, name in enumerate(names, start=1):
       t = float(tk[i])
       scalar[f"per_dataset_train/tokens/{name}"] = t
-      scalar[f"per_dataset_train/loss/{name}"] = float(xs[i]) / t if t > 0 else float("nan")
-      scalar[f"per_dataset_train/accuracy/{name}"] = float(ok[i]) / t if t > 0 else float("nan")
+      if t > 0:
+        scalar[f"per_dataset_train/loss/{name}"] = float(xs[i]) / t
+        scalar[f"per_dataset_train/accuracy/{name}"] = float(ok[i]) / t
 
   def write_per_dataset_eval(self, per_dataset_eval, step):
     """Write per-dataset eval metrics (Option B): {name: (xent_sum, tokens, correct)} -> named scalars.
