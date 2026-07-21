@@ -205,7 +205,8 @@ class MetricLogger:
         loss = xent_sum / tokens
         scalar[f"per_dataset_eval/loss/{name}"] = loss
         scalar[f"per_dataset_eval/perplexity/{name}"] = float(np.exp(loss))
-        scalar[f"per_dataset_eval/accuracy/{name}"] = correct / tokens
+        if correct is not None:  # accuracy is optional (see the eval loop)
+          scalar[f"per_dataset_eval/accuracy/{name}"] = correct / tokens
       scalar[f"per_dataset_eval/tokens/{name}"] = tokens
     metrics = {"scalar": scalar, "scalars": {}}
     if self.config.enable_tensorboard:

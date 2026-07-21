@@ -252,6 +252,15 @@ def _per_dataset_from_logits(logits, masked_xent, data, config):
   return xent_sum_by_ds, correct_by_ds
 
 
+def _total_correct_from_logits(logits, data):
+  """Aggregate next-token correct-token count over the loss mask (non-tiled path only).
+
+  With vocab tiling the decoder returns logits=None, so the tiled path sources this from the
+  tiled scan instead (see vocab_tiling_linen_loss).
+  """
+  return jnp.sum((jnp.argmax(logits, axis=-1) == data["targets"]) & (data["targets_segmentation"] != 0))
+
+
 def _assemble_per_dataset_aux(config, data, xent_sum_by_ds, correct_by_ds, use_ditto, ditto_step):
   """Per-dataset aux dict (xent_sum / correct / token_count, each [num_datasets+1]) or None.
 
@@ -311,9 +320,11 @@ def loss_fn(model, config, data, dropout_rng, params, sparsity_state=None, is_tr
   ul_sum = 0.0
   ditto_sum = 0.0
   ditto_step = jnp.array(False)
-  # Per-dataset (per mixture component) accumulators; filled in the non-tiled loss branch (train only).
+  # Per-dataset (per mixture component) accumulators; filled in the loss branch below (train only).
   xent_sum_by_ds = None
   correct_by_ds = None
+  # Aggregate correct-token count for this batch; used for eval accuracy (train or eval).
+  total_correct = None
   if use_ditto:
     # Derive an independent per-step rng (fold_in does not consume the dropout stream).
     base_rng = dropout_rng if dropout_rng is not None else jax.random.PRNGKey(0)
@@ -384,10 +395,15 @@ def loss_fn(model, config, data, dropout_rng, params, sparsity_state=None, is_tr
     elif config.num_vocab_tiling > 1:
       hidden_state_key = ("intermediates", "decoder", "hidden_states")
       hidden_states = maxtext_utils.get_nested_value(intermediate_outputs, hidden_state_key)[0]
-      if config.per_dataset_metrics and "dataset_id" in data:
-        xent_sum, total_z_loss, ul_sum, ditto_sum, xent_sum_by_ds, correct_by_ds = vocab_tiling_linen_loss(
+      if config.per_dataset_metrics:
+        xent_sum, total_z_loss, ul_sum, ditto_sum, _pd_xent, _pd_correct = vocab_tiling_linen_loss(
             hidden_states, data, config, model, params, is_train
         )
+        # No full logits exist on the tiled path, so accuracy comes from the tiled scan. Train
+        # batches give per-component vectors; eval batches bucket into one slot (the aggregate).
+        total_correct = jnp.sum(_pd_correct)
+        if "dataset_id" in data:
+          xent_sum_by_ds, correct_by_ds = _pd_xent, _pd_correct
       else:
         xent_sum, total_z_loss, ul_sum, ditto_sum = vocab_tiling_linen_loss(
             hidden_states, data, config, model, params, is_train
@@ -417,8 +433,10 @@ def loss_fn(model, config, data, dropout_rng, params, sparsity_state=None, is_tr
 
       xent_sum = jnp.sum(xent)
       total_z_loss = jnp.sum(z_loss)
-      if config.per_dataset_metrics and "dataset_id" in data:
-        xent_sum_by_ds, correct_by_ds = _per_dataset_from_logits(logits, xent, data, config)
+      if config.per_dataset_metrics:
+        total_correct = _total_correct_from_logits(logits, data)
+        if "dataset_id" in data:
+          xent_sum_by_ds, correct_by_ds = _per_dataset_from_logits(logits, xent, data, config)
       if use_unlikelihood:
         ul_sum = _unlikelihood_loss_full(logits, data, config)
       if use_ditto:
@@ -462,8 +480,10 @@ def loss_fn(model, config, data, dropout_rng, params, sparsity_state=None, is_tr
 
       xent_sum = jnp.sum(xent)
       total_z_loss = jnp.sum(z_loss)
-      if config.per_dataset_metrics and "dataset_id" in data:
-        xent_sum_by_ds, correct_by_ds = _per_dataset_from_logits(logits, xent, data, config)
+      if config.per_dataset_metrics:
+        total_correct = _total_correct_from_logits(logits, data)
+        if "dataset_id" in data:
+          xent_sum_by_ds, correct_by_ds = _per_dataset_from_logits(logits, xent, data, config)
       if use_unlikelihood:
         ul_sum = _unlikelihood_loss_full(logits, data, config)
       if use_ditto:
@@ -552,6 +572,8 @@ def loss_fn(model, config, data, dropout_rng, params, sparsity_state=None, is_tr
   }
   if per_dataset_aux is not None:
     aux["per_dataset"] = per_dataset_aux
+  if total_correct is not None:
+    aux["total_correct"] = total_correct
   return loss, aux
 
 
@@ -849,13 +871,12 @@ def eval_step(model, config, state, data, dropout_rng=None):
       "evaluation/mtp_loss": mtp_loss,
       "evaluation/mtp_acceptance_rate_percent": mtp_acceptance_rate,
   }
-  if config.per_dataset_metrics:
-    # Full logits are always materialized in eval mode (num_vocab_tiling skips logits only in
-    # MODEL_MODE_TRAIN), so per-pass accuracy is a direct argmax for both tiled and non-tiled.
-    # `data` was sliced in place by loss_fn, so it matches the logits' micro-batch shape.
-    eval_logits = aux["intermediate_outputs"]["logits"]
-    correct = (jnp.argmax(eval_logits, axis=-1) == data["targets"]) & (data["targets_segmentation"] != 0)
-    eval_scalar["evaluation/total_correct"] = jnp.sum(correct).astype(jnp.float32)
+  # Aggregate correct-token count for per-dataset eval accuracy. loss_fn supplies it from whichever
+  # path applies (tiled scan or full logits); it is simply absent if neither could produce one
+  # (e.g. the NNX tiled path), and the eval loop degrades to loss/perplexity only.
+  eval_total_correct = aux.get("total_correct")
+  if eval_total_correct is not None:
+    eval_scalar["evaluation/total_correct"] = eval_total_correct.astype(jnp.float32)
   metrics = {"scalar": eval_scalar}
 
   return metrics
@@ -972,6 +993,7 @@ def train_loop(config, recorder, state=None):
             for ds_name, ds_iter in eval_data_iterator.items():
               ds_iter.reset()
               xent_sum_acc, tokens_acc, correct_acc, cnt = 0.0, 0.0, 0.0, 0
+              has_correct = True  # accuracy is optional; loss/perplexity always work
               # pylint: disable=not-callable
               for eval_batch in ds_iter:
                 if config.eval_steps > 0 and cnt >= config.eval_steps:
@@ -981,9 +1003,12 @@ def train_loop(config, recorder, state=None):
                   em = p_eval_step(state, eval_batch, *step_rng_args)["scalar"]
                 xent_sum_acc += float(em["evaluation/total_loss"])
                 tokens_acc += float(em["evaluation/total_weights"])
-                correct_acc += float(em["evaluation/total_correct"])
+                if "evaluation/total_correct" in em:
+                  correct_acc += float(em["evaluation/total_correct"])
+                else:
+                  has_correct = False
                 cnt += 1
-              per_dataset_eval[ds_name] = (xent_sum_acc, tokens_acc, correct_acc)
+              per_dataset_eval[ds_name] = (xent_sum_acc, tokens_acc, correct_acc if has_correct else None)
               max_logging.log(f"  eval[{ds_name}]: {cnt} steps, {int(tokens_acc)} loss-tokens")
             metric_logger_instance.write_per_dataset_eval(per_dataset_eval, step)
             eval_step_count = 0

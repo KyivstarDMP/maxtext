@@ -156,23 +156,34 @@ def vocab_tiling_linen_loss(
 
   gold_probs = _gold_probs_linen() if use_ditto else None
 
-  per_dataset = config.per_dataset_metrics and "dataset_id" in data
+  per_dataset = config.per_dataset_metrics
 
   def _per_dataset_linen():
-    """Forward-only tiled per-dataset (xent_sum, correct_count) [num_datasets+1] vectors (no grad).
+    """Forward-only tiled (xent_sum, correct_count) vectors, segment-summed by dataset (no grad).
 
     Mirrors :func:`_gold_probs_linen`: one extra forward over the tiled logits, wrapped in
     stop_gradient (these are metrics, not part of the training objective). Each chunk holds full
-    per-token logits, so next-token accuracy is a per-chunk argmax; both quantities are
-    segment-summed by ``dataset_id`` and accumulated across chunks.
+    per-token logits, so next-token accuracy is a per-chunk argmax.
+
+    Train batches carry ``dataset_id`` -> [num_datasets+1] per-component vectors. Eval batches
+    (Option B: one pass per dataset) carry none, so everything is bucketed into slot 1 and the
+    result is simply this pass's AGGREGATE xent/correct — which is what the caller needs, since
+    with vocab tiling the decoder returns ``logits=None`` (decoders.py: num_vocab_tiling > 1 and
+    model_mode == MODEL_MODE_TRAIN, which eval's teacher-forced forward also uses).
     """
-    num_seg = len([n for n in config.per_dataset_names.split(",") if n]) + 1
+    has_ids = "dataset_id" in data
+    if has_ids:
+      num_seg = len([n for n in config.per_dataset_names.split(",") if n]) + 1
+      ids_full = data["dataset_id"]
+    else:
+      num_seg = 2
+      ids_full = jnp.ones_like(labels)
     bsz, slen, edim = hidden_states.shape
     tile = (bsz * slen) // config.num_vocab_tiling
     rh = _reshape(hidden_states, (config.num_vocab_tiling, tile, edim), reshaped_hidden_spec)
     rl = _reshape(labels, (config.num_vocab_tiling, tile), reshaped_data_spec)
     rs = _reshape(segmentation, (config.num_vocab_tiling, tile), reshaped_data_spec)
-    rd = _reshape(data["dataset_id"], (config.num_vocab_tiling, tile), reshaped_data_spec)
+    rd = _reshape(ids_full, (config.num_vocab_tiling, tile), reshaped_data_spec)
 
     def _pd_body(acc, chunk):
       xent_acc, correct_acc = acc
