@@ -215,6 +215,28 @@ class MetricLogger:
       self.write_metrics_locally(metrics, step)
     if self.config.gcs_metrics and jax.process_index() == 0:
       self.write_metrics_for_gcs(metrics, step, "eval")
+    # W&B logs via a separate hook (docker wandb-support.patch) that requires monotonically increasing
+    # steps. This method runs BEFORE the train step's buffered flush (train.py), so emitting to W&B here
+    # at `step` would make W&B drop the still-buffered train point at step-1. Defer the W&B emission to
+    # the next train buffer_and_write_metrics (mirrors _finalize_eval_metrics); TB/local/GCS above are
+    # order-independent so they stay here. See docs/012.
+    if scalar:
+      self._pending_per_dataset_eval_wandb = (dict(scalar), step)
+
+  def _flush_pending_per_dataset_eval_wandb(self):
+    """Emit any deferred per-dataset eval scalars to W&B at their eval step.
+
+    Called from buffer_and_write_metrics (train) AFTER the previous train step has been flushed, so the
+    eval step is >= the last W&B step and nothing is dropped. No-op unless the wandb hook is active
+    (self.enable_wandb / self.write_metrics_to_wandb are added by the wandb-support patch).
+    """
+    pending = getattr(self, "_pending_per_dataset_eval_wandb", None)
+    if pending is None:
+      return
+    scalar, eval_step = pending
+    self._pending_per_dataset_eval_wandb = None
+    if getattr(self, "enable_wandb", False):
+      self.write_metrics_to_wandb({"scalar": scalar, "scalars": {}}, eval_step)
 
   def log_metrics(self, metrics, step, metric_type):
     """Logs metrics via max_logging."""
@@ -461,6 +483,9 @@ class MetricLogger:
       self.buffered_metrics.append(("train", step, metrics, step_time_delta))
       if self._pending_eval_step_count > 0:
         self._finalize_eval_metrics(step)
+      # Emit deferred per-dataset eval scalars now: the previous train step was flushed above, so the
+      # eval step is monotonically safe for W&B (see write_per_dataset_eval).
+      self._flush_pending_per_dataset_eval_wandb()
     else:
       self._pending_eval_step_count += 1
       self.buffered_metrics.append(("eval", step, metrics, step_time_delta))
@@ -547,5 +572,7 @@ class MetricLogger:
     for entry in self.buffered_metrics:
       self._flush_one_buffered_entry(entry)
     self.buffered_metrics = []
+    # Safety net for the rare case where eval fires on the final step and no train flush follows.
+    self._flush_pending_per_dataset_eval_wandb()
 
     max_utils.close_summary_writer(self.writer)
