@@ -185,29 +185,37 @@ class MetricLogger:
     self._per_dataset_accum = None
     names = [n for n in self.config.per_dataset_names.split(",") if n]
     scalar = metrics["scalar"]
+    # Key layout is `per_dataset_train_<type>/<name>`: W&B groups panels into sections by the FIRST '/'
+    # segment (default "group by first prefix"), so putting the metric type in that segment gives one
+    # section per (split, type) — per_dataset_train_loss / _accuracy / _tokens — each holding one panel
+    # per dataset. TensorBoard groups on the same prefix. See docs/012.
     for i, name in enumerate(names, start=1):
       t = float(tk_w[i])
-      scalar[f"per_dataset_train/tokens/{name}"] = t
+      scalar[f"per_dataset_train_tokens/{name}"] = t
       if t > 0:
-        scalar[f"per_dataset_train/loss/{name}"] = float(xs_w[i]) / t
-        scalar[f"per_dataset_train/accuracy/{name}"] = float(ok_w[i]) / t
+        scalar[f"per_dataset_train_loss/{name}"] = float(xs_w[i]) / t
+        scalar[f"per_dataset_train_accuracy/{name}"] = float(ok_w[i]) / t
 
   def write_per_dataset_eval(self, per_dataset_eval, step):
     """Write per-dataset eval metrics (Option B): {name: (xent_sum, tokens, correct)} -> named scalars.
 
     Each dataset's aggregate over its own eval pass becomes
-    per_dataset_eval/{loss,perplexity,accuracy,tokens}/<name>. Written straight to the TB/JSON/GCS
+    per_dataset_eval_{loss,perplexity,accuracy,tokens}/<name>. Written straight to the TB/JSON/GCS
     sinks (bypassing the eval-aggregation path, which is keyed on the single-pass evaluation/* keys).
+
+    The metric type is the FIRST '/' segment (`per_dataset_eval_loss/<name>`, not
+    `per_dataset_eval/loss/<name>`) so W&B — which groups panels into sections by the first prefix —
+    puts one section per (split, type), each holding one panel per dataset. See docs/012.
     """
     scalar = {}
     for name, (xent_sum, tokens, correct) in per_dataset_eval.items():
       if tokens > 0:
         loss = xent_sum / tokens
-        scalar[f"per_dataset_eval/loss/{name}"] = loss
-        scalar[f"per_dataset_eval/perplexity/{name}"] = float(np.exp(loss))
+        scalar[f"per_dataset_eval_loss/{name}"] = loss
+        scalar[f"per_dataset_eval_perplexity/{name}"] = float(np.exp(loss))
         if correct is not None:  # accuracy is optional (see the eval loop)
-          scalar[f"per_dataset_eval/accuracy/{name}"] = correct / tokens
-      scalar[f"per_dataset_eval/tokens/{name}"] = tokens
+          scalar[f"per_dataset_eval_accuracy/{name}"] = correct / tokens
+      scalar[f"per_dataset_eval_tokens/{name}"] = tokens
     metrics = {"scalar": scalar, "scalars": {}}
     if self.config.enable_tensorboard:
       self.write_metrics_to_tensorboard(metrics, step, "eval")
