@@ -22,6 +22,7 @@ from concurrent import futures
 import json
 
 import jax
+import numpy as np
 
 import grain.python as grain
 from grain.experimental import ElasticIterator
@@ -594,11 +595,17 @@ def make_grain_eval_iterator(
     global_mesh,
     process_indices,
     eval_files_override=None,
+    force_padding_batch=False,
 ):
   """Load, preprocess dataset and return iterators.
 
   ``eval_files_override`` (per_dataset_metrics Option B): use this glob instead of
   ``config.grain_eval_files`` so one iterator can be built per eval dataset.
+
+  ``force_padding_batch`` (per_dataset_metrics Option B): force the multi-host iterator to pad instead of
+  raising StopIteration, so every host issues an identical (fixed) number of eval collectives even when a
+  small per-dataset split does not divide evenly across hosts. Without this, a short host exits early and
+  the SPMD launch groups diverge (E0200). See docs/012.
   """
   assert (
       config.global_batch_size_to_load_eval % global_mesh.size == 0
@@ -631,6 +638,37 @@ def make_grain_eval_iterator(
       stamp_dataset_id=False,
   )
 
+  use_padding = config.generate_padding_batch_eval or force_padding_batch
+
+  # Option B (force_padding_batch) is text-only: the zero-data-host template below covers text columns.
+  # A multimodal split with an empty host would need image columns too, so fail fast at setup.
+  assert not (force_padding_batch and config.use_multimodal), (
+      "per_dataset_metrics Option B (force_padding_batch) is not supported for multimodal eval: the "
+      "zero-data-host padding template covers text columns only (see docs/012)."
+  )
+
+  # Zero-batch template for a host whose strided eval shard is EMPTY (a split with fewer records than
+  # dataloading hosts): it has no real batch to clone, so _make_padding_batch would otherwise ValueError.
+  # These are exactly the six int32 columns a *text* eval batch carries: the two data columns plus their
+  # _position/_segmentation, packed to (local batch, max_target_length). stamp_dataset_id=False for eval, so
+  # there is no dataset_id column. Left None for multimodal (pre-existing generate_padding_batch_eval path),
+  # which preserves the prior clone-last-batch behavior.
+  padding_batch_template = None
+  if use_padding and not config.use_multimodal:
+    local_bs = data_processing_utils.get_local_batch_size(config)
+    seq = config.max_target_length
+    padding_batch_template = {
+        col: np.zeros((local_bs, seq), np.int32)
+        for col in (
+            "inputs",
+            "inputs_position",
+            "inputs_segmentation",
+            "targets",
+            "targets_position",
+            "targets_segmentation",
+        )
+    }
+
   if not config.colocated_python_data_input:
     eval_ds = get_ds_fn(
         dataloading_host_index=process_indices.index(jax.process_index()),
@@ -638,7 +676,7 @@ def make_grain_eval_iterator(
     )
     eval_dataloader = preprocessing_fn(dataset=eval_ds)
     return multihost_dataloading.MultiHostDataLoadIterator(
-        eval_dataloader, global_mesh, config.generate_padding_batch_eval
+        eval_dataloader, global_mesh, use_padding, padding_batch_template=padding_batch_template
     )
   else:
     global_shape = (config.global_batch_size_to_load, config.max_target_length)

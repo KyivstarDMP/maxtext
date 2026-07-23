@@ -989,15 +989,24 @@ def train_loop(config, recorder, state=None):
           _eval_sharding = sharding.get_input_data_sharding(config, mesh)
           if isinstance(eval_data_iterator, dict):
             # Option B: one full eval pass per dataset; each pass's aggregate is that dataset's metric.
+            # Every host MUST run exactly the same number of p_eval_step (jit_eval_step) collectives per
+            # dataset, else the SPMD launch groups diverge -> E0200 core-halt. We therefore run a FIXED
+            # config.eval_steps launches: the per-dataset iterators are built with force_padding_batch=True
+            # (input_pipeline_interface.py), so next() never raises StopIteration and no host can exit early.
+            # All-zero padding batches have targets_segmentation==0 -> contribute 0 to loss/weights/correct,
+            # so the metric is identical to a real-only pass (see docs/012).
+            assert config.eval_steps > 0, (
+                "per_dataset_metrics Option B requires eval_steps > 0: the per-dataset iterators pad "
+                "indefinitely (force_padding_batch), so eval_steps is what bounds each dataset pass."
+            )
             per_dataset_eval = {}
             for ds_name, ds_iter in eval_data_iterator.items():
               ds_iter.reset()
-              xent_sum_acc, tokens_acc, correct_acc, cnt = 0.0, 0.0, 0.0, 0
+              xent_sum_acc, tokens_acc, correct_acc = 0.0, 0.0, 0.0
               has_correct = True  # accuracy is optional; loss/perplexity always work
               # pylint: disable=not-callable
-              for eval_batch in ds_iter:
-                if config.eval_steps > 0 and cnt >= config.eval_steps:
-                  break
+              for _ in range(config.eval_steps):
+                eval_batch = next(ds_iter)
                 eval_batch = jax.device_put(eval_batch, _eval_sharding)
                 with jax.set_mesh(mesh), nn_partitioning.axis_rules(config.logical_axis_rules):
                   em = p_eval_step(state, eval_batch, *step_rng_args)["scalar"]
@@ -1007,9 +1016,8 @@ def train_loop(config, recorder, state=None):
                   correct_acc += float(em["evaluation/total_correct"])
                 else:
                   has_correct = False
-                cnt += 1
               per_dataset_eval[ds_name] = (xent_sum_acc, tokens_acc, correct_acc if has_correct else None)
-              max_logging.log(f"  eval[{ds_name}]: {cnt} steps, {int(tokens_acc)} loss-tokens")
+              max_logging.log(f"  eval[{ds_name}]: {config.eval_steps} steps, {int(tokens_acc)} loss-tokens")
             metric_logger_instance.write_per_dataset_eval(per_dataset_eval, step)
             eval_step_count = 0
           else:
