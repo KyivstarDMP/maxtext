@@ -15,6 +15,7 @@
 """Unit tests for train_sft.py."""
 
 import unittest
+from unittest import mock
 from types import SimpleNamespace
 import pytest
 
@@ -26,7 +27,6 @@ pytestmark = [pytest.mark.post_training]
 class TrainSFTTest(unittest.TestCase):
   """Tests for train_sft.py."""
 
-  @pytest.mark.cpu_only
   def test_validate_config_valid(self):
     config = SimpleNamespace(
         optimizer_memory_host_offload=False,
@@ -34,13 +34,52 @@ class TrainSFTTest(unittest.TestCase):
     # Should not raise any exception
     train_sft.validate_config(config)
 
-  @pytest.mark.cpu_only
   def test_validate_config_invalid_offload(self):
     config = SimpleNamespace(
         optimizer_memory_host_offload=True,
     )
     with self.assertRaisesRegex(ValueError, "optimizer_memory_host_offload=True is not supported"):
       train_sft.validate_config(config)
+
+  def test_train_model_caching_moe(self):
+    """Test that NNX graph caching is disabled for MoE models (num_experts > 1)."""
+    mt_config = SimpleNamespace(
+        logical_axis_rules=[],
+        num_experts=8,
+    )
+    trainer = mock.MagicMock()
+    trainer.data_hooks.train_data_iterator = "train_iter"
+    trainer.data_hooks.eval_data_iterator = "eval_iter"
+    mesh = mock.MagicMock()
+
+    with mock.patch("jax.set_mesh"):
+      train_sft.train_model(mt_config, trainer, mesh)
+
+    trainer.train.assert_called_once_with(
+        "train_iter",
+        "eval_iter",
+        cache_nnx_graph=False,
+    )
+
+  def test_train_model_caching_dense(self):
+    """Test that NNX graph caching is enabled for dense models (num_experts <= 1)."""
+    mt_config = SimpleNamespace(
+        logical_axis_rules=[],
+        num_experts=1,
+    )
+    trainer = mock.MagicMock()
+    trainer.data_hooks.train_data_iterator = "train_iter"
+    trainer.data_hooks.eval_data_iterator = "eval_iter"
+    mesh = mock.MagicMock()
+
+    with mock.patch("jax.set_mesh"):
+      train_sft.train_model(mt_config, trainer, mesh)
+
+    trainer.train.assert_called_once_with(
+        "train_iter",
+        "eval_iter",
+        cache_nnx_graph=True,
+    )
 
 
 if __name__ == "__main__":

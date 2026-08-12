@@ -1,4 +1,4 @@
-# Copyright 2026 Google LLC
+# Copyright 2023-2026 Google LLC
 
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# This file defines a module for running jupyter notebooks against the built maxtext package.
+# This workflow runs jupyter notebooks against the built MaxText package.
 
 name: Run Jupyter Notebooks
 
@@ -49,19 +49,20 @@ jobs:
   run:
     runs-on: ${{ inputs.cloud_runner != '' && inputs.cloud_runner || fromJson(format('["self-hosted", "{0}", "{1}"]', inputs.device_type, inputs.device_name)) }}
     container:
-      image: gcr.io/tpu-prod-env-multipod/${{ inputs.base_image }}
+      image: gcr.io/tpu-prod-env-multipod/${{ inputs.base_image }} # zizmor: ignore[unpinned-images]
       env:
         VLLM_TARGET_DEVICE: "tpu"
         UV_TORCH_BACKEND: "cpu"
     steps:
       - name: Checkout MaxText
         if: ${{ !inputs.maxtext_installed }}
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           ref: ${{ inputs.maxtext_sha }}
+          persist-credentials: false
       - name: Download the MaxText wheel
         if: ${{ !inputs.maxtext_installed }}
-        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: maxtext-wheel
       - name: Install MaxText and Dependencies
@@ -74,6 +75,15 @@ jobs:
           maxtext_wheel=$(ls maxtext-*-py3-none-any.whl 2>/dev/null)
 
           # 2. Install MaxText package and all the post training dependencies
+          if command -v apt-get &> /dev/null; then
+            echo "Installing GCC 12 for vLLM C++20 compilation in CI runner..."
+            if [ -f /etc/os-release ] && grep -q "bullseye" /etc/os-release; then
+              echo "deb http://deb.debian.org/debian bookworm main" | (sudo tee /etc/apt/sources.list.d/bookworm.list 2>/dev/null || tee /etc/apt/sources.list.d/bookworm.list)
+              (sudo apt-get update -y && sudo apt-get install -y --no-install-recommends -t bookworm gcc-12 g++-12 build-essential cmake ninja-build) || (apt-get update -y && apt-get install -y --no-install-recommends -t bookworm gcc-12 g++-12 build-essential cmake ninja-build) || true
+            else
+              (sudo apt-get update -y && sudo apt-get install -y --no-install-recommends gcc-12 g++-12 build-essential cmake ninja-build) || (apt-get update -y && apt-get install -y --no-install-recommends gcc-12 g++-12 build-essential cmake ninja-build) || true
+            fi
+          fi
           uv pip install ${maxtext_wheel}[tpu-post-train] --resolution=lowest
           install_tpu_post_train_extra_deps
 
@@ -109,10 +119,9 @@ jobs:
           # Run Hugging Face authentication
           hf auth login --token "$HF_TOKEN"
 
-          for notebook in "$MAXTEXT_NOTEBOOKS_ROOT"/{sft,rl}*.ipynb; do
+          for notebook in "$MAXTEXT_NOTEBOOKS_ROOT"/*.ipynb; do
             filename=$(basename "$notebook")
-            # TODO: Update runnner to v6e-8 as RL with LLama3.1-8b doesn't fit on v6e-4
-            if [[ "$filename" == "sft_llama3_demo_gpu.ipynb" || "$filename" == "maxtext_with_gepa.ipynb" ]]; then
+            if [[ "$filename" == "sft_llama3_demo_gpu.ipynb" || "$filename" == "maxtext_with_gepa.ipynb" || "$filename" == "demo_decoding.ipynb" || "$filename" == "dpo_qwen3_demo.ipynb" ]]; then
               echo "Skipping $filename"
               continue
             fi
@@ -123,10 +132,15 @@ jobs:
             echo "------------------------------------------------------"
 
             $PAPERMILL_EXE "$notebook" "$output_name" -k maxtext_venv
+
+            # Clean up any checkpoint directories created by the notebook to avoid filling up disk space
+            echo "Post-notebook disk cleanup for $filename ..."
+            rm -rf "$MAXTEXT_PKG_DIR"/*_output
+            rm -rf "$HOME/.cache/huggingface/hub"
           done
       - name: Upload Outputs
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@5d5d22a31266ced268874388b861e4b58bb5c2f3 # v4.3.1
         with:
           name: notebook-outputs-${{ inputs.device_name }}
           path: ./*_output.ipynb

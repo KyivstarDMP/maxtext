@@ -25,19 +25,24 @@ import os
 
 from absl import app
 
-import numpy as np
 import optax
 
 import pathwaysutils  # pylint: disable=unused-import
 
-import tensorflow as tf
+try:
+  import tensorflow as tf
+
+  _TF_AVAILABLE = True
+except ImportError:
+  _TF_AVAILABLE = False
 
 import jax
 import jax.numpy as jnp
 from jax.sharding import NamedSharding
 
-from flax import linen as nn, nnx
+from flax import linen as nn, nnx, traverse_util
 from flax.linen import partitioning as nn_partitioning
+from flax.nnx import variablelib
 
 from maxtext.configs import pyconfig
 from maxtext.utils.globals import EPS
@@ -45,7 +50,7 @@ from maxtext.utils import elastic_utils
 # Placeholder: internal
 
 # pylint: disable=too-many-positional-arguments
-from maxtext.layers.multi_token_prediction import calculate_mtp_acceptance_rate, calculate_mtp_loss
+from maxtext.layers.multi_token_prediction import calculate_mtp_acceptance_rate, calculate_mtp_loss, mtp_acceptance, mtp_losses
 from maxtext.common import checkpointing, profiler
 from maxtext.common.goodput import (
     GoodputEvent,
@@ -77,158 +82,9 @@ VertexTensorboardManager, _vertex_tb_is_stub = vertex_tensorboard_modules()
 def get_first_step(model, state):
   if isinstance(model, nn.Module):
     return int(state.step)
+  if hasattr(state, "inner_state"):  # DiLoCoTrainState (NNX DiLoCo): step is the optimizer step var
+    return int(state.step.get_value())
   return int(state.optimizer.step.get_value())
-
-
-# Constant tag folded into the per-step rng to derive DITTO's coin/sentence stream
-# without consuming the dropout rng stream.
-_DITTO_RNG_TAG = 0xD1770
-
-
-def _unlikelihood_loss_full(logits, data, config):
-  """Token-level unlikelihood loss on full (non-tiled) ``[B, S, V]`` logits.
-
-  Flattens the batch-sequence axis and defers to ``max_utils.unlikelihood_loss_from_logits``,
-  the same kernel used per tile in the vocab-tiling path, so the two paths agree.
-  Candidate scope B: ``targets`` / ``targets_segmentation`` are the candidate context
-  (the model's own completion tokens).
-  """
-  batch_size, seq_len = logits.shape[0], logits.shape[1]
-  positions = jnp.arange(batch_size * seq_len, dtype=jnp.int32)
-  return max_utils.unlikelihood_loss_from_logits(
-      logits.reshape(batch_size * seq_len, config.vocab_size),
-      positions,
-      data["targets"],
-      data["targets_segmentation"],
-      data["targets"].reshape(-1),
-      (data["targets_segmentation"] != 0).reshape(-1),
-      seq_len=seq_len,
-      window=config.unlikelihood_window,
-      eps=config.unlikelihood_eps,
-  )
-
-
-def _ditto_loss_full(logits, data, config):
-  """DITTO decay loss on full (non-tiled) ``[B, S, V]`` logits.
-
-  Flattens the batch-sequence axis and defers to ``max_utils.ditto_loss_from_logits``,
-  the same kernel used per tile in the vocab-tiling path, so the two paths agree. The
-  baseline ``gold_probs`` is the detached per-token gold probability of the *same* logits.
-  Reads the precomputed period maps ``ditto_baseline_pos`` / ``ditto_pen_mask`` from
-  ``data`` (built by :func:`build_pseudo_repetition`).
-  """
-  batch_size, seq_len = logits.shape[0], logits.shape[1]
-  flat_logits = logits.reshape(batch_size * seq_len, config.vocab_size)
-  gold = data["targets"].reshape(-1)
-  gold_probs = jax.lax.stop_gradient(max_utils.gold_prob_from_logits(flat_logits, gold)).reshape(
-      batch_size, seq_len
-  )
-  positions = jnp.arange(batch_size * seq_len, dtype=jnp.int32)
-  return max_utils.ditto_loss_from_logits(
-      flat_logits,
-      positions,
-      gold,
-      gold_probs,
-      data["ditto_baseline_pos"],
-      data["ditto_pen_mask"],
-      seq_len=seq_len,
-      gamma=config.ditto_gamma,
-      eps=config.ditto_eps,
-      loss_type=config.ditto_loss_type,
-  )
-
-
-def build_pseudo_repetition(inputs, targets, targets_segmentation, delim_ids, rng, max_reps=0):
-  """Build a synthetic pseudo-repetition batch for a DITTO step (Xu et al., 2022).
-
-  Reproduces the paper's ``re_orgnize_sentence`` for MaxText's completion-only SFT layout
-  (``targets[i] = inputs[i+1]`` after ``shift_and_refine``, ``targets_segmentation != 0``
-  on the assistant completion). Per row it makes the assistant **start repeating one of
-  its own sentences partway through the answer**, keeping the prompt and earlier answer as
-  context. See ``docs/008``.
-
-  Args:
-    inputs: ``[B, S]`` int decoder input tokens.
-    targets: ``[B, S]`` int next-token targets (``= inputs`` shifted left).
-    targets_segmentation: ``[B, S]`` int; non-zero marks the assistant completion.
-    delim_ids: a (static) tuple of token ids that mark sentence boundaries.
-    rng: a PRNGKey used to pick the repeated sentence per row.
-    max_reps: cap on the number of repetitions of the chosen sentence (``<= 0`` = fill the
-      whole completion run). Capping bounds the geometric decay depth ``gamma^n`` so it cannot
-      drive deep-repetition probabilities toward 0 — uncapped + a long run is what previously
-      taught the model to stop immediately (empty output). Recommended ~5.
-
-  Returns:
-    ``(new_inputs, new_targets, baseline_pos, pen_mask)``. ``baseline_pos[b, i] = i -
-    period`` (clamped) and ``pen_mask[b, i]`` marks the 2nd-or-later repetition (the
-    positions the decay loss penalizes). Rows with < 3 completion sentences are left
-    unchanged with an all-zero ``pen_mask`` (a jit-friendly per-row relaxation of the
-    original's whole-batch skip).
-  """
-  b_dim, s_dim = inputs.shape
-  idx = jnp.arange(s_dim, dtype=jnp.int32)[None, :]  # [1, S]
-  if not delim_ids:
-    # No sentence delimiters configured -> DITTO is a no-op (empty pen_mask).
-    zeros = jnp.zeros((b_dim, s_dim), dtype=jnp.int32)
-    return inputs, targets, jnp.broadcast_to(idx, (b_dim, s_dim)).astype(jnp.int32), zeros
-
-  comp_lab = targets_segmentation != 0  # [B, S] label-space completion
-  # inputs[j] is a completion token  <=>  targets_segmentation[j-1] != 0  (shift_right).
-  cmask_in = jnp.concatenate([jnp.zeros((b_dim, 1), dtype=bool), comp_lab[:, :-1]], axis=1)
-
-  delim_arr = jnp.asarray(delim_ids, dtype=inputs.dtype)
-  is_delim = jnp.isin(inputs, delim_arr) & cmask_in  # [B, S]
-  cum = jnp.cumsum(is_delim.astype(jnp.int32), axis=1)  # [B, S]
-  num_delims = cum[:, -1]  # [B]
-  valid = num_delims >= 3  # need >= 3 delimiters to define a prefix + a repeated sentence
-
-  # Pick a 0-indexed delimiter rank r in [1, num_delims - 2] per row.
-  u = jax.random.uniform(rng, (b_dim,))
-  r = (1 + jnp.floor(u * jnp.maximum(num_delims - 2, 1)).astype(jnp.int32)).astype(jnp.int32)
-
-  def pos_of_rank(k):  # position of the k-th (0-indexed) delimiter = first j with cum[j] >= k+1
-    return jnp.argmax(cum >= (k + 1)[:, None], axis=1).astype(jnp.int32)
-
-  s_start = pos_of_rank(r)  # e_r
-  e_next = pos_of_rank(r + 1)  # e_{r+1}
-  period = jnp.maximum(e_next - s_start, 1)  # [B]
-
-  # run_end: first completion-input position after s_start that ends the run, else S.
-  after = (~cmask_in) & (idx > s_start[:, None])  # [B, S]
-  run_end = jnp.where(jnp.any(after, axis=1), jnp.argmax(after, axis=1).astype(jnp.int32), s_dim)  # [B]
-
-  # Cap the repetition depth: fill at most `max_reps` copies of the sentence, then let the
-  # original completion resume. This bounds the geometric decay `gamma^n` (a long uncapped run
-  # drives deep-repetition probabilities to ~0 -> the model learns to stop immediately).
-  fill_end = run_end if max_reps <= 0 else jnp.minimum(run_end, s_start + period * max_reps)  # [B]
-
-  # Overwrite inputs on [s_start, fill_end) with the period-`period` repeat of the unit.
-  in_region = (idx >= s_start[:, None]) & (idx < fill_end[:, None]) & valid[:, None]  # [B, S]
-  src = s_start[:, None] + ((idx - s_start[:, None]) % period[:, None])
-  src = jnp.clip(src, 0, s_dim - 1)
-  repeated = jnp.take_along_axis(inputs, src, axis=1)
-  new_inputs = jnp.where(in_region, repeated, inputs)
-
-  # targets[i] = new_inputs[i+1] (shift_left); only changed where i+1 is in the region.
-  shifted = jnp.concatenate([new_inputs[:, 1:], inputs[:, -1:]], axis=1)
-  tgt_changed = jnp.concatenate([in_region[:, 1:], jnp.zeros((b_dim, 1), dtype=bool)], axis=1)
-  new_targets = jnp.where(tgt_changed, shifted, targets)
-
-  # Penalize label positions in the 2nd-or-later repetition: targets[i] is repeated for
-  # i >= s_start - 1 (i.e. i+1 >= s_start); the baseline at i-period exists in the 1st
-  # repetition for i >= s_start + period - 1; and targets[i] stays in-region for i < fill_end - 1.
-  pen_start = s_start + period - 1
-  pen_mask = (
-      (idx >= pen_start[:, None]) & (idx < (fill_end - 1)[:, None]) & valid[:, None] & comp_lab
-  ).astype(jnp.int32)
-  baseline_pos = jnp.clip(idx - period[:, None], 0, s_dim - 1).astype(jnp.int32)
-  baseline_pos = jnp.broadcast_to(baseline_pos, (b_dim, s_dim))
-  return new_inputs, new_targets, baseline_pos, pen_mask
-
-
-# -----------------------------------------------------------------------------
-# Top-level Functions
-# -----------------------------------------------------------------------------
 
 
 def _num_datasets_plus1(config):
@@ -261,12 +117,11 @@ def _total_correct_from_logits(logits, data):
   return jnp.sum((jnp.argmax(logits, axis=-1) == data["targets"]) & (data["targets_segmentation"] != 0))
 
 
-def _assemble_per_dataset_aux(config, data, xent_sum_by_ds, correct_by_ds, use_ditto, ditto_step):
+def _assemble_per_dataset_aux(config, data, xent_sum_by_ds, correct_by_ds):
   """Per-dataset aux dict (xent_sum / correct / token_count, each [num_datasets+1]) or None.
 
   Only for the train path (batches carry `dataset_id`); eval Option B runs per-dataset passes and
-  has no `dataset_id`, so this returns None there. DITTO steps train on synthetic data, so their
-  per-dataset train metrics are zeroed out.
+  has no `dataset_id`, so this returns None there.
   """
   if not (config.per_dataset_metrics and "dataset_id" in data):
     return None
@@ -278,10 +133,6 @@ def _assemble_per_dataset_aux(config, data, xent_sum_by_ds, correct_by_ds, use_d
   if xent_sum_by_ds is None:  # tiled loss path not yet wired for per-dataset (Phase 2) — emit zeros
     xent_sum_by_ds = jnp.zeros(num_seg, jnp.float32)
     correct_by_ds = jnp.zeros(num_seg, jnp.int32)
-  if use_ditto:
-    xent_sum_by_ds = jnp.where(ditto_step, jnp.zeros(num_seg, jnp.float32), xent_sum_by_ds)
-    correct_by_ds = jnp.where(ditto_step, jnp.zeros(num_seg, jnp.int32), correct_by_ds)
-    token_count_by_ds = jnp.where(ditto_step, jnp.zeros(num_seg, jnp.int32), token_count_by_ds)
   return {
       "xent_sum_by_ds": xent_sum_by_ds,
       "correct_by_ds": correct_by_ds,
@@ -311,41 +162,11 @@ def loss_fn(model, config, data, dropout_rng, params, sparsity_state=None, is_tr
   else:
     for k, v in data.items():
       data[k] = v[: config.micro_batch_size_to_eval_on, :]
-  # Anti-repetition regularizers. Unlikelihood adds `alpha * L_UL` to the NLL on the real
-  # batch. DITTO (paper-faithful) instead alternates: with probability
-  # `ditto_sequence_level_train_rate` the step trains on a synthetic pseudo-repetition
-  # batch with a pure DITTO decay loss; otherwise a normal MLE step.
-  use_unlikelihood = is_train and config.unlikelihood_alpha > 0
-  use_ditto = is_train and config.ditto_alpha > 0
-  ul_sum = 0.0
-  ditto_sum = 0.0
-  ditto_step = jnp.array(False)
   # Per-dataset (per mixture component) accumulators; filled in the loss branch below (train only).
   xent_sum_by_ds = None
   correct_by_ds = None
   # Aggregate correct-token count for this batch; used for eval accuracy (train or eval).
   total_correct = None
-  if use_ditto:
-    # Derive an independent per-step rng (fold_in does not consume the dropout stream).
-    base_rng = dropout_rng if dropout_rng is not None else jax.random.PRNGKey(0)
-    ditto_rng = jax.random.fold_in(base_rng, _DITTO_RNG_TAG)
-    coin_rng, sentence_rng = jax.random.split(ditto_rng)
-    ditto_step = jax.random.uniform(coin_rng, ()) < config.ditto_sequence_level_train_rate
-    pr_inputs, pr_targets, ditto_baseline_pos, ditto_pen_mask = build_pseudo_repetition(
-        data["inputs"],
-        data["targets"],
-        data["targets_segmentation"],
-        tuple(config.ditto_sentence_delim_ids),
-        sentence_rng,
-        max_reps=config.ditto_max_reps,
-    )
-    # On a DITTO step swap in the synthetic sequence; otherwise leave the batch untouched
-    # and zero the penalty mask so the DITTO term vanishes (the loss select below also
-    # discards it, but this avoids any wasted/garbage penalty on MLE steps).
-    data["inputs"] = jnp.where(ditto_step, pr_inputs, data["inputs"])
-    data["targets"] = jnp.where(ditto_step, pr_targets, data["targets"])
-    data["ditto_baseline_pos"] = ditto_baseline_pos
-    data["ditto_pen_mask"] = jnp.where(ditto_step, ditto_pen_mask, jnp.zeros_like(ditto_pen_mask))
   mutable_collections = ["intermediates"]
   if config.mtp_num_layers > 0 and is_train:
     # The single model.apply call now triggers the entire chain if MTP is enabled:
@@ -381,7 +202,7 @@ def loss_fn(model, config, data, dropout_rng, params, sparsity_state=None, is_tr
         encoder_images=data["images"] if config.use_multimodal else None,
         encoder_image_masks=data["image_masks"] if config.use_multimodal and "image_masks" in data else None,
         enable_dropout=config.enable_dropout if is_train else False,
-        rngs={"dropout": rng1, "params": aqt_rng},
+        rngs={"dropout": rng1, "params": aqt_rng},  # pyrefly: ignore[bad-argument-type]
         mutable=mutable_collections,
         decoder_target_tokens=data["targets"],
         decoder_target_mask=data["targets_segmentation"],
@@ -396,7 +217,7 @@ def loss_fn(model, config, data, dropout_rng, params, sparsity_state=None, is_tr
       hidden_state_key = ("intermediates", "decoder", "hidden_states")
       hidden_states = maxtext_utils.get_nested_value(intermediate_outputs, hidden_state_key)[0]
       if config.per_dataset_metrics:
-        xent_sum, total_z_loss, ul_sum, ditto_sum, _pd_xent, _pd_correct = vocab_tiling_linen_loss(
+        xent_sum, total_z_loss, _pd_xent, _pd_correct = vocab_tiling_linen_loss(
             hidden_states, data, config, model, params, is_train
         )
         # No full logits exist on the tiled path, so accuracy comes from the tiled scan. Train
@@ -405,9 +226,7 @@ def loss_fn(model, config, data, dropout_rng, params, sparsity_state=None, is_tr
         if "dataset_id" in data:
           xent_sum_by_ds, correct_by_ds = _pd_xent, _pd_correct
       else:
-        xent_sum, total_z_loss, ul_sum, ditto_sum = vocab_tiling_linen_loss(
-            hidden_states, data, config, model, params, is_train
-        )
+        xent_sum, total_z_loss = vocab_tiling_linen_loss(hidden_states, data, config, model, params, is_train)
     else:
       one_hot_targets = jax.nn.one_hot(data["targets"], config.vocab_size)
       xent, z_loss = max_utils.cross_entropy_with_logits(logits, one_hot_targets, z_loss=config.z_loss_multiplier)
@@ -437,10 +256,6 @@ def loss_fn(model, config, data, dropout_rng, params, sparsity_state=None, is_tr
         total_correct = _total_correct_from_logits(logits, data)
         if "dataset_id" in data:
           xent_sum_by_ds, correct_by_ds = _per_dataset_from_logits(logits, xent, data, config)
-      if use_unlikelihood:
-        ul_sum = _unlikelihood_loss_full(logits, data, config)
-      if use_ditto:
-        ditto_sum = _ditto_loss_full(logits, data, config)
   else:
     # Flax NNX model: forward pass, then pop Intermediates sown during it.
     logits = model(
@@ -453,26 +268,50 @@ def loss_fn(model, config, data, dropout_rng, params, sparsity_state=None, is_tr
         decoder_target_tokens=data["targets"],
         decoder_target_mask=data["targets_segmentation"],
     )
+    # mtp_losses and mtp_acceptance subclass nnx.Intermediate, and nnx type filters match
+    # subclasses. Pop them before the generic Intermediate pop below, which would otherwise
+    # take them too and leave the MTP loss silently reading as 0.
+    mtp_losses_state, mtp_acceptance_state = None, None
+    if config.mtp_num_layers > 0:
+      mtp_losses_state = nnx.pop(model, mtp_losses)
+      mtp_acceptance_state = nnx.pop(model, mtp_acceptance)
+
     intermediates = nnx.pop(model, nnx.Intermediate)
     intermediate_outputs = intermediates.to_pure_dict()
 
-    if config.num_vocab_tiling > 1:
-      hidden_state_key = ("decoder", "hidden_states")
-      hidden_states = maxtext_utils.get_nested_value(intermediate_outputs, hidden_state_key)[0]
-      xent_sum, total_z_loss, ul_sum, ditto_sum = vocab_tiling_nnx_loss(
-          model, hidden_states, data, config, is_train
-      )
-    elif (config.use_indexer and not config.indexer_sparse_training) and is_train:
+    # Store them under the collection name so calculate_mtp_loss and
+    # calculate_mtp_acceptance_rate find them at the same path as the Linen collections.
+    if mtp_losses_state is not None and mtp_acceptance_state is not None:
+      intermediate_outputs["mtp_losses"] = mtp_losses_state.to_pure_dict()
+      intermediate_outputs["mtp_acceptance"] = mtp_acceptance_state.to_pure_dict()
+
+    if (config.use_indexer and not config.indexer_sparse_training) and is_train:
       # In Dense Warm-up stage, we skip main model loss calculation for efficiency.
       # The main model parameters are frozen and only the indexer is trained via KL divergence.
       xent_sum = 0.0
       total_z_loss = 0.0
+    elif config.num_vocab_tiling > 1:
+      hidden_state_key = ("decoder", "hidden_states")
+      hidden_states = maxtext_utils.get_nested_value(intermediate_outputs, hidden_state_key)[0]
+      xent_sum, total_z_loss = vocab_tiling_nnx_loss(model, hidden_states, data, config, is_train)
     else:
       one_hot_targets = jax.nn.one_hot(data["targets"], config.vocab_size)
       xent, z_loss = max_utils.cross_entropy_with_logits(logits, one_hot_targets, z_loss=config.z_loss_multiplier)
 
-      xent = nn.with_logical_constraint(xent, ("activation_embed_and_logits_batch", "activation_length"))
-      z_loss = nn.with_logical_constraint(z_loss, ("activation_embed_and_logits_batch", "activation_length"))
+      xent = sharding.maybe_shard_with_logical(
+          xent,
+          ("activation_embed_and_logits_batch", "activation_length"),
+          model.mesh,
+          config.shard_mode,
+          debug_sharding=config.debug_sharding,
+      )
+      z_loss = sharding.maybe_shard_with_logical(
+          z_loss,
+          ("activation_embed_and_logits_batch", "activation_length"),
+          model.mesh,
+          config.shard_mode,
+          debug_sharding=config.debug_sharding,
+      )
 
       # Mask out paddings at the end of each example.
       xent = xent * (data["targets_segmentation"] != 0)
@@ -484,21 +323,10 @@ def loss_fn(model, config, data, dropout_rng, params, sparsity_state=None, is_tr
         total_correct = _total_correct_from_logits(logits, data)
         if "dataset_id" in data:
           xent_sum_by_ds, correct_by_ds = _per_dataset_from_logits(logits, xent, data, config)
-      if use_unlikelihood:
-        ul_sum = _unlikelihood_loss_full(logits, data, config)
-      if use_ditto:
-        ditto_sum = _ditto_loss_full(logits, data, config)
 
   total_weights = jnp.sum(data["targets_segmentation"] != 0)
-  per_dataset_aux = _assemble_per_dataset_aux(config, data, xent_sum_by_ds, correct_by_ds, use_ditto, ditto_step)
-  # MLE-step loss: NLL plus the optional alpha-weighted unlikelihood term. On a DITTO step
-  # we replace it with the pure DITTO decay loss (paper-faithful alternation): the data is
-  # already the synthetic pseudo-repetition batch, so the NLL there is meaningless and the
-  # `jnp.where` discards it (and its gradient). Each term is a distinct differentiable
-  # output of the vocab-tiling custom_vjp, so the chain rule scales the gradient correctly.
-  combined_sum = xent_sum + config.unlikelihood_alpha * ul_sum
-  if use_ditto:
-    combined_sum = jnp.where(ditto_step, config.ditto_alpha * ditto_sum, combined_sum)
+  per_dataset_aux = _assemble_per_dataset_aux(config, data, xent_sum_by_ds, correct_by_ds)
+  combined_sum = xent_sum
   # If gradient accumulation is enabled, we don't need to divide xent_sum
   # by total_weights and then multiply the computed gradient by total_weights,
   # since it's equivalent to computing the gradient from xent_sum.
@@ -516,10 +344,7 @@ def loss_fn(model, config, data, dropout_rng, params, sparsity_state=None, is_tr
     # updates and scaling internally.
     loss = combined_sum / (total_weights + EPS)
 
-  # We keep z-loss and the (reported) unlikelihood / DITTO losses normalized by total_weights.
   total_z_loss = total_z_loss / (total_weights + EPS)
-  ul_loss = ul_sum / (total_weights + EPS)
-  ditto_loss = ditto_sum / (total_weights + EPS)
 
   # Calculate and Add MTP Loss
   mtp_loss = 0.0
@@ -550,8 +375,25 @@ def loss_fn(model, config, data, dropout_rng, params, sparsity_state=None, is_tr
   # get MoE routed bias term updates
   moe_bias_updates = None
   if config.routed_bias and config.routed_bias_update_rate > 0.0:
-    nested_key = ("intermediates", "decoder", "moe_layers", "moe_bias_updates")
-    moe_bias_updates = maxtext_utils.get_nested_value(intermediate_outputs, nested_key, None)
+    if isinstance(model, nn.Module):
+      nested_key = ("intermediates", "decoder", "moe_layers", "moe_bias_updates")
+      moe_bias_updates = maxtext_utils.get_nested_value(intermediate_outputs, nested_key, None)
+    else:
+      # NNX intermediates are model-rooted (no "intermediates" prefix), so match by
+      # suffix instead. Unlike collect_intermediates_by_suffix we must not ravel:
+      # the update is a 2-D matrix that's transposed at the apply site below.
+      moe_bias_updates = next(
+          (
+              val
+              for path, val in jax.tree_util.tree_leaves_with_path(intermediate_outputs)
+              if tuple(k.key for k in path if hasattr(k, "key"))[-1:] == ("moe_bias_updates",)
+          ),
+          None,
+      )
+      if moe_bias_updates is not None:
+        # The Linen path returns the sow tuple and indexes [0] downstream; tree_leaves
+        # already descended that tuple, so wrap it back so the apply site is uniform.
+        moe_bias_updates = (moe_bias_updates,)
 
   # Add the model's primary output to the intermediates dict so it can be used
   # by the acceptance rate calculation in eval_step.
@@ -561,8 +403,6 @@ def loss_fn(model, config, data, dropout_rng, params, sparsity_state=None, is_tr
       "intermediate_outputs": intermediate_outputs,
       "xent_sum": xent_sum,
       "z_loss": total_z_loss,
-      "ul_loss": ul_loss,
-      "ditto_loss": ditto_loss,
       "total_weights": total_weights,
       "moe_lb_loss": moe_lb_loss,
       "indexer_loss": indexer_loss,
@@ -600,12 +440,6 @@ def train_step(model, config, state_mesh_shardings, params_shardings, state, dat
   else:
     state = nnx.merge(model, state)  # reconstruct TrainStateNNX
     loss_model, loss_params, loss_rng = state.model, None, None
-    # The NNX path is not handed a per-step rng through the jit signature (in_shardings has
-    # no rng slot), so DITTO's coin/sentence selection would be frozen across steps. Derive
-    # a step-varying key from the optimizer step (the same accessor get_first_step uses) so
-    # the DITTO alternation works on NNX as it does on Linen. Only when DITTO is enabled.
-    if config.ditto_alpha > 0:
-      loss_rng = jax.random.fold_in(jax.random.PRNGKey(0), state.optimizer.step.get_value().astype(jnp.uint32))
 
   # --- Gradient computation ---
   if config.gradient_accumulation_steps > 1:
@@ -623,11 +457,11 @@ def train_step(model, config, state_mesh_shardings, params_shardings, state, dat
       if config.shard_optimizer_over_data:
         params = jax.tree.map(
             functools.partial(sharding.maybe_shard_with_name, shard_mode=config.shard_mode),
-            params,
+            params,  # pyrefly: ignore[unbound-name]
             params_shardings,
         )
       sparsity_enabled = config.weight_sparsity_n and config.weight_sparsity_m
-      pure_params = params["params"] if sparsity_enabled else params
+      pure_params = params["params"] if sparsity_enabled else params  # pyrefly: ignore[unbound-name]
       batch_stats = params.get("batch_stats", {})
 
       grad_func = jax.value_and_grad(loss_fn, argnums=4, has_aux=True)
@@ -641,7 +475,17 @@ def train_step(model, config, state_mesh_shardings, params_shardings, state, dat
           is_train=True,
       )
     else:
-      model_graphdef, curr_params, rest = nnx.split(state.model, nnx.Param, ...)
+      owg_type = variablelib.variable_type_from_name("_overwrite_with_gradient", allow_register=True)
+      custom_param_filter = nnx.Any(owg_type)
+      train_param_type = (
+          getattr(nnx, "LoRAParam", nnx.Param)
+          if getattr(getattr(config, "lora", None), "enable_lora", False)
+          else nnx.Param
+      )
+      nnx.pop(state.model, nnx.Intermediate)
+      model_graphdef, curr_params, custom_params, rest = nnx.split(
+          state.model, train_param_type, custom_param_filter, ...
+      )
       if config.parameter_memory_host_offload:
         # Params are kept on host (pinned_host) in in_shardings. Move only Param
         # variables to device before the forward/backward pass so that all dot_general
@@ -656,23 +500,33 @@ def train_step(model, config, state_mesh_shardings, params_shardings, state, dat
         curr_params = jax.device_put(curr_params, device_param_shardings)
         nnx.update(state.model, curr_params)  # ensure state.model has device params for optimizer update
       if config.shard_optimizer_over_data:
-        curr_params = jax.tree.map(
-            functools.partial(sharding.maybe_shard_with_name, shard_mode=config.shard_mode),
+        param_sharding_lookup = {}
+        for p, s in jax.tree_util.tree_leaves_with_path(
+            params_shardings, is_leaf=lambda x: isinstance(x, (nnx.Variable, NamedSharding, jax.sharding.Sharding))
+        ):
+          param_sharding_lookup[p] = s.get_value() if isinstance(s, nnx.Variable) else s
+
+        def _maybe_shard_param(path, var):
+          if path in param_sharding_lookup:
+            return sharding.maybe_shard_with_name(var, param_sharding_lookup[path], shard_mode=config.shard_mode)
+          return var
+
+        curr_params = jax.tree_util.tree_map_with_path(
+            _maybe_shard_param,
             curr_params,
-            params_shardings,
+            is_leaf=lambda x: isinstance(x, nnx.Variable),
         )
         nnx.update(state.model, curr_params)
 
-      def diff_wrapper(param, rest, config, data):
-        local_model = nnx.merge(model_graphdef, param, rest, copy=True)
-        # Pass the step-derived rng (loss_rng) so DITTO's per-step coin varies on NNX too.
-        loss, aux = loss_fn(local_model, config, data, loss_rng, None, is_train=True)
-        _, _, new_rest = nnx.split(local_model, nnx.Param, ...)
-        return loss, (aux, new_rest)
+      def diff_wrapper(curr_params, custom_params, rest, config, data):
+        local_model = nnx.merge(model_graphdef, curr_params, custom_params, rest, copy=True)
+        loss, aux = loss_fn(local_model, config, data, None, None, is_train=True)
+        non_param_rest = nnx.state(local_model, nnx.Not(nnx.Any(nnx.Param, nnx.Intermediate)))
+        return loss, (aux, non_param_rest)
 
-      grad_func = jax.value_and_grad(diff_wrapper, argnums=0, has_aux=True)
-      (loss, (aux, new_rest)), raw_grads = grad_func(curr_params, rest, config, data)
-      nnx.update(state.model, new_rest)
+      grad_func = jax.value_and_grad(diff_wrapper, argnums=(0, 1), has_aux=True)
+      (loss, (aux, non_param_rest)), (raw_grads, custom_grads) = grad_func(curr_params, custom_params, rest, config, data)
+      nnx.update(state.model, nnx.State.merge(custom_grads, non_param_rest))
 
   raw_grads = jax.tree_util.tree_map(
       lambda x: x.astype(config.grad_dtype) if x.dtype == jnp.float32 else x,
@@ -691,12 +545,11 @@ def train_step(model, config, state_mesh_shardings, params_shardings, state, dat
   moe_lb_loss = aux["moe_lb_loss"]
   indexer_loss = aux.get("indexer_loss", 0.0)
   z_loss = aux.get("z_loss", 0.0)
-  ul_loss = aux.get("ul_loss", 0.0)
-  ditto_loss = aux.get("ditto_loss", 0.0)
   moe_bias_updates = aux.get("moe_bias_updates")
   mtp_loss = aux.get("mtp_loss", 0.0)
   per_dataset = aux.get("per_dataset")
   new_opt_state = None
+  bias_metrics = {}
 
   if isinstance(model, nn.Module):
     if config.gradient_clipping_threshold > 0:
@@ -775,13 +628,49 @@ def train_step(model, config, state_mesh_shardings, params_shardings, state, dat
       opt_state = nnx.state(state.optimizer)
       new_opt_state = jax.device_put(opt_state, device_opt_shardings)
       nnx.update(state.optimizer, new_opt_state)
-    state.apply_gradients(grads)
+    if config.skip_step_on_spikes:
+      # The skip-step optimizer is a GradientTransformationExtraArgs that reads
+      # loss/grad_norm to decide whether to zero the update on a spike. nnx
+      # Optimizer.update forwards these kwargs to tx.update.
+      grad_norm = max_utils.l2norm_pytree(grads)
+      state.apply_gradients(grads, loss=loss, grad_norm=grad_norm)
+    else:
+      state.apply_gradients(grads)
     new_state = state
 
     # Apply updates for Auxiliary-Loss-Free load balancing for DeepSeek family
-    if config.routed_bias and config.routed_bias_update_rate > 0.0 and moe_bias_updates is not None:
-      target_bias = new_state.model.decoder.moe_layers.DeepSeekMoeBlock_0.MoeBlock_0.gate.bias
-      target_bias.value = target_bias.value + jnp.array(moe_bias_updates[0]).transpose()
+    # pylint: disable=too-many-nested-blocks
+    if config.routed_bias and config.routed_bias_update_rate > 0.0:
+      if config.model_name.startswith("deepseek4"):
+        max_logging.log("DeepSeek V4: Applying auxiliary-loss-free routing bias via pure NNX MoEBiasVar.")
+        flat_intermediates = traverse_util.flatten_dict(aux.get("intermediate_outputs", {}))
+        for path, update in flat_intermediates.items():
+          if path[-1] != "moe_bias_updates":
+            continue
+          target = new_state.model
+          prefix = path[1:-1] if path[0] == "intermediates" else path[:-1]
+          for key in prefix:
+            if hasattr(target, key):
+              target = getattr(target, key)
+            elif isinstance(target, dict) and key in target:
+              target = target[key]
+            else:
+              target = None
+              break
+          if target is None:
+            continue
+          for _, node in nnx.iter_graph(target):
+            if type(node).__name__ == "GateLogit" and hasattr(node, "bias") and node.bias is not None:
+              update_val = update[0] if isinstance(update, (tuple, list)) else update
+              name_prefix = "-".join(map(str, prefix))
+              if getattr(config, "log_moe_bias_norms", False):
+                bias_metrics[f"learning/moe_bias_before_norm_{name_prefix}"] = jnp.linalg.norm(node.bias.value)
+              node.bias.value = node.bias.value + jnp.array(update_val)
+              if getattr(config, "log_moe_bias_norms", False):
+                bias_metrics[f"learning/moe_bias_update_norm_{name_prefix}"] = jnp.linalg.norm(jnp.array(update_val))
+      elif moe_bias_updates is not None:
+        target_bias = new_state.model.decoder.moe_layers.DeepSeekMoeBlock_0.MoeBlock_0.gate.bias
+        target_bias.value = target_bias.value + jnp.array(moe_bias_updates[0]).transpose()
 
   lm_loss = xent_sum / (total_weights + EPS)
   scalar_metrics = {
@@ -789,13 +678,12 @@ def train_step(model, config, state_mesh_shardings, params_shardings, state, dat
       "learning/lm_loss": lm_loss,
       "learning/perplexity": jnp.exp(lm_loss),
       "learning/z_loss": z_loss,
-      "learning/ul_loss": ul_loss,
-      "learning/ditto_loss": ditto_loss,
       "learning/moe_lb_loss": moe_lb_loss,
       "learning/indexer_loss": indexer_loss,
       "learning/mtp_loss": mtp_loss,
       "learning/total_weights": total_weights,
   }
+  scalar_metrics.update(bias_metrics)
   if config.use_qk_clip:
     if isinstance(model, nn.Module):
       new_state = qk_clip_utils.apply_qk_clip(new_state, intermediate_outputs, config)
@@ -815,10 +703,15 @@ def train_step(model, config, state_mesh_shardings, params_shardings, state, dat
       model_params = nnx.state(new_state.model, nnx.Param)
       scalar_metrics["learning/param_norm"] = max_utils.l2norm_pytree(model_params)
 
-  # Surface skip-step rejections as a TB metric. Linen path only — the NNX
-  # branch doesn't apply skip-step, so new_opt_state stays None.
+  # Surface skip-step rejections as a TB metric. The skip-step optimizer stores
+  # is_skipped in its opt_state: the Linen path gets it from the tx.update return,
+  # the NNX path reads it back off the optimizer it just updated in place.
   if config.skip_step_on_spikes:
-    is_skipped = new_opt_state.get("is_skipped") if isinstance(new_opt_state, dict) else None
+    if isinstance(model, nn.Module):
+      is_skipped = new_opt_state.get("is_skipped") if isinstance(new_opt_state, dict) else None
+    else:
+      opt_state = nnx.to_pure_dict(nnx.state(new_state.optimizer)).get("opt_state", {})
+      is_skipped = opt_state.get("is_skipped") if isinstance(opt_state, dict) else None
     if is_skipped is not None:
       scalar_metrics["optim/step_skipped"] = is_skipped.astype(jnp.float32)
   metrics = {
@@ -827,13 +720,14 @@ def train_step(model, config, state_mesh_shardings, params_shardings, state, dat
   }
   if per_dataset is not None:
     metrics["per_dataset"] = per_dataset
-  if config.record_internal_nn_metrics:
+  if getattr(config, "record_internal_nn_metrics", False):
     record_activation_metrics(metrics, intermediate_outputs, config)
 
   if isinstance(model, nn.Module):
     return new_state, metrics
-  # Drop Intermediates (e.g. sowed max_logits for QK-Clip) before returning;
-  # they're absent from state_mesh_shardings and would cause a leaf-count mismatch.
+  # Drop Intermediates (e.g. sowed max_logits for QK-Clip) and the MTP sown
+  # vars (mtp_losses/mtp_acceptance) before returning. They're absent from
+  # state_mesh_shardings and would cause a leaf-count / structure mismatch.
   return nnx.state(new_state, nnx.Not(nnx.Intermediate)), metrics
 
 
@@ -882,6 +776,163 @@ def eval_step(model, config, state, data, dropout_rng=None):
   return metrics
 
 
+def training_loop_iteration(
+    jax_device_state: dict[str, Any],
+    python_vars: dict[str, Any],
+    immutable_data: dict[str, Any],
+):
+  """Executes a single iteration of the training loop."""
+  # Unpack jax_device_state
+  state = jax_device_state["state"]
+  init_rng = jax_device_state["init_rng"]
+  mesh = jax_device_state["mesh"]
+  state_mesh_shardings = jax_device_state["state_mesh_shardings"]
+  p_train_step = jax_device_state["p_train_step"]
+  p_eval_step = jax_device_state["p_eval_step"]
+  model = jax_device_state["model"]
+
+  # Unpack python_vars
+  step = python_vars["step"]
+  last_step_completion = python_vars["last_step_completion"]
+  data_loader = python_vars["data_loader"]
+  rampup_manager = python_vars["rampup_manager"]
+  recorder = python_vars["recorder"]
+  checkpoint_manager = python_vars["checkpoint_manager"]
+  data_iterator = python_vars["data_iterator"]
+  eval_data_iterator = python_vars["eval_data_iterator"]
+  metric_logger_instance = python_vars["metric_logger_instance"]
+  prof = python_vars["prof"]
+
+  # Unpack immutable_data
+  config = immutable_data["config"]  # for helpers
+  logical_axis_rules_for_train = immutable_data["logical_axis_rules_for_train"]
+  logical_axis_rules_for_eval = immutable_data["logical_axis_rules_for_eval"]
+  shard_optimizer_over_data = immutable_data["shard_optimizer_over_data"]
+  shard_mode = immutable_data["shard_mode"]
+  eval_interval = immutable_data["eval_interval"]
+  eval_steps = immutable_data["eval_steps"]
+  start_step = immutable_data["start_step"]
+  eval_start_step = immutable_data["eval_start_step"]
+
+  # HLO dump config
+  dump_hlo = immutable_data["dump_hlo"]
+  dump_step = immutable_data["dump_step"]
+  dump_hlo_local_dir = immutable_data["dump_hlo_local_dir"]
+  dump_hlo_gcs_dir = immutable_data["dump_hlo_gcs_dir"]
+  dump_hlo_module_name = immutable_data["dump_hlo_module_name"]
+  dump_hlo_delete_local_after = immutable_data["dump_hlo_delete_local_after"]
+  dump_hlo_upload_all = immutable_data["dump_hlo_upload_all"]
+
+  prof.maybe_activate_profiler(step, state)
+  if config.elastic_enabled:
+    elastic_utils.maybe_elastic_scale_up(config, checkpoint_manager)
+
+  with jax.profiler.StepTraceAnnotation("train", step_num=step):
+    example_batch = data_loader.load_next_batch(rampup_manager=rampup_manager)
+    # DiLoCo's inner step takes the rng like the Linen step does.
+    if isinstance(model, nn.Module) or config.enable_diloco:
+      # pylint: disable=not-callable
+      step_rng_args = (jax.jit(jax.random.fold_in)(init_rng, step),)
+    else:
+      step_rng_args = ()
+    with maybe_record_goodput(recorder, GoodputEvent.STEP, step):
+      with jax.set_mesh(mesh), nn_partitioning.axis_rules(logical_axis_rules_for_train):
+        if shard_optimizer_over_data and isinstance(model, nn.Module):
+          state = sharding.maybe_shard_with_name(state, state_mesh_shardings, shard_mode)
+        state, metrics = p_train_step(state, example_batch, *step_rng_args)
+
+  step_time_delta = datetime.datetime.now() - last_step_completion
+  last_step_completion = datetime.datetime.now()
+
+  checkpointing.maybe_save_checkpoint(checkpoint_manager, state, config, data_iterator, step)
+
+  if dump_hlo and step == (dump_step if dump_step >= 0 else start_step):
+    jax.block_until_ready(state)  # Ensure compilation has finished.
+    gcs_utils.upload_dump(
+        dump_hlo_local_dir,
+        dump_hlo_gcs_dir,
+        module_name=dump_hlo_module_name,
+        delete_local_after=dump_hlo_delete_local_after,
+        all_host_upload=dump_hlo_upload_all,
+    )
+
+  if (
+      eval_interval > 0
+      and step >= start_step
+      and step >= eval_start_step
+      and (step - eval_start_step) % eval_interval == 0
+  ):
+    assert eval_data_iterator
+    if isinstance(eval_data_iterator, dict):
+      # per_dataset_metrics Option B: one full eval pass per dataset; each pass's aggregate is that
+      # dataset's metric. Every host MUST issue exactly the same number of p_eval_step collectives
+      # per dataset, else the SPMD launch groups diverge -> E0200 core-halt. We therefore run a
+      # FIXED `eval_steps` launches: the per-dataset iterators are built with force_padding_batch=True
+      # (input_pipeline_interface.py), so next() never raises StopIteration and no host exits early.
+      # All-zero padding batches have targets_segmentation==0 -> contribute 0 to loss/weights/correct,
+      # so the metric is identical to a real-only pass (see docs/012).
+      assert eval_steps > 0, (
+          "per_dataset_metrics Option B requires eval_steps > 0: the per-dataset iterators pad "
+          "indefinitely (force_padding_batch), so eval_steps is what bounds each dataset pass."
+      )
+      _eval_sharding = sharding.get_input_data_sharding(config, mesh, rules=config.logical_axis_rules_for_eval)
+      per_dataset_eval = {}
+      for ds_name, ds_iter in eval_data_iterator.items():
+        ds_iter.reset()
+        xent_sum_acc, tokens_acc, correct_acc = 0.0, 0.0, 0.0
+        has_correct = True  # accuracy is optional; loss/perplexity always work
+        # pylint: disable=not-callable
+        for _ in range(eval_steps):
+          eval_batch = jax.device_put(next(ds_iter), _eval_sharding)
+          with jax.set_mesh(mesh), nn_partitioning.axis_rules(logical_axis_rules_for_eval):
+            em = p_eval_step(state, eval_batch, *step_rng_args)["scalar"]
+          xent_sum_acc += float(em["evaluation/total_loss"])
+          tokens_acc += float(em["evaluation/total_weights"])
+          if "evaluation/total_correct" in em:
+            correct_acc += float(em["evaluation/total_correct"])
+          else:
+            has_correct = False
+        per_dataset_eval[ds_name] = (xent_sum_acc, tokens_acc, correct_acc if has_correct else None)
+        max_logging.log(f"  eval[{ds_name}]: {eval_steps} steps, {int(tokens_acc)} loss-tokens")
+      metric_logger_instance.write_per_dataset_eval(per_dataset_eval, step)
+
+    else:
+      # Explicitly reset the eval iterator and counters before starting the eval loop
+      eval_data_iterator.reset()
+      metric_logger_instance.reset_eval_metrics()
+      max_logging.log(f"Starting eval after train step {step}")
+
+      eval_step_count = 0
+      last_eval_step_completion = datetime.datetime.now()
+      # pylint: disable=not-callable
+      for eval_batch in eval_data_iterator:
+        # Shard input eval data
+        eval_batch = jax.device_put(
+            eval_batch, sharding.get_input_data_sharding(config, mesh, rules=config.logical_axis_rules_for_eval)
+        )
+        if 0 < eval_steps <= eval_step_count:
+          break
+        with jax.set_mesh(mesh), nn_partitioning.axis_rules(logical_axis_rules_for_eval):
+          eval_metrics = p_eval_step(state, eval_batch, *step_rng_args)
+        eval_step_time_delta = datetime.datetime.now() - last_eval_step_completion
+        last_eval_step_completion = datetime.datetime.now()
+        metric_logger_instance.buffer_and_write_metrics(
+            eval_metrics, eval_step_count, step_time_delta=eval_step_time_delta, is_training=False
+        )
+        eval_step_count += 1
+
+  prof.maybe_deactivate_profiler(step, state)
+
+  if step == start_step:
+    max_utils.print_mem_stats("After params initialized")
+
+  metric_logger_instance.buffer_and_write_metrics(metrics, step, step_time_delta)
+
+  # Pack mutated state back to dicts
+  jax_device_state["state"] = state
+  python_vars["last_step_completion"] = last_step_completion
+
+
 def train_loop(config, recorder, state=None):
   """Main Training loop."""
   (
@@ -898,15 +949,27 @@ def train_loop(config, recorder, state=None):
       state,
   ) = train_utils.setup_train_loop(config, recorder)
 
+  # Throttling is applied only if configured (dcn_bandwidth_limit is set).
+  # The default flag value is empty, meaning no throttling is applied by default.
+  train_utils.maybe_apply_dcn_throttling(config)
+
   start_step = get_first_step(model, state)  # this is the start_step for training
   train_utils.validate_completed_steps(start_step, config.steps)
 
   if isinstance(model, nn.Module):
     jit_model = model
+  elif config.enable_diloco:
+    # state is the DiLoCoTrainState; `model` is already the TrainStateNNX graphdef the inner step needs.
+    jit_model = model
   else:
     jit_model, state = nnx.split(state)
 
-  params_shardings, state_mesh_shardings = sharding.maybe_update_params_sharding_with_opt(config, state_mesh_shardings)
+  if config.pure_nnx and config.enable_diloco:
+    # DiLoCoTrainState.params already holds the param shardings the inner step needs;
+    # the Zero-1 opt overlay doesn't apply through the diloco wrapper.
+    params_shardings = state_mesh_shardings.params
+  else:
+    params_shardings, state_mesh_shardings = sharding.maybe_update_params_sharding_with_opt(config, state_mesh_shardings)
 
   p_train_step, p_eval_step = train_utils.jit_train_and_eval_step(
       config,
@@ -921,13 +984,15 @@ def train_loop(config, recorder, state=None):
   )
 
   with jax.set_mesh(mesh), mesh, nn_partitioning.axis_rules(config.logical_axis_rules):
-    shaped_batch = maxtext_utils.get_shaped_batch(config)
+    data_sharding = sharding.get_input_data_sharding(config, mesh)
+    shaped_batch = maxtext_utils.get_shaped_batch(config, batch_sharding=data_sharding)
     if config.shard_optimizer_over_data and isinstance(model, nn.Module):
       state = sharding.maybe_shard_with_name(state, state_mesh_shardings, config.shard_mode)
     elif config.shard_optimizer_over_data:
       # NNX: reshard state so params match the data-sharded in_shardings (Zero-1 layout)
       state = jax.device_put(state, state_mesh_shardings)
-    if isinstance(model, nn.Module):
+    if isinstance(model, nn.Module) or config.enable_diloco:
+      # The DiLoCo train step takes (state, batch, rng), like the Linen step.
       lower_args = (state, shaped_batch, init_rng)
     else:
       lower_args = (state, shaped_batch)
@@ -943,117 +1008,77 @@ def train_loop(config, recorder, state=None):
   # Write train config params, num model params, and XLA flags to tensorboard
   if isinstance(model, nn.Module):
     setup_params = state.params
+  elif config.enable_diloco:
+    setup_params = state.params  # DiLoCoTrainState.params: the outer (global) params
   else:
     _, setup_params, _ = nnx.split(state.model, nnx.Param, ...)
   metric_logger_instance.write_setup_info_to_tensorboard(setup_params)
 
   elastic_utils.record_elastic_reinit_end()
 
+  # Initialize dictionaries for refactored iteration
+  jax_device_state = {
+      "state": state,
+      "init_rng": init_rng,
+      "mesh": mesh,
+      "state_mesh_shardings": state_mesh_shardings,
+      "p_train_step": p_train_step,
+      "p_eval_step": p_eval_step,
+      "model": model,
+  }
+
+  python_vars = {
+      "step": start_step,
+      "last_step_completion": datetime.datetime.now(),
+      "data_loader": data_loader,
+      "rampup_manager": rampup_manager,
+      "recorder": recorder,
+      "checkpoint_manager": checkpoint_manager,
+      "data_iterator": data_iterator,
+      "eval_data_iterator": eval_data_iterator,
+      "metric_logger_instance": metric_logger_instance,
+      "prof": prof,
+  }
+
+  immutable_data = {
+      "config": config,
+      "logical_axis_rules_for_train": config.logical_axis_rules,
+      "logical_axis_rules_for_eval": config.logical_axis_rules_for_eval,
+      "shard_optimizer_over_data": config.shard_optimizer_over_data,
+      "shard_mode": config.shard_mode,
+      "steps": config.steps,
+      "eval_interval": config.eval_interval,
+      "eval_steps": config.eval_steps,
+      "eval_start_step": config.eval_start_step,
+      "save_checkpoint_on_completion": config.save_checkpoint_on_completion,
+      "start_step": start_step,
+      "dump_hlo": config.dump_hlo,
+      "dump_step": config.dump_step,
+      "dump_hlo_local_dir": config.dump_hlo_local_dir,
+      "dump_hlo_gcs_dir": config.dump_hlo_gcs_dir,
+      "dump_hlo_module_name": config.dump_hlo_module_name,
+      "dump_hlo_delete_local_after": config.dump_hlo_delete_local_after,
+      "dump_hlo_upload_all": config.dump_hlo_upload_all,
+  }
+
   _job_completed_gracefully = False
   try:
-    last_step_completion = datetime.datetime.now()
-    for step in np.arange(start_step, config.steps):
-      prof.maybe_activate_profiler(step, state)
+    python_vars["last_step_completion"] = datetime.datetime.now()
 
-      with jax.profiler.StepTraceAnnotation("train", step_num=step):
-        example_batch = data_loader.load_next_batch(rampup_manager=rampup_manager)
-        if isinstance(model, nn.Module):
-          # pylint: disable=not-callable
-          step_rng_args = (jax.jit(jax.random.fold_in)(init_rng, step),)
-        else:
-          step_rng_args = ()
-        with maybe_record_goodput(recorder, GoodputEvent.STEP, step):
-          with jax.set_mesh(mesh), nn_partitioning.axis_rules(config.logical_axis_rules):
-            if config.shard_optimizer_over_data and isinstance(model, nn.Module):
-              state = sharding.maybe_shard_with_name(state, state_mesh_shardings, config.shard_mode)
-            state, metrics = p_train_step(state, example_batch, *step_rng_args)
+    # Using while loop to allow for potential dynamic 'steps' adjustment in future
+    while python_vars["step"] < immutable_data["steps"]:
+      training_loop_iteration(jax_device_state, python_vars, immutable_data)
+      python_vars["step"] += 1
 
-        step_time_delta = datetime.datetime.now() - last_step_completion
+    # Unpack state for post-loop actions
+    state = jax_device_state["state"]
 
-        checkpointing.maybe_save_checkpoint(checkpoint_manager, state, config, data_iterator, step)
-
-        if config.dump_hlo and step == (config.dump_step if config.dump_step >= 0 else start_step):
-          jax.block_until_ready(state)  # Ensure compilation has finished.
-          gcs_utils.upload_dump(
-              config.dump_hlo_local_dir,
-              config.dump_hlo_gcs_dir,
-              module_name=config.dump_hlo_module_name,
-              delete_local_after=config.dump_hlo_delete_local_after,
-              all_host_upload=config.dump_hlo_upload_all,
-          )
-
-        eval_step_count = None
-        if config.eval_interval > 0 and step > start_step and (step + 1) % config.eval_interval == 0:
-          assert eval_data_iterator
-          max_logging.log(f"Starting eval after train step {step}")
-          _eval_sharding = sharding.get_input_data_sharding(config, mesh)
-          if isinstance(eval_data_iterator, dict):
-            # Option B: one full eval pass per dataset; each pass's aggregate is that dataset's metric.
-            # Every host MUST run exactly the same number of p_eval_step (jit_eval_step) collectives per
-            # dataset, else the SPMD launch groups diverge -> E0200 core-halt. We therefore run a FIXED
-            # config.eval_steps launches: the per-dataset iterators are built with force_padding_batch=True
-            # (input_pipeline_interface.py), so next() never raises StopIteration and no host can exit early.
-            # All-zero padding batches have targets_segmentation==0 -> contribute 0 to loss/weights/correct,
-            # so the metric is identical to a real-only pass (see docs/012).
-            assert config.eval_steps > 0, (
-                "per_dataset_metrics Option B requires eval_steps > 0: the per-dataset iterators pad "
-                "indefinitely (force_padding_batch), so eval_steps is what bounds each dataset pass."
-            )
-            per_dataset_eval = {}
-            for ds_name, ds_iter in eval_data_iterator.items():
-              ds_iter.reset()
-              xent_sum_acc, tokens_acc, correct_acc = 0.0, 0.0, 0.0
-              has_correct = True  # accuracy is optional; loss/perplexity always work
-              # pylint: disable=not-callable
-              for _ in range(config.eval_steps):
-                eval_batch = next(ds_iter)
-                eval_batch = jax.device_put(eval_batch, _eval_sharding)
-                with jax.set_mesh(mesh), nn_partitioning.axis_rules(config.logical_axis_rules):
-                  em = p_eval_step(state, eval_batch, *step_rng_args)["scalar"]
-                xent_sum_acc += float(em["evaluation/total_loss"])
-                tokens_acc += float(em["evaluation/total_weights"])
-                if "evaluation/total_correct" in em:
-                  correct_acc += float(em["evaluation/total_correct"])
-                else:
-                  has_correct = False
-              per_dataset_eval[ds_name] = (xent_sum_acc, tokens_acc, correct_acc if has_correct else None)
-              max_logging.log(f"  eval[{ds_name}]: {config.eval_steps} steps, {int(tokens_acc)} loss-tokens")
-            metric_logger_instance.write_per_dataset_eval(per_dataset_eval, step)
-            eval_step_count = 0
-          else:
-            # Explicitly reset the eval iterator and counters before starting the eval loop
-            eval_data_iterator.reset()
-            metric_logger_instance.reset_eval_metrics()
-            eval_step_count = 0
-            last_eval_step_completion = datetime.datetime.now()
-            # pylint: disable=not-callable
-            for eval_batch in eval_data_iterator:
-              # Shard input eval data
-              eval_batch = jax.device_put(eval_batch, _eval_sharding)
-              if config.eval_steps > 0 and eval_step_count >= config.eval_steps:
-                break
-              with jax.set_mesh(mesh), nn_partitioning.axis_rules(config.logical_axis_rules):
-                eval_metrics = p_eval_step(state, eval_batch, *step_rng_args)
-              eval_step_time_delta = datetime.datetime.now() - last_eval_step_completion
-              last_eval_step_completion = datetime.datetime.now()
-              metric_logger_instance.buffer_and_write_metrics(
-                  eval_metrics, eval_step_count, step_time_delta=eval_step_time_delta, is_training=False
-              )
-              eval_step_count += 1
-
-        prof.maybe_deactivate_profiler(step, state)
-
-        if step == start_step:
-          max_utils.print_mem_stats("After params initialized")
-
-        last_step_completion = datetime.datetime.now()
-        metric_logger_instance.buffer_and_write_metrics(metrics, step, step_time_delta)
-
-    if config.save_checkpoint_on_completion:
+    if immutable_data["save_checkpoint_on_completion"]:
       checkpointing.maybe_save_checkpoint(checkpoint_manager, state, config, data_iterator)
+
     if checkpoint_manager is not None:
       # in case the last checkpoint_period checkpoint is still in progress
-      checkpoint_manager.wait_until_finished()
+      checkpointing.wait_until_finished(checkpoint_manager)
     _job_completed_gracefully = True
   except exceptions.StopTraining as e:
     prof.deactivate()
@@ -1063,6 +1088,7 @@ def train_loop(config, recorder, state=None):
     if _job_completed_gracefully:
       record_goodput(recorder, RECORD_JOB_END_TIME)
     metric_logger_instance.flush_metrics_and_cleanup()
+    train_utils.maybe_cleanup_dcn_throttling(config)
 
   return state
 
@@ -1071,9 +1097,10 @@ def initialize(argv: Sequence[str]) -> tuple[pyconfig.HyperParameters, Any]:
   """Initialization of hyperparameters and utilities"""
   pathwaysutils.initialize()
   jax.config.update("jax_default_prng_impl", "unsafe_rbg")
-  # TF allocates extraneous GPU memory when using TFDS data
-  # this leads to CUDA OOMs. WAR for now is to hide GPUs from TF
-  tf.config.set_visible_devices([], "GPU")
+  if _TF_AVAILABLE:
+    # TF allocates extraneous GPU memory when using TFDS data
+    # this leads to CUDA OOMs. WAR for now is to hide GPUs from TF
+    tf.config.set_visible_devices([], "GPU")
   if "xla_tpu_spmd_rng_bit_generator_unsafe" not in os.environ.get("LIBTPU_INIT_ARGS", ""):
     os.environ["LIBTPU_INIT_ARGS"] = (
         os.environ.get("LIBTPU_INIT_ARGS", "") + " --xla_tpu_spmd_rng_bit_generator_unsafe=true"
@@ -1089,6 +1116,9 @@ def initialize(argv: Sequence[str]) -> tuple[pyconfig.HyperParameters, Any]:
   vertex_tensorboard_manager = VertexTensorboardManager()
   if config.use_vertex_tensorboard or os.environ.get("UPLOAD_DATA_TO_TENSORBOARD"):
     vertex_tensorboard_manager.configure_vertex_tensorboard(config)
+
+  if config.use_te_comm_gemm_overlap:
+    max_utils.bootstrap_transformer_engine_cgemm(config)
 
   # Create the Goodput recorder
   recorder = create_goodput_recorder(config)

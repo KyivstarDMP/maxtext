@@ -33,6 +33,7 @@ from maxtext.utils import max_utils
 _config_lib, engine_api, _token_utils, _tokenizer_api, _token_params_ns = jetstream()
 # Placeholder: internal
 
+
 # Number of text sequences to process in a single batch.
 _NUM_STREAMS = 1
 
@@ -139,7 +140,7 @@ def main(argv: Sequence[str]) -> None:
 
   if config.use_multimodal:
     tokens = mm_processor.prepare_text_for_image_fusion(tokens=tokens, config=config, processor_output=processor_outputs)
-    true_length += image_offsets
+    true_length += image_offsets  # pyrefly: ignore[unbound-name]
 
     if config.use_mrope:
       from maxtext.multimodal import processor_qwen3_omni  # pylint: disable=import-outside-toplevel
@@ -181,13 +182,17 @@ def main(argv: Sequence[str]) -> None:
       prefill_result, first_token = engine.prefill(
           params=params,
           padded_tokens=tokens,
-          positions=position_ids,
-          mrope_deltas=mrope_position_deltas,
-          images=processor_outputs.pixel_values if config.use_multimodal else None,
-          image_masks=processor_outputs.pixel_mask if config.use_multimodal and "llama4" in config.model_name else None,
+          positions=position_ids,  # pyrefly: ignore[bad-argument-type]
+          mrope_deltas=mrope_position_deltas,  # pyrefly: ignore[bad-argument-type]
+          images=processor_outputs.pixel_values if config.use_multimodal else None,  # pyrefly: ignore[bad-argument-type]
+          image_masks=processor_outputs.pixel_mask  # pyrefly: ignore[bad-argument-type]
+          if config.use_multimodal and "llama4" in config.model_name
+          else None,  # pyrefly: ignore[bad-argument-type]
           videos=getattr(processor_outputs, "video_values", None) if config.use_multimodal else None,
-          audio_values=processor_outputs.audio_values if config.use_audio else None,
-          audio_masks=processor_outputs.audio_mask if config.use_audio else None,
+          video_masks=getattr(processor_outputs, "video_mask", None) if config.use_multimodal else None,
+          video_grid_thw=getattr(processor_outputs, "video_grid_thw", None) if config.use_multimodal else None,
+          audio_values=processor_outputs.audio_values if config.use_audio else None,  # pyrefly: ignore[bad-argument-type]
+          audio_masks=processor_outputs.audio_mask if config.use_audio else None,  # pyrefly: ignore[bad-argument-type]
           true_length=true_length,
           rng=rng_prefill,
           slot=i,

@@ -187,7 +187,7 @@ def forward_with_context_expert_parallelism(
   """Get logits from attention under context/expert parallelism."""
   # If load balanced cp, shuffle along seq dim for input
   # This corresponds to the pre-shuffle step in training
-  context_parallel_size = cfg_cp.context_parallel_size
+  context_parallel_size = mesh_cp.shape.get(cfg_cp.context_sharding, 1)
   # This helper is TPU-oriented and uses the TPU-compatible DUAL_CHUNK_SWAP reorder path.
   # It does not model GPU-specific packed/striped reorder behavior.
   if context_parallel_size > 1 and cfg_cp.context_parallel_load_balance:
@@ -215,8 +215,8 @@ def forward_with_context_expert_parallelism(
         nn_partitioning.get_axis_rules(),
     )
     pos_spec = nn_partitioning.logical_to_mesh_axes((None, length_axis), nn_partitioning.get_axis_rules())
-    lnx_sharding = NamedSharding(mesh_cp, lnx_spec)
-    pos_sharding = NamedSharding(mesh_cp, pos_spec)
+    lnx_sharding = NamedSharding(mesh_cp, lnx_spec)  # pyrefly: ignore[bad-argument-type]
+    pos_sharding = NamedSharding(mesh_cp, pos_spec)  # pyrefly: ignore[bad-argument-type]
 
     lnx = jax.device_put(lnx, lnx_sharding)
     decoder_segment_ids = jax.device_put(decoder_segment_ids, pos_sharding)

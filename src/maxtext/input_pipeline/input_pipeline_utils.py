@@ -173,7 +173,12 @@ def is_conversational(features, data_columns):
   for column in data_columns:
     messages = features[column]
     if isinstance(messages, datasets.Sequence):
-      if isinstance(messages.feature, dict) and "role" in messages.feature and "content" in messages.feature:
+      if (
+          # pyrefly: ignore[missing-attribute]
+          isinstance(messages.feature, dict)
+          and "role" in messages.feature
+          and "content" in messages.feature  # pyrefly: ignore[missing-attribute]
+      ):
         return True
 
   return False
@@ -695,6 +700,88 @@ def make_tfrecord_iter_dataset(path: str):
   return TFRecordIterDataset(path)
 
 
+def make_parquet_iter_dataset(path: str, hf_access_token: str | None = None):
+  """Returns the appropriate ParquetIterDataset for local or HF paths."""
+  if path.startswith("hf://"):
+    from huggingface_hub import HfFileSystem  # pylint: disable=import-outside-toplevel
+
+    return grain.experimental.ParquetIterDataset(path, filesystem=HfFileSystem(token=hf_access_token))
+  return grain.experimental.ParquetIterDataset(path)
+
+
+def compute_file_sharding(file_count, host_index, host_count):
+  """Compute per-host file slicing and optional row-shard parameters.
+
+  When file_count >= host_count, each host reads a disjoint subset of files via the
+  standard `[host_index::host_count]` slice. When file_count < host_count, every file
+  is replicated across `ceil(host_count/file_count)` hosts (or `floor` for files past
+  the remainder), and those hosts shard records by index within the file. This bounds
+  concurrent readers per file at `ceil(host_count/file_count)`
+
+  Returns:
+    file_slice (slice): file slice this host should keep — also the (start, step)
+      pair `(host_index, host_count)` to feed `tf.distribute.InputContext` when applicable.
+    files_per_host (int): files this host's slice contains per epoch.
+    row_shard (tuple|None): `(row_shard_index, row_shard_count)` when host_count > file_count
+      and the file's group has >1 reader; otherwise None.
+  """
+  if file_count >= host_count:
+    return slice(host_index, None, host_count), max(file_count // host_count, 1), None
+  file_idx = host_index % file_count
+  row_shard_idx = host_index // file_count
+  row_shard_count = (host_count // file_count) + (1 if file_idx < (host_count % file_count) else 0)
+  row_shard = (row_shard_idx, row_shard_count) if row_shard_count > 1 else None
+  return slice(file_idx, None, file_count), 1, row_shard
+
+
+class _IndexShardDatasetIterator(grain.DatasetIterator):
+  """Iterator that yields every nth element of its parent (round-robin by index)."""
+
+  def __init__(self, parent: grain.DatasetIterator, host_index: int, host_count: int):
+    super().__init__(parent)
+    self._host_index = host_index
+    self._host_count = host_count
+    self._next_index = 0
+
+  def __next__(self):
+    while True:
+      value = next(self._parent)
+      current = self._next_index
+      self._next_index += 1
+      if current % self._host_count == self._host_index:
+        return value
+
+  def get_state(self):
+    return {
+        "next_index": self._next_index,
+        "parent": self._parent.get_state(),
+    }
+
+  def set_state(self, state):
+    self._next_index = state["next_index"]
+    self._parent.set_state(state["parent"])
+
+
+class IndexShardIterDataset(grain.IterDataset):
+  """Shards an IterDataset across hosts by element index (host i keeps records where idx % N == i).
+
+  Use when the upstream `IterDataset` order is deterministic and identical on every host;
+  this guarantees disjoint, balanced slices without per-file sharding.
+  """
+
+  def __init__(self, parent: grain.IterDataset, host_index: int, host_count: int):
+    super().__init__(parent)
+    self._host_index = host_index
+    self._host_count = host_count
+
+  def __iter__(self) -> _IndexShardDatasetIterator:
+    return _IndexShardDatasetIterator(
+        self._parent.__iter__(),
+        host_index=self._host_index,
+        host_count=self._host_count,
+    )
+
+
 @dataclasses.dataclass
 class ParseFeatures(grain.MapTransform):
   """Parse serialized tf.train.Example protos for arrayrecord/tfrecord datasets.
@@ -941,7 +1028,7 @@ class PadOrTrimToMaxLength(grain.MapTransform):
     if preprocessed_image.pixel_values is None:
       raise ValueError("Input preprocessed_image must have pixel_values to pad images.")
 
-    if self.config.model_name and self.config.model_name.startswith("qwen3-omni"):
+    if self.config.model_name and self.config.model_name.startswith("qwen3-omni"):  # pyrefly: ignore[missing-attribute]
       return preprocessed_image
 
     # Determine the maximum number of images/masks allowed.
@@ -1003,21 +1090,32 @@ class PadOrTrimToMaxLength(grain.MapTransform):
         if isinstance(element[data_column], mm_utils.PreprocessorOutput):
           raise TypeError("Only 'images' column can be of type PreprocessorOutput.")
 
-        element[f"{data_column}_segmentation"] = element[data_column] != self.pad_id
-        element[f"{data_column}_segmentation"] = element[f"{data_column}_segmentation"].astype(np.int32)
-        element[f"{data_column}_position"] = np.arange(element[data_column].shape[0], dtype=np.int32)
+        element[f"{data_column}_segmentation"] = (
+            element[data_column] != self.pad_id  # pyrefly: ignore[unsupported-operation]
+        )  # pyrefly: ignore[unsupported-operation]
+        # pyrefly: ignore[missing-attribute]
+        element[f"{data_column}_segmentation"] = element[
+            f"{data_column}_segmentation"
+        ].astype(  # pyrefly: ignore[missing-attribute]
+            np.int32
+        )
+        element[f"{data_column}_position"] = np.arange(
+            element[data_column].shape[0], dtype=np.int32  # pyrefly: ignore[missing-attribute]
+        )  # pyrefly: ignore[missing-attribute]
         if self.add_true_length:
-          element[f"{data_column}_true_length"] = np.array([element[data_column].shape[0]], dtype=np.int32)
+          element[f"{data_column}_true_length"] = np.array(
+              [element[data_column].shape[0]], dtype=np.int32  # pyrefly: ignore[missing-attribute]
+          )  # pyrefly: ignore[missing-attribute]
 
     for key, _ in element.items():
       if key == "images":
-        if self.config.model_name is None:
+        if self.config.model_name is None:  # pyrefly: ignore[missing-attribute]
           raise ValueError("model_name must be provided when padding images")
 
-        element["images"] = self._pad_image_and_mask(element["images"])
+        element["images"] = self._pad_image_and_mask(element["images"])  # pyrefly: ignore[bad-argument-type]
 
       elif "true_length" not in key:
-        element[key] = self._pad_text(element[key], self.max_length, self.pad_id)
+        element[key] = self._pad_text(element[key], self.max_length, self.pad_id)  # pyrefly: ignore[bad-argument-type]
     return element
 
 
@@ -1044,9 +1142,13 @@ class ExtractImagesAndMasks(grain.MapTransform):
       raise TypeError(f"'images' must be of type PreprocessorOutput, but got {type(preprocessed_image)}")
 
     output = element.copy()
-    output["images"] = preprocessed_image.pixel_values
+    output["images"] = preprocessed_image.pixel_values  # pyrefly: ignore[unsupported-operation]
     if preprocessed_image.pixel_mask is not None:
       output["image_masks"] = preprocessed_image.pixel_mask
+    # Qwen MRoPE needs per-image (t, h, w) grids to build 3D positions.
+    pixel_grid_thw = getattr(preprocessed_image, "pixel_grid_thw", None)
+    if pixel_grid_thw is not None:
+      output["image_grid_thw"] = pixel_grid_thw
 
     return output
 
@@ -1162,6 +1264,8 @@ class ComputeQwen3OmniPositions(grain.MapTransform):
       spatial_merge_size: int = 2,
       position_id_per_seconds: int = 25,
       use_audio_in_video: bool = False,
+      config=None,
+      keep_aux_fields: bool = False,
   ):
     """Initialize the Qwen3-Omni position computation transform.
 
@@ -1170,11 +1274,17 @@ class ComputeQwen3OmniPositions(grain.MapTransform):
       spatial_merge_size: Number of patches merged spatially (e.g., 2 for 2x2→1).
       position_id_per_seconds: Temporal granularity (tokens per second, typically 25).
       use_audio_in_video: If True, audio tokens are interleaved with video tokens.
+      config: Optional model config for model-specific special token IDs.
+      keep_aux_fields: If True, keep auxiliary (aux) fields — mrope deltas / grid
+        metadata — on the element for inference. Training should leave this False
+        so the batch matches get_shaped_batch.
     """
     self.data_column = data_column
     self.spatial_merge_size = spatial_merge_size
     self.position_id_per_seconds = position_id_per_seconds
     self.use_audio_in_video = use_audio_in_video
+    self.config = config
+    self.keep_aux_fields = keep_aux_fields
 
   def map(self, element: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
     """Compute 3D position IDs for the batch element.
@@ -1183,13 +1293,13 @@ class ComputeQwen3OmniPositions(grain.MapTransform):
       element: Dictionary containing:
         - {data_column}: Token IDs with shape (batch, seq_len)
         - {data_column}_segmentation: Attention mask (1=real, 0=padding)
-        - image_grid_thw: Optional (num_images, 3) array
+        - image_grid_thw: Optional (num_images, 3) or (batch, num_images, 3) array
         - video_grid_thw: Optional (num_videos, 3) array
         - audio_lengths: Optional (num_audios,) array
         - second_per_grids: Optional (num_videos,) array
 
     Returns:
-      element with {data_column}_position updated to shape (3, batch, seq_len)
+      element with {data_column}_position updated to shape (batch, seq_len, 3)
       for 3D positions (always 3D, even for text-only sequences).
     """
 
@@ -1202,6 +1312,14 @@ class ComputeQwen3OmniPositions(grain.MapTransform):
     video_grid_thw = element.get("video_grid_thw")
     audio_lengths = element.get("audio_lengths")
     second_per_grids = element.get("second_per_grids")
+
+    # grain.Batch stacks per-example (N, 3) grids to (B, N, 3). get_rope_index
+    # resets image_idx per sequence against a shared (N, 3) table, which is
+    # correct when training force-resizes all images to the same grid.
+    if image_grid_thw is not None and image_grid_thw.ndim == 3:
+      image_grid_thw = image_grid_thw[0]
+    if video_grid_thw is not None and video_grid_thw.ndim == 3:
+      video_grid_thw = video_grid_thw[0]
 
     # Call the standalone get_rope_index function from multimodal_utils
     from maxtext.multimodal import processor_qwen3_omni  # pylint: disable=import-outside-toplevel
@@ -1217,11 +1335,20 @@ class ComputeQwen3OmniPositions(grain.MapTransform):
         second_per_grids=second_per_grids,
         spatial_merge_size=self.spatial_merge_size,
         position_id_per_seconds=self.position_id_per_seconds,
+        config=self.config,
     )
 
     # Update element with 3D positions
-    # Shape: (3, batch, seq_len) for multimodal, or (batch, seq_len) for text-only
-    element[f"{self.data_column}_position"] = position_ids
-    element[f"{self.data_column}_mrope_deltas"] = mrope_position_deltas
+    # Shape: (batch, seq_len, 3) for multimodal, or (batch, seq_len) for text-only
+    element[f"{self.data_column}_position"] = position_ids.astype(np.int32)
+    if self.keep_aux_fields:
+      element[f"{self.data_column}_mrope_deltas"] = mrope_position_deltas
+    else:
+      # Drop metadata that is not part of the training shaped batch.
+      element.pop(f"{self.data_column}_mrope_deltas", None)
+      element.pop("image_grid_thw", None)
+      element.pop("video_grid_thw", None)
+      element.pop("audio_lengths", None)
+      element.pop("second_per_grids", None)
 
     return element

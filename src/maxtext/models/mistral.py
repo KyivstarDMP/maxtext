@@ -176,11 +176,11 @@ class MistralDecoderLayer(nnx.Module):
     layer_output = self.dropout(layer_output, deterministic=deterministic)
     layer_output = nn.with_logical_constraint(layer_output, self.activation_axis_names)
 
-    if cfg.record_internal_nn_metrics:
-      self.sow("intermediates", "activation_mean", jnp.mean(layer_output))
-      self.sow("intermediates", "activation_stdev", jnp.std(layer_output))
+    if getattr(cfg, "record_internal_nn_metrics", False):
+      self.sow(nnx.Intermediate, "activation_mean", jnp.mean(layer_output))
+      self.sow(nnx.Intermediate, "activation_stdev", jnp.std(layer_output))
       self.sow(
-          "intermediates",
+          nnx.Intermediate,
           "activation_fraction_zero",
           jnp.sum(layer_output == 0) / jnp.size(layer_output),
       )
@@ -192,8 +192,8 @@ class MistralDecoderLayer(nnx.Module):
           return cache.at[layer_idx].set(val)
         return cache
 
-      stacked_kv_cache = jax.tree_util.tree_map(update_cache, stacked_kv_cache, kv_cache)
-      return (layer_output, stacked_kv_cache, layer_idx + 1), None
+      stacked_kv_cache = jax.tree_util.tree_map(update_cache, stacked_kv_cache, kv_cache)  # pyrefly: ignore[unbound-name]
+      return (layer_output, stacked_kv_cache, layer_idx + 1), None  # pyrefly: ignore[unbound-name]
     elif cfg.scan_layers:
       return layer_output, None
     else:

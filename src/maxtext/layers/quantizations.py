@@ -28,6 +28,7 @@ from aqt.jax.v2 import tiled_dot_general
 from aqt.jax.v2 import calibration
 
 import qwix
+from qwix._src.core import numerics
 from qwix._src.core import dot_general_qt
 from qwix._src.core import sparsity
 
@@ -38,6 +39,14 @@ from jax.tree_util import tree_flatten_with_path, tree_unflatten
 from flax.linen import fp8_ops
 from flax.linen import initializers as flax_initializers
 import flax.linen as nn
+from flax import nnx
+# Support different packaging structures across environments even within
+# the same Qwix version identifier (imports from _src.utils vs _src).
+try:
+  from qwix._src.utils import flax_util
+except ImportError:
+  from qwix._src import flax_util  # pytype: disable=import-error
+from maxtext.layers import nnx_wrappers
 
 from maxtext.common.common_types import DType, Config
 from maxtext.inference.kvcache import KVQuant
@@ -95,22 +104,22 @@ def _rhs_axis_metadata_wrapper(
     if len(x.shape) == 1:
       return nn.with_logical_partitioning((lambda: x), tuple(None for _ in mesh_axes))()
 
-  mesh_axes = list(mesh_axes)
+  mesh_axes = list(mesh_axes)  # pyrefly: ignore[bad-assignment]
   if is_tiled:
     # tile_map is a mapping between original rank and a list of new, tiled rank.
     if len(mesh_axes) < len(tile_map):
-      mesh_axes = [None] * (len(tile_map) - len(mesh_axes)) + mesh_axes
+      mesh_axes = [None] * (len(tile_map) - len(mesh_axes)) + mesh_axes  # pyrefly: ignore[unsupported-operation]
     new_mesh_axes = [None] * len(x.shape)
     for orig_rank, new_rank in tile_map.items():
       assert new_rank
       assert len(new_rank) <= 2
       new_mesh_axes[new_rank[-1]] = mesh_axes[orig_rank]
-    mesh_axes = new_mesh_axes
+    mesh_axes = new_mesh_axes  # pyrefly: ignore[bad-assignment]
 
   if mesh_axes is not None and len(mesh_axes) > 0:
     for no_shard_idx in no_sharding_axis:
       if no_shard_idx < len(mesh_axes):
-        mesh_axes[no_shard_idx] = None
+        mesh_axes[no_shard_idx] = None  # pyrefly: ignore[unsupported-operation]
 
   return nn.with_logical_partitioning((lambda: x), mesh_axes)()
 
@@ -129,13 +138,13 @@ class AqtQuantization:
     is_tiled = False
     tiling_fn = None
     # pylint: disable=protected-access
-    module_path = "/".join(nn.module._context.module_stack[-1].path)
+    module_path = "/".join(nn.module._context.module_stack[-1].path)  # pyrefly: ignore[missing-attribute]
     tile_size = -1
-    for layer_name_re, layer_quant_dg in self.quant_dg.items():
+    for layer_name_re, layer_quant_dg in self.quant_dg.items():  # pyrefly: ignore[missing-attribute]
       if re.fullmatch(layer_name_re, module_path):
         quant_dg, tile_size = layer_quant_dg
     if quant_dg is None:
-      quant_dg, tile_size = self.quant_dg[DEFAULT]
+      quant_dg, tile_size = self.quant_dg[DEFAULT]  # pyrefly: ignore[bad-index]
     if tile_size != -1:
       is_tiled = True
       tiling_fn = functools.partial(_tiling_fn, tile_size=tile_size)
@@ -245,7 +254,6 @@ class QwixDotGeneral(nn.Module):
       *,
       out_sharding=None,
   ) -> jax.Array:
-
     return dot_general_qt.dot_general_qt(lhs, rhs, dimension_numbers, self.config)
 
 
@@ -264,9 +272,8 @@ class QwixEinsum(nn.Module):
       _dot_general: Callable[..., jax.Array] | None = None,
       out_sharding=None,
   ) -> jax.Array:
-
     def custom_dot_general(*args, **kwargs):
-      return dot_general_qt.dot_general_qt(*args[:3], self.config)
+      return dot_general_qt.dot_general_qt(*args[:3], self.config)  # pyrefly: ignore[bad-argument-count]
 
     with jax.disable_jit():
       return jnp.einsum(
@@ -380,13 +387,16 @@ class NANOOFp8Quantization(Quantization):
 
 
 def _get_int8_quant_config(config):
+  """Get int8 quantization configuration."""
   drhs_bits = None
   drhs_accumulator_dtype = None
   drhs_local_aqt = None
   if config.quantization_local_shard_count != 0:
     drhs_bits = 8
     drhs_accumulator_dtype = jnp.int32
-    drhs_local_aqt = aqt_config.LocalAqt(contraction_axis_shard_count=config.quantization_local_shard_count)
+    drhs_local_aqt = aqt_config.LocalAqt(
+        contraction_axis_shard_count=config.quantization_local_shard_count  # pyrefly: ignore[unexpected-keyword]
+    )  # pyrefly: ignore[unexpected-keyword]
   return aqt_config.config_v3(
       fwd_bits=8,
       dlhs_bits=8,
@@ -424,30 +434,30 @@ def _build_const_scale_config(
     The AQT dot general config with constant scale config.
   """
   if cst_bound_config.fwd_lhs_bound is not None:
-    aqt_dg.fwd.dg_quantizer.lhs.calibration = functools.partial(
+    aqt_dg.fwd.dg_quantizer.lhs.calibration = functools.partial(  # pyrefly: ignore[missing-attribute]
         calibration.ConstantCalibration, bound=cst_bound_config.fwd_lhs_bound
     )
   if cst_bound_config.fwd_rhs_bound is not None:
-    aqt_dg.fwd.dg_quantizer.rhs.calibration = functools.partial(
+    aqt_dg.fwd.dg_quantizer.rhs.calibration = functools.partial(  # pyrefly: ignore[missing-attribute]
         calibration.ConstantCalibration, bound=cst_bound_config.fwd_rhs_bound
     )
   if cst_bound_config.dlhs_lhs_bound:
-    aqt_dg.dlhs.dg_quantizer.lhs.calibration = functools.partial(
+    aqt_dg.dlhs.dg_quantizer.lhs.calibration = functools.partial(  # pyrefly: ignore[missing-attribute]
         calibration.ConstantCalibration, bound=cst_bound_config.dlhs_lhs_bound
     )
 
   if cst_bound_config.dlhs_rhs_bound is not None:
-    aqt_dg.dlhs.dg_quantizer.rhs.calibration = functools.partial(
+    aqt_dg.dlhs.dg_quantizer.rhs.calibration = functools.partial(  # pyrefly: ignore[missing-attribute]
         calibration.ConstantCalibration, bound=cst_bound_config.dlhs_rhs_bound
     )
 
   if cst_bound_config.drhs_lhs_bound is not None:
-    aqt_dg.drhs.dg_quantizer.lhs.calibration = functools.partial(
+    aqt_dg.drhs.dg_quantizer.lhs.calibration = functools.partial(  # pyrefly: ignore[missing-attribute]
         calibration.ConstantCalibration, bound=cst_bound_config.drhs_lhs_bound
     )
 
   if cst_bound_config.drhs_rhs_bound is not None:
-    aqt_dg.drhs.dg_quantizer.rhs.calibration = functools.partial(
+    aqt_dg.drhs.dg_quantizer.rhs.calibration = functools.partial(  # pyrefly: ignore[missing-attribute]
         calibration.ConstantCalibration, bound=cst_bound_config.drhs_rhs_bound
     )
 
@@ -478,17 +488,17 @@ def _build_per_tensor_config(
     The AQT dot general config with per tensor config.
   """
   if per_tensor_scales.fwd_lhs:
-    aqt_dg.fwd.dg_quantizer.lhs.calib_shared_axes = "per_tensor"
+    aqt_dg.fwd.dg_quantizer.lhs.calib_shared_axes = "per_tensor"  # pyrefly: ignore[missing-attribute]
   if per_tensor_scales.fwd_rhs:
-    aqt_dg.fwd.dg_quantizer.rhs.calib_shared_axes = "per_tensor"
+    aqt_dg.fwd.dg_quantizer.rhs.calib_shared_axes = "per_tensor"  # pyrefly: ignore[missing-attribute]
   if per_tensor_scales.dlhs_lhs:
-    aqt_dg.dlhs.dg_quantizer.lhs.calib_shared_axes = "per_tensor"
+    aqt_dg.dlhs.dg_quantizer.lhs.calib_shared_axes = "per_tensor"  # pyrefly: ignore[missing-attribute]
   if per_tensor_scales.dlhs_rhs:
-    aqt_dg.dlhs.dg_quantizer.rhs.calib_shared_axes = "per_tensor"
+    aqt_dg.dlhs.dg_quantizer.rhs.calib_shared_axes = "per_tensor"  # pyrefly: ignore[missing-attribute]
   if per_tensor_scales.drhs_lhs:
-    aqt_dg.drhs.dg_quantizer.lhs.calib_shared_axes = "per_tensor"
+    aqt_dg.drhs.dg_quantizer.lhs.calib_shared_axes = "per_tensor"  # pyrefly: ignore[missing-attribute]
   if per_tensor_scales.drhs_rhs:
-    aqt_dg.drhs.dg_quantizer.rhs.calib_shared_axes = "per_tensor"
+    aqt_dg.drhs.dg_quantizer.rhs.calib_shared_axes = "per_tensor"  # pyrefly: ignore[missing-attribute]
   return aqt_dg
 
 
@@ -509,9 +519,14 @@ def _get_aqt_fp8_default_config(config):
   constant_bound_config = None
 
   if len(config.constant_bound_config) == 6:
-    fwd_lhs_bound, fwd_rhs_bound, dlhs_lhs_bound, dlhs_rhs_bound, drhs_lhs_bound, drhs_rhs_bound = (
-        config.constant_bound_config
-    )
+    (
+        fwd_lhs_bound,
+        fwd_rhs_bound,
+        dlhs_lhs_bound,
+        dlhs_rhs_bound,
+        drhs_lhs_bound,
+        drhs_rhs_bound,
+    ) = config.constant_bound_config
     constant_bound_config = ConstantBoundConfig(
         fwd_lhs_bound=fwd_lhs_bound,
         fwd_rhs_bound=fwd_rhs_bound,
@@ -554,9 +569,13 @@ def _dot_general_make(quant_cfg):
   rhs_scale = quant_cfg[_W_SCALE]
   aqt_dg = aqt_config.dot_general_make(lhs_bits=lhs_bits, rhs_bits=rhs_bits)
   if lhs_scale < 1.0:
-    aqt_dg.fwd.dg_quantizer.lhs.calibration = functools.partial(calibration.AbsMaxCalibration, scale=lhs_scale)
+    aqt_dg.fwd.dg_quantizer.lhs.calibration = functools.partial(  # pyrefly: ignore[missing-attribute]
+        calibration.AbsMaxCalibration, scale=lhs_scale
+    )  # pyrefly: ignore[missing-attribute]
   if rhs_scale < 1.0:
-    aqt_dg.fwd.dg_quantizer.rhs.calibration = functools.partial(calibration.AbsMaxCalibration, scale=rhs_scale)
+    aqt_dg.fwd.dg_quantizer.rhs.calibration = functools.partial(  # pyrefly: ignore[missing-attribute]
+        calibration.AbsMaxCalibration, scale=rhs_scale
+    )  # pyrefly: ignore[missing-attribute]
   return aqt_dg
 
 
@@ -629,7 +648,7 @@ def get_quant_mode(quant_mode_str: str = "train"):
 
 def configure_quantization(config: Config, quant_mode_str: str = "train"):
   """Configure quantization based on user config and quant mode."""
-  if config.use_batch_split_schedule and config.quantization:
+  if getattr(config, "use_batch_split_schedule", False) and config.quantization:
     # The older version of batch-split that fully uses qwix quantization.
     if config.quantization == "fp8_full" and not config.use_manual_quantization:
       return QwixQuantization(
@@ -640,7 +659,7 @@ def configure_quantization(config: Config, quant_mode_str: str = "train"):
     # The pure JAX version of batch-split that uses manual quantization for dot general.
     return None
 
-  if config.use_qwix_quantization:
+  if config.quantization and config.use_qwix_quantization:
     return None
   quant_cfg = _get_quant_config(config)
   if quant_cfg:
@@ -707,6 +726,32 @@ def configure_kv_quant(config):
   return None if not config.quantize_kvcache else KVQuant(config)
 
 
+def _apply_linen_module_in_nnx(linen_module_cls, op_id, *args, **kwargs):
+  """Applies a Linen module within an NNX context."""
+  try:
+    parent = flax_util.get_current_module()
+    is_nnx = isinstance(parent, nnx.Module)
+  except ValueError:
+    is_nnx = False
+
+  if is_nnx:
+    attr_name = f"_qwix_fp8_gpu_{op_id}"
+    if not hasattr(parent, attr_name):  # pyrefly: ignore[unbound-name]
+      rngs = getattr(parent, "qwix_rngs", None)
+      if rngs is None:
+        parent_rngs = getattr(parent, "rngs", None)
+        if parent_rngs is not None and hasattr(parent_rngs, "fork"):
+          rngs = parent_rngs.fork()
+        else:
+          rngs = nnx.Rngs(0)
+      wrapper = nnx_wrappers.ToNNX(linen_module_cls(name=op_id), rngs=rngs)
+      wrapper.lazy_init(*args, **kwargs)
+      setattr(parent, attr_name, wrapper)
+    return getattr(parent, attr_name)(*args, mutable=["_overwrite_with_gradient"], **kwargs)
+  else:
+    return linen_module_cls(name=op_id)(*args, **kwargs)
+
+
 class NvidaFp8Provider(qwix.QtProvider):
   """Wraps nn.Fp8DirectDotGeneralOp with Qwix's provider interface."""
 
@@ -715,13 +760,13 @@ class NvidaFp8Provider(qwix.QtProvider):
     rule, op_id = self._get_current_rule_and_op_id("dot_general")
     if rule is None:
       return jax.lax.dot_general(*args, **kwargs)
-    return nn.Fp8DirectDotGeneralOp(name=op_id)(*args, **kwargs)
+    return _apply_linen_module_in_nnx(nn.Fp8DirectDotGeneralOp, op_id, *args, **kwargs)
 
   def einsum(self, *args, **kwargs):
     rule, op_id = self._get_current_rule_and_op_id("einsum")
     if rule is None:
       return jnp.einsum(*args, **kwargs)
-    return nn.Fp8Einsum(name=op_id)(*args, **kwargs)
+    return _apply_linen_module_in_nnx(nn.Fp8Einsum, op_id, *args, **kwargs)
 
 
 class NANOOFp8Provider(qwix.QtProvider):
@@ -731,7 +776,7 @@ class NANOOFp8Provider(qwix.QtProvider):
     rule, op_id = self._get_current_rule_and_op_id("dot_general")
     if rule is None:
       return jax.lax.dot_general(*args, **kwargs)
-    return nn.NANOOFp8DotGeneralOp(name=op_id)(*args, **kwargs)
+    return _apply_linen_module_in_nnx(nn.NANOOFp8DotGeneralOp, op_id, *args, **kwargs)
 
 
 def get_fp8_full_qwix_rule_w_sparsity(config: Config):
@@ -769,6 +814,7 @@ def get_quantization_rule(config: Config):
             act_qtype=dtype,
             bwd_qtype=dtype,
             bwd_weight_grad_tile_size=1 / config.quantization_local_shard_count,
+            disable_channelwise_axes=False,
             op_names=("dot_general",),
         )
     ]
@@ -779,6 +825,9 @@ def get_quantization_rule(config: Config):
 
     case "int8":
       return make_qt_rule(jnp.int8)
+
+    case "fp4" | "fp4_e2m1":
+      return make_qt_rule(jnp.float4_e2m1fn)
 
     case "fp8_e5m2":
       return make_qt_rule(jnp.float8_e5m2)
@@ -797,7 +846,7 @@ def get_quantization_rule(config: Config):
 def get_qt_provider(config):
   """Get quantization rules based on the config."""
   match config.quantization:
-    case "int4" | "int8" | "fp8" | "fp8_e5m2" | "fp8_e4m3" | "fp8_full":
+    case "int4" | "int8" | "fp4" | "fp4_e2m1" | "fp8" | "fp8_e5m2" | "fp8_e4m3" | "fp8_full":
       return qwix.QtProvider(get_quantization_rule(config))
     case "fp8_gpu":
       return NvidaFp8Provider(get_quantization_rule(config))
@@ -809,10 +858,35 @@ def get_qt_provider(config):
 def maybe_quantize_model(model, config):
   """Quantize the model if quantization is enabled."""
   # Batch split is not using Qwix's interception feature but manual plumbing
-  if config.use_qwix_quantization and not config.use_batch_split_schedule:
+  if config.quantization and config.use_qwix_quantization and not config.use_batch_split_schedule:
     quantization_provider = get_qt_provider(config)
     if quantization_provider:
-      model = qwix.quantize_model(model, quantization_provider)
+      if config.pure_nnx:
+        input_shape = (config.micro_batch_size_to_train_on, config.max_target_length)
+        dummy_tokens = jnp.ones(input_shape, dtype=jnp.int32)
+        dummy_positions = jnp.ones(input_shape, dtype=jnp.int32)
+        dummy_segment_ids = jnp.ones(input_shape, dtype=jnp.int32)
+        # The MTP block reads the decoder targets, so the qwix forward pass needs them.
+        # The Linen path supplies them from the is_initializing() guard in Transformer.
+        dummy_targets = {}
+        if config.mtp_num_layers > 0:
+          dummy_targets["decoder_target_tokens"] = jnp.ones(input_shape, dtype=jnp.int32)
+          dummy_targets["decoder_target_mask"] = jnp.ones(input_shape, dtype=jnp.int32)
+        model = qwix.quantize_model(
+            model,
+            quantization_provider,
+            dummy_tokens,
+            dummy_positions,
+            dummy_segment_ids,
+            enable_dropout=False,
+            **dummy_targets,
+        )
+        # Qwix quantization runs a forward pass during tracing, which sows transient nnx.Intermediate variables
+        # (e.g. max_logits from QK-Clip, MTP losses) into the model. Popping them here prevents structural mismatches
+        # between the initial setup GraphDef/state_mesh_shardings and the stripped states during train steps.
+        nnx.pop(model, nnx.Intermediate)
+      else:
+        model = qwix.quantize_model(model, quantization_provider)
   return model
 
 
@@ -832,20 +906,47 @@ def _make_scale_tensor(scale, arr):
   return _cast_reduced_from(scale_tensor, arr)
 
 
-def _get_max_min(target_dtype):
-  if target_dtype in (jnp.int4, jnp.int8):
-    return jnp.iinfo(target_dtype).max, jnp.iinfo(target_dtype).min
-  else:
-    return jnp.finfo(target_dtype).max.astype(jnp.bfloat16), jnp.finfo(target_dtype).min.astype(jnp.bfloat16)
+def get_static_scale(qtype: jax.typing.DTypeLike, calibration_method: str) -> float:
+  """Extracts the static scale.
+  Currently, only symmetric fixed range calibration is supported.
+  For symmetric calibration, the calibration_method must be in the format 'fixed,-max,max' or 'fixed,max'.
+
+  Args:
+    qtype: The dtype to quantize to.
+    calibration_method: A string specifying the calibration method.
+
+  Returns:
+    The extracted static scale value.
+  """
+  if calibration_method is None or not calibration_method.lower().startswith("fixed"):
+    raise ValueError(f"Only static scale quantization is supported, got {calibration_method}")
+
+  args = [float(a) for a in calibration_method.split(",")[1:]]
+  if len(args) == 1:
+    args = [-args[0], args[0]]
+
+  if len(args) != 2 or args[0] + args[1] != 0 or args[1] <= 0:
+    raise ValueError(f"Expected format: 'fixed,max' or 'fixed,-max,max'. Got: {calibration_method}")
+
+  qmax = numerics.get_symmetric_bound(qtype)
+  scale_val = args[1] / qmax
+
+  # Prevent scale from being 0
+  tiny_sqrt = jnp.finfo(jnp.float32).tiny ** 0.5
+  if scale_val < tiny_sqrt:
+    scale_val = 1.0
+
+  return scale_val
 
 
-def manual_quantize(tensor, calibration_method, dtype=jnp.float8_e4m3fn):
-  """Manually quantizes a tensor based on a fixed calibration method.
+def manual_quantize(tensor: jax.Array, dtype: jax.typing.DTypeLike, calibration_method: str) -> qwix.QArray:
+  """Manually quantizes a tensor based on per-tensor scaling with symmetric fixed range calibration.
 
   Args:
     tensor: The tensor to quantize.
-    calibration_method: A string specifying the calibration method. Expected
-      format is "fixed,{scale},{max_val}".
+    dtype: The logical type of the quantized value, e.g. jnp.float8_e4m3fn
+    calibration_method: A string specifying the calibration method. Currently only support
+    symmetric fixed range calibration: Expected format is "fixed,{-max_val},{max_val}".
 
   Returns:
     A qwix.QArray containing the quantized value and the scale.
@@ -853,27 +954,17 @@ def manual_quantize(tensor, calibration_method, dtype=jnp.float8_e4m3fn):
   Raises:
     ValueError: If calibration_method is None or has an unexpected format.
   """
-  calib_method = calibration_method
-  if calib_method is None:
-    raise ValueError("calibration_method cannot be None for manual quantization")
-  if not calib_method.startswith("fixed"):
-    raise ValueError("Only static weight/activation quantization is supported, but got" f" {calib_method}")
-
-  parts = calib_method.split(",")
-  if len(parts) != 3:
-    raise ValueError(f"Unexpected format for weight calibration method: {calib_method}")
-
-  dtype_max, dtype_min = _get_max_min(dtype)
-  max_val = float(parts[2])
-  scale = max_val / dtype_max
-  scale = jnp.where(scale == 0, 1.0, scale)
+  scale = get_static_scale(dtype, calibration_method)
+  dtype_max = numerics.get_symmetric_bound(dtype)
+  dtype_min = -dtype_max
   # scale must be converted to a tensor because grad has reduced axes.
   scale_tensor = _make_scale_tensor(scale, tensor)
   min_bound = _make_scale_tensor(dtype_min, tensor)
   max_bound = _make_scale_tensor(dtype_max, tensor)
   q_tensor = jnp.clip(tensor / scale_tensor, min_bound, max_bound).astype(dtype)
 
-  # get scale for QArray
+  # get scale for QArray.
+  # per-tensor scaling: same scale for each axis
   scale_shape = [1] * tensor.ndim
   # It must stay fully replicated for the backward pass and Pallas.
   scale_tensor_qpl = jnp.full(scale_shape, scale, dtype=tensor.dtype)
@@ -893,6 +984,8 @@ class TransformerEngineQuantization(Quantization):
       raise ValueError(f"Invalid TransformerEngine quantization config: {config.quantization}")
 
     self._recipe = TransformerEngineQuantization._get_recipe(config.quantization)
+
+    self._perform_collective_gemm = config.use_te_comm_gemm_overlap
 
   def __hash__(self):
     return hash((self.quant_mode, self._recipe))
@@ -944,11 +1037,13 @@ class TransformerEngineQuantization(Quantization):
     2. Wraps the given function in a Flax linen module. This module does not store any Flax
     parameters but can store Flax variables for quantizers if required by the recipe.
 
-    3. When the wrapper is called, it provides an additional argument to the given function `f`,
-    'generate_quantizer_set' as the first argument. 'generate_quantizer_set' is a function that
-    can be called to generate a TransformerEngine/JAX quantizer set object used in
-    TransformerEngine/JAX APIs. 'generate_quantizer_set' will generate quantizers based on the
-    recipe of this TransformerEngineQuantizer object.
+    3. When the wrapper is called, it provides two additional arguments to the given function `f`,
+    'generate_quantizer_set' as the first argument and 'generate_collective_op_set' as the second argument.
+    'generate_quantizer_set' is a function that can be called to generate a TransformerEngine/JAX quantizer
+    set object used in TransformerEngine/JAX APIs based on the recipe of this TransformerEngineQuantizer
+    object. Similarly, 'generate_collective_op_set' is a function that can be called to generate a
+    TransformerEngine/JAX collective operation set object used in TransformerEngine/JAX APIs based
+    the kernel's mesh axes.
 
     Args:
       f: The function to wrap. The first argument must be 'generate_quantizer_set'.
@@ -959,24 +1054,46 @@ class TransformerEngineQuantization(Quantization):
     """
 
     import transformer_engine.jax  # pylint: disable=import-outside-toplevel # pytype: disable=import-error
+    import transformer_engine.jax.cpp_extensions as tex  # pylint: disable=import-outside-toplevel # pytype: disable=import-error
+    from transformer_engine.common import recipe  # pylint: disable=import-outside-toplevel # pytype: disable=import-error
 
-    fp8_recipe = self._recipe
+    default_recipe = self._recipe
 
     class TEWrapper(transformer_engine.jax.flax.module.TransformerEngineBase):
       """Wrapper module for TransformerEngine quantization."""
 
-      def generate_quantizer_set(self, postfix: str = ""):
+      def generate_quantizer_set(
+          self,
+          postfix: str = "",
+          variable_collection: str | None = None,
+          quantization_checkpoint_name: str | None = None,
+          fp8_recipe: recipe.Recipe | None = default_recipe,
+          n_groups: int | None = None,
+      ):
+        """Route quantizer-set generation through the OVERWRITE_WITH_GRADIENT collection."""
         OVERWRITE_WITH_GRADIENT = "_overwrite_with_gradient"
         return super().generate_quantizer_set(  # pytype: disable=wrong-keyword-args
             postfix=postfix,
             variable_collection=OVERWRITE_WITH_GRADIENT,
             quantization_checkpoint_name="quantization",
             fp8_recipe=fp8_recipe,
+            n_groups=n_groups,  # pyrefly: ignore[bad-argument-type]
         )
+
+      def generate_collective_op_set(self, mesh_axes: Tuple[str, ...] = ()):
+        """Inspect the kernel's mesh axes to determine the type of collective operation to use for collective GEMM."""
+
+        if len(mesh_axes) >= 1:
+          if mesh_axes[0] == "embed" and mesh_axes[-1] == "mlp":
+            return tex.CollectiveOpSet.create(tex.CollectiveOp.ALL_GATHER)
+          elif mesh_axes[0] == "mlp" and mesh_axes[-1] == "embed":
+            return tex.CollectiveOpSet.create(tex.CollectiveOp.REDUCE_SCATTER)
+
+        return tex.noop_collective_op_set
 
       @nn.compact
       def __call__(self, *args, **kwargs):
-        return f(self.generate_quantizer_set, *args, **kwargs)
+        return f(self.generate_quantizer_set, self.generate_collective_op_set, *args, **kwargs)
 
     TEWrapper.__name__ = f"TEWrapper_{name if name else f.__name__}"
 
@@ -985,17 +1102,22 @@ class TransformerEngineQuantization(Quantization):
   def dot_general_cls(self, mesh_axes: Tuple[str, ...] = ()):
     """Placeholder for dot_general implementation in subclasses."""
     import transformer_engine.jax  # pylint: disable=import-outside-toplevel # pytype: disable=import-error
+    import transformer_engine.jax.cpp_extensions as tex  # pylint: disable=import-outside-toplevel # pytype: disable=import-error
 
-    def te_dot_general(generate_quantizer_set, x, kernel, dims, **kwargs):
+    def te_dot_general(generate_quantizer_set, generate_collective_op_set, x, kernel, dims, **kwargs):
       contracting_dims, batch_dims = dims
       assert batch_dims == ((), ()), "Batch dimensions must be empty for TransformerEngine dot."
 
       quantizer_set = generate_quantizer_set()
+      collective_op_set = (
+          generate_collective_op_set(mesh_axes) if self._perform_collective_gemm else tex.noop_collective_op_set
+      )
       return transformer_engine.jax.dense.dense(
           x,
           kernel,
           contracting_dims=contracting_dims,
           quantizer_set=quantizer_set,
+          collective_op_set=collective_op_set,
       )
 
     return self._wrap(te_dot_general, "dot_general")

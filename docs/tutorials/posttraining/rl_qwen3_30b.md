@@ -30,10 +30,6 @@ Before starting, ensure you have:
 - A Pathways-ready GKE cluster (see [create GKE cluster](https://docs.cloud.google.com/ai-hypercomputer/docs/workloads/pathways-on-cloud/create-gke-cluster)).
 - **Docker** installed and configured for sudoless use. Follow the steps to [configure sudoless Docker](https://docs.docker.com/engine/install/linux-postinstall/).
 
-## Build and Upload MaxText Docker Image
-
-For instructions on building and uploading the MaxText Docker image with post-training dependencies, please refer to the [official documentation](../../build_maxtext.md).
-
 ## Setup Environment Variables
 
 Set up the following environment variables to configure your training run. Replace
@@ -53,19 +49,6 @@ export ZONE=<ZONE> # e.g., 'us-central1' or 'us-central1-a'
 
 # Use a GCS bucket you own to store logs and checkpoints.
 export BASE_OUTPUT_DIRECTORY=<GCS_BUCKET> # e.g., gs://my-bucket/maxtext-runs
-
-# The Docker image you pushed in the previous step
-export CLOUD_IMAGE_NAME=<IMAGE_NAME>
-export DOCKER_IMAGE="gcr.io/${PROJECT_ID?}/${CLOUD_IMAGE_NAME?}"
-```
-
-## Clone MaxText Repository
-
-If you haven't already, clone the MaxText repository to your local machine:
-
-```bash
-git clone https://github.com/AI-Hypercomputer/maxtext.git
-cd maxtext
 ```
 
 ## Authenticate with Hugging Face
@@ -89,42 +72,29 @@ export MAXTEXT_CKPT_PATH=<CKPT_PATH> # e.g., gs://my-bucket/my-model-checkpoint/
 
 ### Option 2: Converting from a Hugging Face checkpoint
 
-> **Note:** Converting the 30B model requires approximately 62 GB of free disk space to download its safetensors. Please verify you have sufficient space before running the conversion script.
+Refer to [Hugging Face to MaxText](hf-to-maxtext) to convert a Hugging Face checkpoint to MaxText format. You can find an example script to convert `qwen3-30b-a3b-base`model to MaxText format [here](https://github.com/AI-Hypercomputer/maxtext/blob/main/tests/end_to_end/tpu/qwen3/30b/test_qwen3_to_mt.sh). After conversion finishes, set `MAXTEXT_CKPT_PATH` to the converted MaxText checkpoint path.
 
 ```bash
-# Optional: If you run out of disk space when downloading Hugging Face safetensors,
-# customize your "HF_HOME" to redirect the cache to a larger or mounted disk (e.g., on a TPU VM).
-# export HF_HOME="/dev/shm/huggingface_tmp"
-
-# Create and activate a virtual environment
-uv venv --python 3.12 --seed tpu_venv
-source tpu_venv/bin/activate
-uv pip install -e .[tpu] --resolution=lowest
-
-# Run the conversion script to convert the Hugging Face checkpoint to MaxText format
-bash scripts/run_qwen3_30b_hf_to_maxtext.sh
-
-# Deactivate the virtual environment
-deactivate
-rm -rf tpu_venv
+export MAXTEXT_CKPT_PATH=<CKPT_PATH> # e.g., gs://my-bucket/my-model-checkpoint/0/items
 ```
 
+> **Note:** Converting the 30B model requires approximately 62 GB of free disk space to download its safetensors. Please verify you have sufficient space before running the conversion script.
+
 ## Run RL Workload
+
+### Build and Upload MaxText Docker Image
+
+For instructions on building and uploading the MaxText Docker image with post-training dependencies, please refer to the [official documentation](../../build_maxtext.md).
 
 ### Submit your workload
 
 ```bash
-# Create and activate a virtual environment
-uv venv --python 3.12 --seed runner_venv
-source runner_venv/bin/activate
-uv pip install -e .[runner] --resolution=lowest
+# The Docker image you pushed in the previous step
+export CLOUD_IMAGE_NAME=<IMAGE_NAME>
+export DOCKER_IMAGE="gcr.io/${PROJECT_ID?}/${CLOUD_IMAGE_NAME?}"
 
 # Run the RL training script on your cluster
-bash scripts/run_qwen3_30b_rl.sh
-
-# Deactivate the virtual environment
-deactivate
-rm -rf runner_venv
+run_tutorial maxtext/trainers/post_train/rl/scripts/run_qwen3_30b_rl.sh
 ```
 
 ### Monitor your workload
@@ -143,20 +113,26 @@ kubectl logs -f <POD_NAME>
 
 Alternatively, after running the bash script, you will also get a link to the Google Cloud Console to view your workload logs. Follow the link to view logs and monitor your workload's progress in the Cloud Console.
 
+### Monitor RL Metrics
+
+During RL training, you can monitor key metrics to track model convergence, reward trends, and hardware performance.
+
+To enable Tunix-managed metrics measurement, set `enable_tunix_perf_metrics` to `true` in RL configurations. Note that this flag is already set to `True` by default for this tutorial workload. When enabled, Tunix automatically collects and uploads these metrics to TensorBoard.
+
+For a complete list of collected metrics, see the [Tunix Metrics Documentation](https://tunix.readthedocs.io/en/latest/metrics.html). Key metrics to monitor include:
+
+- **Model Quality & Reward Metrics:**
+  - `rewards/mean`: The average reward across the batch (crucial for tracking learning progress).
+  - `score/mean`: The average raw score from the reward model before applying the KL penalty.
+- **Rollout & Generation Metrics:**
+  - `rollout_time`: How long each rollout step takes.
+  - `completions/mean_length`: The average token length of generated completions.
+  - `actor_dequeue_time`: The time spent waiting for data from the rollout workers (relevant when async rollout is enabled).
+- **Performance & Efficiency Metrics:**
+  - `step_time_sec`: The execution time for a single training step.
+
 ## Convert Checkpoint to Hugging Face Format
 
-After training, you may want to convert your MaxText checkpoint back to Hugging Face format. Use the following script to perform the conversion:
+## Convert Checkpoint to Hugging Face Format
 
-```bash
-# Create and activate a virtual environment
-uv venv --python 3.12 --seed tpu_venv
-source tpu_venv/bin/activate
-uv pip install -e .[tpu] --resolution=lowest
-
-# Run the conversion script to convert the MaxText checkpoint back to Hugging Face format 
-bash scripts/run_qwen3_30b_maxtext_to_hf.sh
-
-# Deactivate the virtual environment
-deactivate
-rm -rf tpu_venv
-```
+Refer to [MaxText to Hugging Face](maxtext-to-hf) to convert a MaxText checkpoint back to Hugging Face format. You can find an example script to convert `qwen3-30b-a3b-base`model to Hugging Face format [here](https://github.com/AI-Hypercomputer/maxtext/blob/main/tests/end_to_end/tpu/qwen3/30b/test_qwen3_to_hf.sh).

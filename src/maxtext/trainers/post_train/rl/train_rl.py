@@ -17,7 +17,7 @@ RL Trainer
 
 This module provides a unified `rl_train` function that consolidates the common
 RL training logic. It handles model loading, reward function setup, dataset
-processing, and training orchestration. By default, we run Group Relative Policy Optimization (GRPO) on 
+processing, and training orchestration. By default, we run Group Relative Policy Optimization (GRPO) on
 GSM8K math reasoning benchmark. The script is also flexible enough to run Group Sequence Policy Optimization (GSPO).
 
 Usage Examples:
@@ -46,7 +46,7 @@ python3 -m maxtext.trainers.post_train.rl.train_rl src/maxtext/configs/post_trai
 from __future__ import annotations
 import contextlib
 from functools import wraps
-from typing import Any, Optional, Sequence
+from typing import Any, Callable, Optional, Sequence
 
 import datasets
 import grain
@@ -64,6 +64,9 @@ from flax import nnx
 from orbax import checkpoint as ocp
 from pprint import pprint
 from transformers import AutoTokenizer
+import maxtext.integration.vllm.maxtext_vllm_adapter as adapter
+
+adapter.register()
 import functools
 from tunix.rl import rl_cluster as rl_cluster_lib
 from tunix.rl.rollout import base_rollout
@@ -91,6 +94,8 @@ def _tpu_inference_compat_patches():
   """
   orig_wsc = jax.lax.with_sharding_constraint
   orig_apply_dtype_cast = tunix_utils._apply_dtype_cast  # pylint: disable=protected-access
+  orig_bulk = tunix_utils._bulk_align_and_unstack  # pylint: disable=protected-access
+  orig_unstack = tunix_utils._unstack_scanned_param  # pylint: disable=protected-access
 
   def _compat_wsc(x, shardings):
     try:
@@ -103,18 +108,35 @@ def _tpu_inference_compat_patches():
       return val
     return orig_apply_dtype_cast(val, tgt_dtype, src_key)
 
+  def _compat_bulk(arr, scan_axis, per_layer, key_path):
+    if hasattr(arr, "shape") and len(arr.shape) <= scan_axis:
+      scan_axis = len(arr.shape) - 1 if len(arr.shape) > 0 else 0
+    return orig_bulk(arr, scan_axis, per_layer, key_path)
+
+  def _compat_unstack(src_val, tgt_val, key_path, scan_axis=None):
+    if scan_axis is not None and hasattr(src_val, "shape") and len(src_val.shape) <= scan_axis:
+      scan_axis = len(src_val.shape) - 1 if len(src_val.shape) > 0 else 0
+    res = orig_unstack(src_val, tgt_val, key_path, scan_axis=scan_axis)
+    if isinstance(res, tuple) and len(res) == 1 and hasattr(src_val, "shape") and src_val.shape == tgt_val.shape:
+      return res * 256
+    return res
+
   jax.lax.with_sharding_constraint = _compat_wsc
   tunix_utils._apply_dtype_cast = _no_bf16_to_f32_cast  # pylint: disable=protected-access
+  tunix_utils._bulk_align_and_unstack = _compat_bulk  # pylint: disable=protected-access
+  tunix_utils._unstack_scanned_param = _compat_unstack  # pylint: disable=protected-access
   try:
     yield
   finally:
     jax.lax.with_sharding_constraint = orig_wsc
     tunix_utils._apply_dtype_cast = orig_apply_dtype_cast  # pylint: disable=protected-access
+    tunix_utils._bulk_align_and_unstack = orig_bulk  # pylint: disable=protected-access
+    tunix_utils._unstack_scanned_param = orig_unstack  # pylint: disable=protected-access
 
 
 os.environ["TOKENIZERS_PARALLELISM"] = "0"
 
-from maxtext.configs import pyconfig
+from maxtext.configs import pyconfig, types
 from maxtext.utils.globals import MAXTEXT_CONFIGS_DIR
 from maxtext.integration.vllm.maxtext_vllm_rollout import MaxTextVllmRollout
 from maxtext.trainers.post_train.rl.evaluate_rl import evaluate
@@ -131,14 +153,14 @@ def get_dataset(
 ) -> grain.MapDataset:
   """Download data"""
   if data_files is None:
-    data = datasets.load_dataset(dataset_name, name=tmvp_config.hf_name, split=split)
+    data = datasets.load_dataset(dataset_name, name=tmvp_config.hf_subset, split=split)
   else:  # data_files have been provided, useful for using slices of large datasets like nvidia/OpenMathInstruct-2
     data = datasets.load_dataset(
         "parquet",
         data_files={split: data_files},
         split=split,
     )
-  if tmvp_config.debug.rl:
+  if tmvp_config.debug:
     max_logging.log(f"Loaded Hugging Face dataset {dataset_name} with split {split}. Size: {len(data)}")
 
   return data
@@ -204,16 +226,6 @@ def get_rollout_kwargs_for_parallelism(sampler_config, num_sampler_devices):
   return rollout_kwargs
 
 
-def get_max_train_steps(trainer_config):
-  """Calculate the total number of training steps."""
-  return int(
-      trainer_config.num_batches
-      * trainer_config.rl.num_iterations
-      * trainer_config.train_fraction
-      * trainer_config.num_epoch
-  )
-
-
 def prepare_train_and_eval_dataset(
     trainer_config: Any,
     test_size: float = 0.05,
@@ -248,10 +260,10 @@ def prepare_datasets(
     model_tokenizer: AutoTokenizer,
 ) -> tuple[grain.IterDataset, grain.IterDataset | None]:
   """Setup and return train and test datasets."""
-  template_config = load_data_template_from_file(trainer_config.chat_template_path)
+  template_config = load_data_template_from_file(trainer_config.data_template_path)
   if template_config is None:
     raise ValueError(
-        f"Chat template is required for processing dataset but failed to load from {trainer_config.chat_template_path}"
+        f"Data template is required for processing dataset but failed to load from {trainer_config.data_template_path}"
     )
 
   # Optional user-provided `process_data(dataset_name, tokenizer, template, config, x) -> dict`.
@@ -339,7 +351,7 @@ def prepare_datasets(
   dataset_size = int(trainer_config.num_batches * trainer_config.batch_size * trainer_config.train_fraction)
   train_dataset = train_dataset[:dataset_size]
   train_dataset = train_dataset.repeat(trainer_config.num_epoch)
-  train_dataset = train_dataset.to_iter_dataset().batch(trainer_config.batch_size)
+  train_dataset = train_dataset.to_iter_dataset().batch(trainer_config.batch_size, drop_remainder=True)
 
   if trainer_config.num_test_batches > 0:
     # eval_batch_size = -1 (default) → use trainer_config.batch_size (legacy
@@ -358,12 +370,37 @@ def prepare_datasets(
     test_dataset = test_dataset[
         trainer_config.test_batch_start_index : trainer_config.num_test_batches * eval_batch_size_for_eval
     ]
-    test_dataset = test_dataset.to_iter_dataset().batch(eval_batch_size_for_eval)
+    test_dataset = test_dataset.to_iter_dataset().batch(eval_batch_size_for_eval, drop_remainder=True)
 
   return train_dataset, test_dataset
 
 
-def create_rl_components(
+def build_reward_fns(trainer_config: Any, make_reward_fn: Callable) -> list:
+  """Build the reward-function stack for the RL trainer.
+
+  `reward_functions_path` is a filesystem path to a Python file and
+  `reward_functions` is a comma-separated list of function names to import from
+  it. When both are set, the built-in stack is REPLACED entirely by the
+  user-provided callables (so users have full control over their reward stack).
+  Otherwise the default
+  (`match_format_exactly`, `match_format_approximately`, `check_numbers`) stack
+  is used. Every reward function is wrapped via `make_reward_fn`.
+  """
+  custom_rewards_path = getattr(trainer_config, "reward_functions_path", "") or ""
+  custom_rewards_names = getattr(trainer_config, "reward_functions", "") or ""
+  if custom_rewards_path and custom_rewards_names:
+    names = [n.strip() for n in custom_rewards_names.split(",") if n.strip()]
+    reward_fns = [make_reward_fn(utils_rl.load_custom_callable(custom_rewards_path, n)) for n in names]
+    max_logging.log(f"reward_fns: using {len(reward_fns)} custom reward function(s) {names} from {custom_rewards_path}")
+    return reward_fns
+  return [
+      make_reward_fn(utils_rl.match_format_exactly),
+      make_reward_fn(utils_rl.match_format_approximately),
+      make_reward_fn(utils_rl.check_numbers),
+  ]
+
+
+def create_rl_components(  # pylint: disable=too-many-positional-arguments
     trainer_config,
     sampler_config,
     sampler_devices,
@@ -373,11 +410,10 @@ def create_rl_components(
     reference_mesh,
     rollout_mesh,
     model_tokenizer,
-    max_train_steps,
 ):
   """Setup RL cluster, trainer, and optimizer."""
   # Setup optimizer
-  optimizer = utils_rl.get_optimizer(trainer_config, max_train_steps)
+  optimizer = utils_rl.get_optimizer(trainer_config)
 
   # Setup checkpointing
   if trainer_config.enable_checkpointing:
@@ -423,7 +459,7 @@ def create_rl_components(
   # We need to parse vLLM config to get the logical axis rules for the sampler config.
   vllm_config_path = os.path.join(MAXTEXT_CONFIGS_DIR, "inference", "vllm.yml")
   argv_list = ["", str(vllm_config_path), "log_config=False"]
-  vllm_config = pyconfig.initialize(argv_list)
+  vllm_config = pyconfig.initialize(argv_list, config_class=types.RLConfig)
 
   rl_rollout_engine = (
       functools.partial(MaxTextVllmRollout, maxtext_config=trainer_config)
@@ -447,7 +483,7 @@ def create_rl_components(
       training_config=rl_cluster_lib.RLTrainingConfig(
           actor_optimizer=optimizer,
           eval_every_n_steps=trainer_config.eval_interval,
-          max_steps=max_train_steps,
+          max_steps=trainer_config.train_steps,
           mini_batch_size=trainer_config.batch_size,
           train_micro_batch_size=train_micro_batch_size,
           rollout_micro_batch_size=rollout_micro_batch_size,
@@ -480,7 +516,7 @@ def create_rl_components(
               "enable_expert_parallel": sampler_config.enable_expert_parallel,
               "enable_prefix_caching": True,  # Enable prefix caching to speed up generation for long prompts
               # Ensures vLLM model initializes with correct dtype (not float32 default)
-              "dtype": trainer_config.weight_dtype,
+              "dtype": trainer_config.weight_dtype.value,
           },
           rollout_vllm_sampling_kwargs={
               "stop": trainer_config.stop_strings,
@@ -526,11 +562,11 @@ def create_rl_components(
 
     return _reward_fn
 
-  reward_fns = [  # type: ignore
-      make_reward_fn(utils_rl.match_format_exactly),
-      make_reward_fn(utils_rl.match_format_approximately),
-      make_reward_fn(utils_rl.check_numbers),
-  ]
+  # Optional user-provided reward functions: when `reward_functions_path` and
+  # `reward_functions` are both set the built-in stack is replaced entirely by
+  # the user-provided callables. Each function must accept `prompts`,
+  # `completions`, `tmvp_config`, and `**kwargs` and return a list of floats.
+  reward_fns = build_reward_fns(trainer_config, make_reward_fn)
 
   # Create RL trainer
   max_logging.log("Setting up RL trainer...")
@@ -555,14 +591,13 @@ def create_rl_components(
         max_concurrency=trainer_config.rl.max_concurrency,
         off_policy_steps=trainer_config.rl.off_policy_steps,
         system_prompt=trainer_config.rl.system_prompt,
-        degenerate_group_masking=trainer_config.rl.degenerate_group_masking,
         epsilon_high=trainer_config.rl.epsilon_high,
     )
     # Instantiate the custom MaxText chat parser
-    template_config = load_data_template_from_file(trainer_config.chat_template_path)
+    template_config = load_data_template_from_file(trainer_config.data_template_path)
     if template_config is None:
       raise ValueError(
-          f"Chat template is required for AgenticGRPOLearner but failed to load from {trainer_config.chat_template_path}"
+          f"Data template is required for AgenticGRPOLearner but failed to load from {trainer_config.data_template_path}"
       )
     chat_parser = utils_rl.MaxTextChatParser(
         model_tokenizer=model_tokenizer, template_config=template_config, tmvp_config=trainer_config
@@ -593,6 +628,28 @@ def create_rl_components(
   return rl_cluster, rl_trainer, optimizer, reward_fns
 
 
+def configure_tokenizer_chat_template(model_tokenizer: Any, trainer_config: Any) -> None:
+  """Populates the tokenizer's chat_template from config if missing."""
+  if getattr(model_tokenizer, "chat_template", None) is None:
+    if getattr(trainer_config, "chat_template", None):
+      model_tokenizer.chat_template = trainer_config.chat_template
+    elif getattr(trainer_config, "chat_template_path", None):
+      from maxtext.input_pipeline.instruction_data_processing import (  # pylint: disable=import-outside-toplevel
+          load_chat_template_from_file,
+      )
+
+      model_tokenizer.chat_template = load_chat_template_from_file(trainer_config.chat_template_path)
+    else:
+      raise ValueError(
+          f"Tokenizer {getattr(trainer_config, 'tokenizer_path', None)!r} has no chat_template "
+          "and config.chat_template / config.chat_template_path "
+          "are both empty. Either pick an instruction-tuned tokenizer that "
+          "ships with a chat_template, set config.chat_template to a Jinja "
+          "string, or set config.chat_template_path to a JSON file "
+          "with a 'chat_template' key."
+      )
+
+
 def rl_train(argv: Sequence[str], kwargs: dict):
   """
   Run RL training with the provided configuration.
@@ -607,28 +664,13 @@ def rl_train(argv: Sequence[str], kwargs: dict):
     _rl_train_impl(argv, kwargs)
 
 
-def validate_config(config):
-  """Validates the configuration parameters for RL training."""
-  if config.optimizer_memory_host_offload:
-    raise ValueError(
-        "optimizer_memory_host_offload=True is not supported on the post-training "
-        "RL path because the underlying Tunix RLCluster/Trainer does not "
-        "support host offloading of the optimizer state."
-    )
-
-  if config.num_vocab_tiling > 1:
-    raise ValueError(
-        f"Vocab Tiling is not supported with RL. "
-        f"num_vocab_tiling was configured to {config.num_vocab_tiling}, but it must be 1 when running train_rl."
-    )
-
-
 def _rl_train_impl(argv: Sequence[str], kwargs: dict):
   """rl_train body — kept separate so _tpu_inference_compat_patches wraps it cleanly."""
   trainer_config, sampler_config, trainer_devices, sampler_devices = model_creation_utils.setup_configs_and_devices(
-      argv, kwargs
+      argv,
+      kwargs,
+      config_class=types.RLConfig,
   )
-  validate_config(trainer_config)
 
   # Create model tokenizer first so we can plumb its pad_id into the model
   # adapter (used to synthesize segment_ids that mask pad positions from
@@ -638,6 +680,7 @@ def _rl_train_impl(argv: Sequence[str], kwargs: dict):
       trainer_config.tokenizer_path,
       token=trainer_config.hf_access_token or None,
   )
+  configure_tokenizer_chat_template(model_tokenizer, trainer_config)
 
   reference_model, reference_mesh, actor_model, actor_mesh, rollout_mesh = model_creation_utils.create_models_and_meshes(
       trainer_config,
@@ -647,7 +690,7 @@ def _rl_train_impl(argv: Sequence[str], kwargs: dict):
       tokenizer_pad_id=model_tokenizer.pad_token_id,
   )
 
-  if not trainer_config.debug.rl:
+  if not trainer_config.debug:
     # Apply filter to suppress noisy logs
     noise_filter = max_logging.NoisyLogFilter()
     logging.getLogger().addFilter(noise_filter)
@@ -660,11 +703,9 @@ def _rl_train_impl(argv: Sequence[str], kwargs: dict):
   if not epath.Path(trainer_config.checkpoint_dir).exists():
     epath.Path(trainer_config.checkpoint_dir).mkdir(parents=True)
 
-  max_train_steps = get_max_train_steps(trainer_config)
-
   train_dataset, test_dataset = prepare_datasets(trainer_config, model_tokenizer)
 
-  if trainer_config.debug.rl:
+  if trainer_config.debug:
     max_logging.log("Train dataset samples:")
     for i, ele in enumerate(train_dataset):
       if i >= 5:
@@ -677,7 +718,7 @@ def _rl_train_impl(argv: Sequence[str], kwargs: dict):
           break
         pprint(ele)
 
-  if trainer_config.debug.rl:
+  if trainer_config.debug:
     max_logging.log("Reference Model initialized successfully")
     nnx.display(reference_model)
     max_logging.log(f"Reference mesh shape: {reference_mesh.shape}")
@@ -696,13 +737,17 @@ def _rl_train_impl(argv: Sequence[str], kwargs: dict):
       reference_mesh,
       rollout_mesh,
       model_tokenizer,
-      max_train_steps,
   )
 
   # Run evaluation before training
   if trainer_config.num_test_batches > 0:
-    # Update vllm with model parameters from checkpoint
-    rl_cluster.rollout.update_params(nnx.state(actor_model))
+    # Explicitly sync actor model weights to the rollout engine before Pre-RL evaluation.
+    # When resuming from an RL checkpoint (step > 0), the trainer restores RL checkpoint
+    # weights into actor_model after RLCluster initializes. Without this explicit sync,
+    # the rollout engine would evaluate using the base HuggingFace/SFT weights instead of
+    # the restored RL checkpoint weights. Calling this unconditionally ensures weight sync
+    # robustness across all initialization and restore workflows.
+    rl_cluster.rollout.update_params(nnx.state(actor_model, nnx.Param))
 
     (corr, total, accuracy, partial_accuracy, format_accuracy, mean_reward), _ = evaluate(
         trainer_config,

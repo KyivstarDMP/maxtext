@@ -203,7 +203,7 @@ class ModelBundle(nnx.Module):
     return self.student_model(*args, **kwargs)
 
   def call_teacher(self, *args, **kwargs):
-    return jax.lax.stop_gradient(self.teacher_model(*args, **kwargs))
+    return jax.lax.stop_gradient(self.teacher_model(*args, **kwargs))  # pyrefly: ignore[not-callable]
 
 
 class MaxTextDistillationTrainer(peft_trainer.PeftTrainer):
@@ -232,7 +232,7 @@ class MaxTextDistillationTrainer(peft_trainer.PeftTrainer):
     super().__init__(model=model, optimizer=dummy_optimizer, training_config=training_config, **kwargs)
 
     self.strategy = strategy
-    self.checkpoint_manager: distillation_utils.MaxTextCheckpointManager = None
+    self.checkpoint_manager: distillation_utils.MaxTextCheckpointManager = None  # pyrefly: ignore[bad-assignment]
 
     # Per-step per-device TFLOPs (constants for the run): student fwd+bwd + teacher fwd-only.
     (
@@ -276,7 +276,7 @@ class MaxTextDistillationTrainer(peft_trainer.PeftTrainer):
 
   # Inherits _shard_optimizer from PeftTrainer.
 
-  def _train_step(self, model, optimizer, inputs):
+  def _train_step(self, model, optimizer, inputs, grad_accumulator=None, **kwargs):  # pyrefly: ignore[bad-override]
     """Overrides the main JIT block to natively handle ModelBundle module.
 
     Uses jax.value_and_grad with explicit split/merge to avoid nesting
@@ -385,11 +385,12 @@ class MaxTextDistillationTrainer(peft_trainer.PeftTrainer):
           }
       )
     for name, value in tflops_metrics.items():
-      self.metrics_logger.log(self.metrics_prefix, name, value, self._mode, step)
+      self.metrics_logger.log(self.metrics_prefix, name, value, self._mode, step)  # pyrefly: ignore[missing-attribute]
 
     # Console summary — keep it tight; everything else is in TensorBoard.
     if tflops_per_sec is not None and self._mode == metrics_logger.Mode.TRAIN:
       max_logging.log(
+          # pyrefly: ignore[unsupported-operation]
           f"step {step} | step_time={step_time_delta:.2f}s | "
           f"TFLOPs/s/device: {tflops_per_sec:.2f} "
           f"(student={self._tflops_student / step_time_delta:.2f}, "
@@ -410,6 +411,9 @@ class MaxTextDistillationTrainer(peft_trainer.PeftTrainer):
     Returns:
       A new MaxTextTrainingInput containing the Teacher's outputs (logits).
     """
+    if hasattr(input_data, "microbatches"):
+      input_data.microbatches = [self._prepare_inputs(mb) for mb in input_data.microbatches]
+      return input_data
 
     # 3. Return extended object so fields are available for Student training step
     # pylint: disable=unexpected-keyword-arg
@@ -438,9 +442,12 @@ class MaxTextDistillationTrainer(peft_trainer.PeftTrainer):
 
     for name, value in aux.items():
       if name not in self._buffered_train_metrics.additional_metrics:
-        self._buffered_train_metrics.additional_metrics[name] = ([], distillation_utils.weighted_mean)
+        self._buffered_train_metrics.additional_metrics[name] = (  # pyrefly: ignore[unsupported-operation]
+            [],
+            distillation_utils.weighted_mean,
+        )  # pyrefly: ignore[unsupported-operation]
 
-      self._buffered_train_metrics.additional_metrics[name][0].append(value)
+      self._buffered_train_metrics.additional_metrics[name][0].append(value)  # pyrefly: ignore[bad-argument-type]
 
     # Compact per-step summary: only the metrics that change run-to-run, and
     # only those that are nonzero (so MoE / feature-distill terms hide when off).
@@ -518,7 +525,7 @@ class MaxTextDistillationTrainer(peft_trainer.PeftTrainer):
         raw_iterator=iterator_to_manage,
         root_directory=config.checkpoint_dir,
         student_config=config,  # Pass the config here
-        options=self.config.checkpointing_options,
+        options=self.config.checkpointing_options,  # pyrefly: ignore[bad-argument-type]
     )
 
     # 3. Restore Model & Optimizer State correctly via MaxTextCheckpointManager.

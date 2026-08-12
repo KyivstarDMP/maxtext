@@ -16,23 +16,11 @@
 # Source from https://github.com/vllm-project/tpu-inference/blob/main/tpu_inference/kernels/sparse_core/ragged_gather.py
 
 import functools
-
 import jax
 import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 from jax.experimental.pallas import tpu_sc as plsc
-from packaging.version import Version
-
-
-# JAX <= 0.10.0 used `out_shape`/`scratch_shapes` kwargs for `pl.kernel`; later
-# versions renamed them to `out_type`/`scratch_types`.
-if Version(jax.__version__) <= Version("0.10.0"):
-  _OUT_KW = "out_shape"
-  _SCRATCH_KW = "scratch_shapes"
-else:
-  _OUT_KW = "out_type"
-  _SCRATCH_KW = "scratch_types"
 
 
 def main_kernel(
@@ -41,6 +29,7 @@ def main_kernel(
     end_ref: jax.Ref,
     in_hbm_ref: jax.Ref,
     indices_hbm_ref: jax.Ref,
+    weights_hbm_ref: jax.Ref,
     # Outputs.
     out_hbm_ref: jax.Ref,
     # Scratch.
@@ -48,12 +37,14 @@ def main_kernel(
     end_vmem_ref: jax.Ref,
     out_vmem_ref: jax.Ref,
     indices_vmem_ref: jax.Ref,
+    weights_vmem_ref: jax.Ref,
     sem_ref: jax.Ref,
     *,
     core_axis_name: str,
     subcore_axis_name: str,
+    has_weights: bool,
 ):
-  """Core ragged gather operation"""
+  """Core ragged gather operation with per-row weighting."""
   tpu_info = pltpu.get_tpu_info()
   sc_info = tpu_info.sparse_core
   assert sc_info is not None
@@ -109,9 +100,16 @@ def main_kernel(
           indices_hbm_ref.at[pl.ds(row_tile_start, num_simd_lanes)],
           indices_vmem_ref,
       )
+      if has_weights:
+        pltpu.sync_copy(
+            weights_hbm_ref.at[pl.ds(row_tile_start, num_simd_lanes)],
+            weights_vmem_ref,
+        )
 
     # HBM to VMEM transfer.
     indices = indices_vmem_ref[...]
+    if has_weights:
+      weights = weights_vmem_ref[...]
 
     dtype = out_hbm_ref.dtype
     dtype_bits = jax.dtypes.itemsize_bits(dtype)
@@ -123,8 +121,8 @@ def main_kernel(
     # but for other bitwidths, this is not possible. Therefore, we bitcast data
     # into 32-bits first to fetch packing number of rows per dma and later
     # perform bitwise unpacking / packing to obtain desired results.
-    in_32b_hbm_ref = in_hbm_ref.bitcast(jnp.uint32)
-    out_32b_hbm_ref = out_hbm_ref.bitcast(jnp.uint32)
+    in_32b_hbm_ref = in_hbm_ref.bitcast(jnp.uint32)  # pyrefly: ignore[missing-attribute]
+    out_32b_hbm_ref = out_hbm_ref.bitcast(jnp.uint32)  # pyrefly: ignore[missing-attribute]
 
     for col_vmem_start in range(0, col_size, num_lanes):
       col_hbm_start = col_tile_start + col_vmem_start
@@ -189,6 +187,50 @@ def main_kernel(
               row_dst = row_src // packing
               out_vmem_ref[row_dst, col_slice] = out
 
+      # Apply per-row weights after unpacking if needed.
+      # For packing == 1 (float32), we can apply directly.
+      # For packing > 1 (bf16), the data is already packed; we apply below.
+      if has_weights:
+        if packing == 1:
+          # float32 path: data is already in float32 layout, one row per sublane.
+          for col_compute_offset in range(0, num_lanes, num_simd_lanes):
+            col_slice = pl.ds(col_vmem_start + col_compute_offset, num_simd_lanes)
+            for row_vmem in range(num_simd_lanes):
+              data = out_vmem_ref[row_vmem, col_slice]
+              data_f32 = jax.lax.bitcast_convert_type(data, jnp.float32)
+              data_f32 = data_f32 * weights[row_vmem]
+              out_vmem_ref[row_vmem, col_slice] = jax.lax.bitcast_convert_type(data_f32, jnp.uint32)
+        else:
+          # bf16 path: data is packed, packing=2. Each packed row contains 2
+          # bf16 values from consecutive source rows. We need to unpack each
+          # bf16 to float32, multiply by its weight, then repack.
+          for col_compute_offset in range(0, num_lanes, num_simd_lanes):
+            col_slice = pl.ds(col_vmem_start + col_compute_offset, num_simd_lanes)
+            for row_dst in range(num_simd_lanes // packing):
+              packed_data = out_vmem_ref[row_dst, col_slice]
+              result = jnp.zeros_like(packed_data)
+              for sub in range(packing):
+                row_src = row_dst * packing + sub
+                # Extract the sub-element.
+                shift_right = sub * dtype_bits
+                shift_left = sub * dtype_bits
+                elem = jnp.bitwise_right_shift(packed_data, shift_right)
+                elem = jnp.bitwise_and(elem, 2**dtype_bits - 1)
+                # Convert bf16 bits to float32 for weighting.
+                # bf16 is stored in the lower 16 bits; shift to upper 16 for
+                # bitcast to float32.
+                elem_f32 = jnp.bitwise_left_shift(elem, 16)
+                elem_f32 = jax.lax.bitcast_convert_type(elem_f32, jnp.float32)
+                elem_f32 = elem_f32 * weights[row_src]
+                # Convert back: bitcast float32 -> uint32, shift right 16 to
+                # get bf16 bits, then shift left to target position.
+                elem_u32 = jax.lax.bitcast_convert_type(elem_f32, jnp.uint32)
+                elem_bf16 = jnp.bitwise_right_shift(elem_u32, 16)
+                elem_bf16 = jnp.bitwise_and(elem_bf16, 2**dtype_bits - 1)
+                elem_bf16 = jnp.bitwise_left_shift(elem_bf16, shift_left)
+                result = jnp.bitwise_or(result, elem_bf16)
+              out_vmem_ref[row_dst, col_slice] = result
+
       # Start dma write.
       for row_vmem in range(num_simd_lanes // packing):
         row_hbm = row_tile_start // packing + row_vmem
@@ -208,6 +250,74 @@ def main_kernel(
         ).wait()
 
   inner_kernel()
+
+
+def get_cost_estimate(
+    out_size: int,
+    hidden_size: int,
+    dtype_bytes: int,
+    has_weights: bool,
+    flops_override: int = -1,
+    bytes_accessed_override: int = -1,
+) -> pl.CostEstimate:
+  """Returns a cost estimate for the ragged gather kernel.
+
+  The ragged gather is primarily a data-movement kernel: it gathers rows from
+  an input table according to an index array.  When ``has_weights`` is True an
+  additional element-wise multiply is performed.
+
+  Args:
+    out_size: Number of output rows (after padding).
+    hidden_size: Number of columns in the input / output.
+    dtype_bytes: Size of one element in bytes (e.g. 2 for bf16, 4 for f32).
+    has_weights: Whether per-row weighting is applied.
+    flops_override: If > 0, use this value as the flop count instead of
+      auto-computing.  -1 (default) means auto-compute.
+    bytes_accessed_override: If > 0, use this value as bytes_accessed instead
+      of auto-computing.  -1 (default) means auto-compute.
+    use_single_sparsecore: Static bool flag. When True, launch the kernel
+      on 1 SparseCore instead of all SparseCores.
+
+  Returns:
+    A ``pl.CostEstimate`` suitable for XLA scheduling.
+  """
+  # Flops: one multiply per element when weighting is enabled.
+  if flops_override > 0:
+    flops = flops_override
+  else:
+    flops = out_size * hidden_size if has_weights else 0
+
+  if bytes_accessed_override > 0:
+    bytes_accessed = bytes_accessed_override
+  else:
+    # Bytes accessed:
+    #   read  – gathered input rows + indices (int32) + optional weights (f32)
+    #   write – output rows
+    bytes_in = out_size * hidden_size * dtype_bytes  # input rows read
+    bytes_in += out_size * 4  # indices (int32)
+    if has_weights:
+      bytes_in += out_size * 4  # weights (float32)
+    bytes_out = out_size * hidden_size * dtype_bytes  # output rows written
+    bytes_accessed = bytes_in + bytes_out
+
+  return pl.CostEstimate(
+      flops=flops,
+      bytes_accessed=bytes_accessed,
+      transcendentals=0,
+  )
+
+
+def _fallback_implementation(
+    x: jax.Array,
+    indices: jax.Array,
+    weights: jax.Array | None = None,
+    has_weights: bool = False,
+) -> jax.Array:
+  """Fallback to (non-ragged) JAX implementation for ragged gather."""
+  out = x[indices]
+  if has_weights:
+    out = out * weights[:, None]  # pyrefly: ignore[unsupported-operation]
+  return out
 
 
 def calculate_col_size(hidden_size: int) -> int:
@@ -234,9 +344,53 @@ def calculate_col_size(hidden_size: int) -> int:
   return pl.cdiv(hidden_size, (num_cols * num_lanes)) * num_lanes
 
 
-@jax.jit
-def ragged_gather(x: jax.Array, indices: jax.Array, start: jax.Array, end: jax.Array) -> jax.Array:
-  """Perform gather on indices within dynamic array start and end."""
+@functools.partial(
+    jax.jit,
+    static_argnames=(
+        "has_weights",
+        "enforce_fallback",
+        "flops_override",
+        "bytes_accessed_override",
+        "use_single_sparsecore",
+    ),
+)
+def ragged_gather(
+    x: jax.Array,
+    indices: jax.Array,
+    start: jax.Array,
+    end: jax.Array,
+    weights: jax.Array | None = None,
+    has_weights: bool = False,
+    enforce_fallback: bool = False,
+    flops_override: int = -1,
+    bytes_accessed_override: int = -1,
+    use_single_sparsecore: bool = False,
+) -> jax.Array:
+  """Perform gather on indices within dynamic array start and end.
+
+  Args:
+    x: 2D input array of shape ``(input_size, hidden_size)``.
+    indices: 1D array of gather indices.
+    start: Scalar or 1D array indicating the start of the valid range.
+    end: Scalar or 1D array indicating the end of the valid range.
+    weights: Optional 1D array of per-row weights. When provided, each
+      gathered row is multiplied by its corresponding weight inside the
+      kernel, avoiding an extra HBM read-write pass.
+    has_weights: Static bool flag indicating whether ``weights`` should be
+      applied. Must be ``True`` when ``weights`` is not ``None``.
+    enforce_fallback: Static bool flag. When ``True``, unconditionally use the
+      JAX reference implementation instead of the SparseCore kernel.
+      When ``False`` (default), use the SparseCore kernel and raise any error.
+    flops_override: If > 0, use this value as the flop count instead of
+      auto-computing.  -1 (default) means auto-compute.
+    bytes_accessed_override: If > 0, use this value as bytes_accessed instead
+      of auto-computing.  -1 (default) means auto-compute.
+    use_single_sparsecore: Static bool flag. When True, launch the kernel
+      on 1 SparseCore instead of all SparseCores.
+
+  Returns:
+    Gathered output of shape ``(indices_size, hidden_size)``.
+  """
 
   assert x.ndim == 2, "Ragged gather only supports 2d inputs."
   assert indices.ndim == 1, "Ragged gather only supports 1d indices."
@@ -254,16 +408,22 @@ def ragged_gather(x: jax.Array, indices: jax.Array, start: jax.Array, end: jax.A
 
   dtype = x.dtype
 
+  # Guard against eager initialization on non-TPU hardware (e.g. during CPU tests).
+  # pltpu.get_tpu_info() expects TPU hardware and will crash if executed on CPU.
+  if enforce_fallback or jax.devices()[0].platform != "tpu":
+    return _fallback_implementation(x, indices, weights, has_weights)
+
   sc_info = pltpu.get_tpu_info().sparse_core
   if sc_info is None:
-    # Sparse core is not available. Fallback to regular gather.
-    return x[indices]
+    # Sparse core is not available. Use JAX reference.
+    return _fallback_implementation(x, indices, weights, has_weights)
 
   hidden_size = x.shape[-1]
   out_size = indices.size
 
   num_simd_lanes = sc_info.num_lanes
-  num_cores = sc_info.num_cores * sc_info.num_subcores
+  num_sc_cores = 1 if use_single_sparsecore else sc_info.num_cores
+  num_cores = num_sc_cores * sc_info.num_subcores
   block_size = num_simd_lanes * num_cores
   col_size = calculate_col_size(hidden_size)
 
@@ -271,10 +431,16 @@ def ragged_gather(x: jax.Array, indices: jax.Array, start: jax.Array, end: jax.A
   out_pad_size = pl.cdiv(out_size, block_size) * block_size - out_size
   indices = jnp.pad(indices, ((0, out_pad_size)))
 
+  if has_weights:
+    weights = jnp.pad(weights, ((0, out_pad_size)), constant_values=1.0)  # pyrefly: ignore[bad-argument-type]
+  else:
+    # Provide a dummy weights array; the kernel won't use it.
+    weights = jnp.ones((out_size + out_pad_size,), dtype=jnp.float32)
+
   aligned_hidden_size = pl.cdiv(hidden_size, col_size) * col_size
 
   vector_mesh = plsc.VectorSubcoreMesh(
-      num_cores=sc_info.num_cores,
+      num_cores=num_sc_cores,
       num_subcores=sc_info.num_subcores,
       core_axis_name="core",
       subcore_axis_name="subcore",
@@ -284,21 +450,30 @@ def ragged_gather(x: jax.Array, indices: jax.Array, start: jax.Array, end: jax.A
           main_kernel,
           core_axis_name=vector_mesh.core_axis_name,
           subcore_axis_name=vector_mesh.subcore_axis_name,
+          has_weights=has_weights,
       ),
+      out_type=jax.ShapeDtypeStruct((out_size + out_pad_size, aligned_hidden_size), dtype),
       compiler_params=pltpu.CompilerParams(
           use_tc_tiling_on_sc=True,
           disable_bounds_checks=True,
+          needs_layout_passes=False,
       ),
+      cost_estimate=get_cost_estimate(
+          out_size=out_size + out_pad_size,
+          hidden_size=aligned_hidden_size,
+          dtype_bytes=jax.dtypes.itemsize_bits(dtype) // 8,
+          has_weights=has_weights,
+          flops_override=flops_override,
+          bytes_accessed_override=bytes_accessed_override,
+      ),
+      scratch_types=[
+          pltpu.VMEM((num_simd_lanes,), jnp.int32),
+          pltpu.VMEM((num_simd_lanes,), jnp.int32),
+          pltpu.VMEM((num_simd_lanes, col_size), jnp.uint32),
+          pltpu.VMEM((num_simd_lanes,), jnp.int32),
+          pltpu.VMEM((num_simd_lanes,), jnp.float32),
+          pltpu.SemaphoreType.DMA((2,)),
+      ],
       mesh=vector_mesh,
       name="sc_ragged_gather",
-      **{
-          _OUT_KW: jax.ShapeDtypeStruct((out_size + out_pad_size, aligned_hidden_size), dtype),
-          _SCRATCH_KW: [
-              pltpu.VMEM((num_simd_lanes,), jnp.int32),
-              pltpu.VMEM((num_simd_lanes,), jnp.int32),
-              pltpu.VMEM((num_simd_lanes, col_size), jnp.uint32),
-              pltpu.VMEM((num_simd_lanes,), jnp.int32),
-              pltpu.SemaphoreType.DMA((2,)),
-          ],
-      },
-  )(start, end, x, indices)[:out_size, :hidden_size]
+  )(start, end, x, indices, weights)[:out_size, :hidden_size]

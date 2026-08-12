@@ -11,14 +11,15 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-""" Utils for MaxText NNX. """
+"""Utils for MaxText NNX."""
 
 from functools import partial
 from typing import Callable
 
 from flax import nnx
 import jax
-from jax.sharding import Mesh, NamedSharding
+import jax.numpy as jnp
+from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from maxtext.utils import max_logging
 from maxtext.configs import pyconfig
@@ -51,14 +52,18 @@ def create_nnx_rngs(
   return nnx.Rngs(params=rng_key)  # disable dropout RNG and aqt for inference
 
 
-def get_named_sharding_nnx(abstract_state: nnx.State) -> nnx.State:
+def nnx_extract_named_sharding(abstract_state: nnx.State) -> nnx.State:
   """Get named sharding from NNX abstract state.
 
   Args:
-    abstract_state: NNX model abstract state created from nnx.get_abstract_model.
+    abstract_state: NNX model abstract state created from
+      nnx.get_abstract_model.
 
   Returns:
-    named sharding structure
+    A tree of raw NamedSharding objects (stripping out any nnx.Variable / Param
+    wrappers). This clean structure is expected by JAX compiler APIs (like JIT
+    out_shardings). Contrast with sharding.nnx_construct_named_sharding, which
+    retains wrappers for abstract tree zipping compatibility.
   """
   # Don't use nnx.get_named_sharding() because it constructs new shardings. Instead, we
   # get the existing sharding from the abstract_state.
@@ -156,10 +161,10 @@ def create_nnx_sharded_model(
   if named_sharding is None:
     # The state leaf is of type jax.ShapeDtypeStruct(shape, dtype, sharding)
     # we get the sharding directly from it.
-    named_sharding = get_named_sharding_nnx(abstract_state)
+    named_sharding = nnx_extract_named_sharding(abstract_state)
 
   if mesh is None:
-    mesh = abstract_model.mesh
+    mesh = abstract_model.mesh  # pyrefly: ignore[missing-attribute]
 
   # JIT a function that creates the model state with proper sharding from the start.
   # By providing out_shardings, we instruct JAX to produce sharded output directly,
@@ -185,5 +190,97 @@ def nnx_ensure_scan_leading_axis(tree, length):
       new_val = jax.numpy.broadcast_to(val, (length,))
       return x.replace(value=new_val) if is_var else new_val
     return x
+
+  return jax.tree.map(_op, tree, is_leaf=lambda x: isinstance(x, nnx.Variable))
+
+
+# ------------------------------------------------------------------------------
+# Metadata Synchronization Helpers for NNX Variables
+# ------------------------------------------------------------------------------
+
+
+def nnx_update_sharding_meta(variable, transform_fn):
+  """Generic helper to apply a list transformation to all sharding-related metadata."""
+  if not (hasattr(variable, "get_metadata") and hasattr(variable, "replace")):
+    return variable
+
+  meta = variable.get_metadata()
+  updates = {}
+
+  for key in ["sharding", "out_sharding", "sharding_names"]:
+    if (val := meta.get(key)) and isinstance(val, (P, tuple, list)):
+      new_list = list(val)
+      transformed = transform_fn(new_list)
+      updates[key] = P(*transformed) if isinstance(val, P) else tuple(transformed)
+
+  if updates:
+    return variable.replace(**updates)
+  return variable
+
+
+def nnx_remove_scan_axis(tree, name="layers"):
+  """Removes the given scan axis from the PartitionSpec."""
+
+  def _op(x):
+    if not isinstance(x, nnx.Variable):
+      return x
+
+    # Scanned stacks record their own axis name, such as "dense_layers" or "moe_layers",
+    # so prefer it over the caller's default. Otherwise the name never matches and the
+    # check below strips a real logical axis instead of the scan axis.
+    axis_name = x.get_metadata().get(nnx.PARTITION_NAME, name)
+
+    def remove_fn(l):
+      removed = axis_name in l
+      if removed:
+        l.remove(axis_name)
+      if len(l) > x.get_value().ndim:
+        if removed:
+          raise ValueError(
+              f"Sharding names {l} still exceed value rank {x.get_value().ndim} after removing scan axis "
+              f"{axis_name!r}; the partition metadata is inconsistent."
+          )
+        raise ValueError(
+            f"Scan axis {axis_name!r} not found in sharding names {l} for a rank-{x.get_value().ndim} value; "
+            "the partition metadata is inconsistent."
+        )
+      return l
+
+    return nnx_update_sharding_meta(x, remove_fn)
+
+  return jax.tree.map(_op, tree, is_leaf=lambda x: isinstance(x, nnx.Variable))
+
+
+def nnx_add_and_sync_scan_axis(tree, name="layers", pos=0):
+  """Restores the scan axis on each variable's value and sharding metadata.
+
+  jax.lax.scan stacks its outputs with the scan axis at position 0. For each
+  variable this moves that axis to the variable's own param_scan_axis (falling
+  back to pos when the metadata is absent) and inserts the matching axis name at
+  the same position, so the value and its sharding metadata stay aligned.
+  """
+
+  def _op(x):
+    if not isinstance(x, nnx.Variable):
+      return x
+
+    axis_name = x.get_metadata().get(nnx.PARTITION_NAME, name)
+    target = x.get_metadata().get("param_scan_axis", pos)
+
+    val = x.get_value()
+    if target != 0 and hasattr(val, "ndim") and val.ndim > target:
+      x = x.replace(value=jnp.moveaxis(val, 0, target))
+
+    def add_fn(l):
+      if axis_name not in l:
+        while len(l) < x.get_value().ndim - 1:
+          l.append(None)
+        l.insert(target, axis_name)
+      else:
+        while len(l) < x.get_value().ndim:
+          l.append(None)
+      return l
+
+    return nnx_update_sharding_meta(x, add_fn)
 
   return jax.tree.map(_op, tree, is_leaf=lambda x: isinstance(x, nnx.Variable))

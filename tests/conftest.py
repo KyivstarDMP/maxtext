@@ -21,6 +21,7 @@ are not marked.
 """
 
 import pytest
+import sys
 import warnings
 
 warnings.filterwarnings(
@@ -32,6 +33,14 @@ warnings.filterwarnings(
 warnings.filterwarnings(
     "ignore", message="builtin type SwigPyObject has no __module__ attribute", category=DeprecationWarning
 )
+
+# Prevent libraries that use absl flags (e.g. tokamax) from lazily parsing sys.argv,
+# which would pick up pytest flags like `-v -m` and fail to parse them as integers.
+from absl import flags as _absl_flags
+
+if not _absl_flags.FLAGS.is_parsed():
+  _absl_flags.FLAGS(sys.argv[:1])
+
 import jax
 import os
 import importlib.util
@@ -106,6 +115,7 @@ if os.getenv("JAX_PLATFORMS") == "proxy":
   import maxtext  # pylint: disable=unused-import
 
 from maxtext.common.gcloud_stub import is_decoupled
+from tests.utils.newly_added_detection import get_changed_tests
 
 # Configure JAX to use unsafe_rbg PRNG implementation to match main scripts.
 if is_decoupled():
@@ -113,6 +123,7 @@ if is_decoupled():
 
 
 GCP_MARKERS = {"external_serving", "external_training"}
+HARDWARE_MARKERS = {"tpu_only", "gpu_only", "cpu_only"}
 
 
 def _has_tpu_backend_support() -> bool:
@@ -139,7 +150,17 @@ def pytest_collection_modifyitems(config, items):
   - Skip hardware-specific tests when hardware is missing.
   - Deselect tests marked as external_serving/training in decoupled mode.
   - Mark remaining tests with the `decoupled` marker when running decoupled.
+  - Mark tests without explicit hardware markers as `cpu_only`.
   """
+
+  changed_tests = get_changed_tests()  # set[(file_path, test_name)]
+  if changed_tests:
+    for item in items:
+      item_file = item.nodeid.split("::", 1)[0]
+      base_name = getattr(item, "originalname", item.name)
+      if (item_file, base_name) in changed_tests or (item_file, item.name) in changed_tests:
+        item.add_marker(pytest.mark.newly_added)
+
   decoupled = is_decoupled()
   remaining = []
   deselected = []
@@ -178,6 +199,12 @@ def pytest_collection_modifyitems(config, items):
     for item in remaining:
       item.add_marker(pytest.mark.decoupled)
 
+  # Auto-mark remaining tests as cpu_only unless explicitly marked with hardware target markers.
+  for item in remaining:
+    cur_test_markers = {m.name for m in item.iter_markers()}
+    if cur_test_markers.isdisjoint(HARDWARE_MARKERS):
+      item.add_marker(pytest.mark.cpu_only)
+
 
 def pytest_configure(config):
   """Registers custom pytest markers dynamically."""
@@ -190,6 +217,7 @@ def pytest_configure(config):
       "external_training: goodput integrations",
       "decoupled: marked on tests that are not skipped due to GCP deps, when DECOUPLE_GCLOUD=TRUE",
       "skip_on_tpu7x: skip test if running on TPU7x platform",
+      "newly_added: newly introduced or modified tests in PRs, executed even if scheduled_only",
   ]:
     config.addinivalue_line("markers", m)
 
@@ -240,3 +268,9 @@ def handle_gpu_only(request):
       has_gpu = False
     if not has_gpu:
       pytest.skip("Skipped: requires GPU hardware, none detected")
+
+
+def pytest_runtest_setup(item):
+  """Hook to inject markers as properties into the test item."""
+  for marker in item.iter_markers():
+    item.user_properties.append(("marker", marker.name))

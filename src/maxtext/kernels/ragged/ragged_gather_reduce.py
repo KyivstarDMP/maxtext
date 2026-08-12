@@ -22,30 +22,66 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 from jax.experimental.pallas import tpu_sc as plsc
 import jax.numpy as jnp
-from packaging.version import Version
-
-# JAX <= 0.10.0 used `out_shape`/`scratch_shapes` kwargs for `pl.kernel`; later
-# versions renamed them to `out_type`/`scratch_types`.
-if Version(jax.__version__) <= Version("0.10.0"):
-  _OUT_KW = "out_shape"
-  _SCRATCH_KW = "scratch_shapes"
-  _COMPILER_PARAMS = {
-      "use_tc_tiling_on_sc": True,
-      "disable_bounds_checks": True,
-  }
-else:
-  _OUT_KW = "out_type"
-  _SCRATCH_KW = "scratch_types"
-  _COMPILER_PARAMS = {
-      "use_tc_tiling_on_sc": True,
-      "disable_bounds_checks": True,
-      "needs_layout_passes": False,
-  }
 
 
 # ceil up to the nearest multiple of b.
 def _align_to(a, b):
   return ((a + b - 1) // b) * b
+
+
+def get_cost_estimate(
+    padded_input_size: int,
+    aligned_hidden_size: int,
+    reduce_group_size: int,
+    input_dtype_bytes: int,
+    bytes_accessed_override: int = -1,
+    flops_override: int = -1,
+) -> pl.CostEstimate:
+  """Returns a cost estimate for the ragged gather-reduce kernel.
+
+  The kernel gathers rows, multiplies each by a scalar weight, and reduces
+  (sums) every ``reduce_group_size`` rows into one output row.
+
+  Args:
+    padded_input_size: Total number of source rows (after padding).
+    aligned_hidden_size: Number of columns (after alignment).
+    reduce_group_size: Number of source rows reduced into each output row.
+    input_dtype_bytes: Size of one input element in bytes.
+    bytes_accessed_override: If > 0, use this value as bytes_accessed instead
+      of auto-computing.  -1 (default) means auto-compute.
+    flops_override: If > 0, use this value as the flop count instead of
+      auto-computing.  -1 (default) means auto-compute.
+
+  Returns:
+    A ``pl.CostEstimate`` suitable for XLA scheduling.
+  """
+  # Flops:
+  #   - one multiply per element for weighting: padded_input_size * aligned_hidden_size
+  #   - one add per element for reduction:       padded_input_size * aligned_hidden_size
+  if flops_override > 0:
+    flops = flops_override
+  else:
+    flops = 2 * padded_input_size * aligned_hidden_size
+
+  if bytes_accessed_override > 0:
+    bytes_accessed = bytes_accessed_override
+  else:
+    # Bytes accessed:
+    #   read  – input rows + src_indices (int32) + dst_indices (int32) + topk_weights (f32)
+    #   write – output rows (float32)
+    bytes_in = padded_input_size * aligned_hidden_size * input_dtype_bytes  # input rows
+    bytes_in += padded_input_size * 4  # src_indices (int32)
+    bytes_in += padded_input_size * 4  # dst_indices (int32)
+    bytes_in += padded_input_size * 4  # topk_weights (float32)
+    output_rows = padded_input_size // reduce_group_size
+    bytes_out = output_rows * aligned_hidden_size * 4  # output rows (float32)
+    bytes_accessed = bytes_in + bytes_out
+
+  return pl.CostEstimate(
+      flops=flops,
+      bytes_accessed=bytes_accessed,
+      transcendentals=0,
+  )
 
 
 def _fallback_implementation(
@@ -172,8 +208,8 @@ def main_kernel(
       input_dtype_bits = jax.dtypes.itemsize_bits(in_dtype)
       input_packing = 32 // input_dtype_bits
 
-      in_32b_hbm_ref = in_hbm_ref.bitcast(jnp.uint32)
-      out_32b_hbm_ref = out_hbm_ref.bitcast(jnp.uint32)
+      in_32b_hbm_ref = in_hbm_ref.bitcast(jnp.uint32)  # pyrefly: ignore[missing-attribute]
+      out_32b_hbm_ref = out_hbm_ref.bitcast(jnp.uint32)  # pyrefly: ignore[missing-attribute]
 
       for col_vmem_start in range(0, col_size, num_lanes):
         col_hbm_start = col_start + col_vmem_start
@@ -373,13 +409,26 @@ def _preprocess(
   )
 
 
-@functools.partial(jax.jit, static_argnames=("reduce_group_size",))
+@functools.partial(
+    jax.jit,
+    static_argnames=(
+        "reduce_group_size",
+        "enforce_fallback",
+        "flops_override",
+        "bytes_accessed_override",
+        "use_single_sparsecore",
+    ),
+)
 def ragged_gather_reduce(
     x: jax.Array,
     indices: jax.Array,
     topk_weights: jax.Array,
     valid_rows_mask: jax.Array,
     reduce_group_size: int,
+    enforce_fallback: bool = False,
+    flops_override: int = -1,
+    bytes_accessed_override: int = -1,
+    use_single_sparsecore: bool = False,
 ) -> jax.Array:
   """Gathers `x` according to `indices`, applies weights and masks, and reduces.
 
@@ -402,6 +451,9 @@ def ragged_gather_reduce(
       valid, with shape `(input_size,)`.
     reduce_group_size: An integer representing the number of consecutive rows to
       reduce (sum) together.
+    enforce_fallback: Static bool flag. When ``True``, unconditionally use the
+      JAX reference implementation instead of the SparseCore kernel.
+      When ``False`` (default), use the SparseCore kernel and raise any error.
 
   Returns:
     A 2D JAX array of reduced data with shape
@@ -413,37 +465,40 @@ def ragged_gather_reduce(
   assert topk_weights.ndim == 1, "ragged_gather_reduce only supports 1d topk_weights."
   assert valid_rows_mask.ndim == 1, "ragged_gather_reduce only supports 1d valid_rows_mask."
 
+  # Guard against eager initialization on non-TPU hardware (e.g. during CPU tests).
+  # pltpu.get_tpu_info() expects TPU hardware and will crash if executed on CPU.
+  if enforce_fallback or jax.devices()[0].platform != "tpu":
+    return _fallback_implementation(x, indices, topk_weights, valid_rows_mask, reduce_group_size)
+
   sc_info = pltpu.get_tpu_info().sparse_core
   if sc_info is None:
+    # Sparse core is not available. Use JAX reference.
     return _fallback_implementation(x, indices, topk_weights, valid_rows_mask, reduce_group_size)
 
   # Heuristic threshold on whether to fallback for small inputs.
   dtype = x.dtype
   dtype_bytes = jax.dtypes.itemsize_bits(dtype) // 8
-  if jnp.size(x) * dtype_bytes * 2 < pltpu.get_tpu_info().vmem_capacity_bytes * 0.6:
-    # For small {input + output}, it's likely that both can be put in TC VMEM,
-    # so it's likely faster to run TC-based implementation on it than going
-    # through SC, without data movement to/from HBM.
-    return _fallback_implementation(x, indices, topk_weights, valid_rows_mask, reduce_group_size)
 
   hidden_size = x.shape[-1]
   input_size = indices.size
   num_simd_lanes = sc_info.num_lanes
-  num_cores = sc_info.num_cores * sc_info.num_subcores
+  num_sc_cores = 1 if use_single_sparsecore else sc_info.num_cores
+  num_cores = num_sc_cores * sc_info.num_subcores
 
-  # This kernel partitions the output's columns into `num_column_partitions` and
-  # partition the output's rows into `num_row_partitions` and run each
+  # This kernel partitions the output's columns into `num_column_partitions`
+  # and partition the output's rows into `num_row_partitions` and run each
   # {row_partition} x {column_partition} combination on a separate SC subcore
-  # for parallelism. With such work partitioning, we guarantee that there won't
-  # be write collision (from different subcores) to the any output row X column.
+  # for parallelism. With such work partitioning, we guarantee that there
+  # won't be write collision (from different subcores) to any output row X
+  # column.
   #
   # Each column partition should be multiple of 128 (number of lanes) due to
   # DMA requirements. Unless requiring padding on the column dimension, larger
   # column partitions (thus smaller row partitions given fixed num_cores) is
   # more preferable because large row partition may lead to imbalanced load
   # (valid_rows_mask may have more rows in some partitions than others).
-  # Most LLM's hidden size is multiple of 1024, `num_column_partitions=8` should
-  # work well in practice without requiring padding on the column size.
+  # Most LLM's hidden size is multiple of 1024, `num_column_partitions=8`
+  # should work well in practice without requiring padding on the column size.
   num_column_partitions = 8
   assert num_cores % num_column_partitions == 0
   num_rows_partitions = num_cores // num_column_partitions
@@ -482,13 +537,13 @@ def ragged_gather_reduce(
   )
 
   vector_mesh = plsc.VectorSubcoreMesh(
-      num_cores=sc_info.num_cores,
+      num_cores=num_sc_cores,
       num_subcores=sc_info.num_subcores,
       core_axis_name="core",
       subcore_axis_name="subcore",
   )
-  # Each output row from `main_kernel` will be of type float32, and then casted
-  # to the input dtype when doing the filter operation.
+  # Each output row from `main_kernel` will be of type float32, and then
+  # casted to the input dtype when doing the filter operation.
   out = pl.kernel(  # pytype: disable=wrong-keyword-args
       functools.partial(
           main_kernel,
@@ -497,26 +552,34 @@ def ragged_gather_reduce(
           num_row_partitions=num_rows_partitions,
           num_column_partitions=num_column_partitions,
       ),
-      compiler_params=pltpu.CompilerParams(  # pytype: disable=wrong-keyword-args
-          **_COMPILER_PARAMS,
+      out_type=jax.ShapeDtypeStruct(
+          (padded_input_size // reduce_group_size, aligned_hidden_size),
+          jnp.float32,
+      ),
+      compiler_params=pltpu.CompilerParams(
+          use_tc_tiling_on_sc=True,
+          disable_bounds_checks=True,
+          needs_layout_passes=False,
+      ),
+      cost_estimate=get_cost_estimate(
+          padded_input_size=padded_input_size,
+          aligned_hidden_size=aligned_hidden_size,
+          reduce_group_size=reduce_group_size,
+          input_dtype_bytes=dtype_bytes,
+          flops_override=flops_override,
+          bytes_accessed_override=bytes_accessed_override,
+      ),
+      scratch_types=dict(  # pylint: disable=use-dict-literal
+          num_rows_per_row_partition_vmem_ref=pltpu.VMEM((num_simd_lanes,), jnp.int32),
+          out_vmem_ref=pltpu.VMEM((num_simd_lanes, col_size), jnp.uint32),
+          prev_iter_last_row_vmem_ref=pltpu.VMEM((1, col_size), jnp.uint32),
+          src_indices_vmem_ref=pltpu.VMEM((num_simd_lanes,), jnp.int32),
+          dst_indices_vmem_ref=pltpu.VMEM((num_simd_lanes,), jnp.int32),
+          topk_weights_vmem_ref=pltpu.VMEM((num_simd_lanes,), jnp.float32),
+          sem_ref=pltpu.SemaphoreType.DMA((2,)),
       ),
       mesh=vector_mesh,
       name="sc_ragged_gather_reduce",
-      **{
-          _OUT_KW: jax.ShapeDtypeStruct(
-              (padded_input_size // reduce_group_size, aligned_hidden_size),
-              jnp.float32,
-          ),
-          _SCRATCH_KW: dict(  # pylint: disable=use-dict-literal
-              num_rows_per_row_partition_vmem_ref=pltpu.VMEM((num_simd_lanes,), jnp.int32),
-              out_vmem_ref=pltpu.VMEM((num_simd_lanes, col_size), jnp.uint32),
-              prev_iter_last_row_vmem_ref=pltpu.VMEM((1, col_size), jnp.uint32),
-              src_indices_vmem_ref=pltpu.VMEM((num_simd_lanes,), jnp.int32),
-              dst_indices_vmem_ref=pltpu.VMEM((num_simd_lanes,), jnp.int32),
-              topk_weights_vmem_ref=pltpu.VMEM((num_simd_lanes,), jnp.float32),
-              sem_ref=pltpu.SemaphoreType.DMA((2,)),
-          ),
-      },
   )(num_src_rows_per_row_partition, x, src_indices, dst_indices, topk_weights)
 
   # If there is no valid source row in a reduce group, set that group's output

@@ -16,8 +16,10 @@
 # pylint: disable=arguments-differ
 # pylint: disable=no-name-in-module
 
+import functools
 from typing import Any, cast
 import math
+import os
 
 import jax
 import jax.nn
@@ -30,6 +32,8 @@ from flax import linen as nn
 from flax import nnx
 
 from maxtext.common.common_types import AttentionType, Config, DType, Array, BATCH, EMBED, MODEL_MODE_TRAIN, LENGTH, MODEL_MODE_AUTOREGRESSIVE
+from maxtext.common.common_types import KV_BATCH, KV_HEAD
+from maxtext.utils.sharding import logical_to_mesh_axes, get_logical_axis_rules
 from maxtext.layers import attentions
 from maxtext.layers import initializers as max_initializers
 from maxtext.layers import moe
@@ -449,7 +453,8 @@ class Qwen3NextGatedDeltaNet(nnx.Module):
   def __init__(
       self,
       config: Config,
-      inputs_shape: tuple,
+      inputs_shape: tuple | None = None,
+      mesh=None,
       dtype: DType = jnp.float32,
       model_mode: str = MODEL_MODE_TRAIN,
       *,
@@ -458,9 +463,13 @@ class Qwen3NextGatedDeltaNet(nnx.Module):
     """
     Args:
       config: MaxText configuration object.
+      mesh: Optional JAX device mesh (required for vLLM paged-state path).
       rngs: The random number generators for initialization, passed by the nnx.to_linen wrapper.
     """
     self.config = config
+    self.mesh = mesh
+
+    self._gdn_replicate_expert = os.environ.get("MAXTEXT_GDN_REPLICATE_EXPERT", "False").lower() == "true"
     cfg = self.config
 
     in_features = cfg.emb_dim
@@ -474,7 +483,7 @@ class Qwen3NextGatedDeltaNet(nnx.Module):
     conv_kernel_size = cfg.gdn_conv_kernel_dim
     self.v_heads_per_k_head = self.num_v_heads // self.num_k_heads
 
-    if model_mode != MODEL_MODE_TRAIN:
+    if model_mode != MODEL_MODE_TRAIN and inputs_shape is not None:
       runtime_batch_size = inputs_shape[0]
 
       self.cache = kvcache.KVCache(
@@ -495,7 +504,7 @@ class Qwen3NextGatedDeltaNet(nnx.Module):
           rngs=rngs,
       )
     else:
-      self.cache = None
+      self.cache = None  # No cache for train mode or when inputs_shape not provided
 
     # Submodule instantiations
     self.in_proj_qkvz = DenseGeneral(
@@ -503,7 +512,7 @@ class Qwen3NextGatedDeltaNet(nnx.Module):
         out_features_shape=(self.key_dim * 2 + self.value_dim * 2),
         dtype=cfg.dtype,
         weight_dtype=cfg.weight_dtype,
-        kernel_axes=("embed", "mlp"),
+        kernel_axes=("embed", "gdn_head"),
         matmul_precision=cfg.matmul_precision,
         rngs=rngs,
     )
@@ -512,7 +521,7 @@ class Qwen3NextGatedDeltaNet(nnx.Module):
         out_features_shape=(self.num_v_heads * 2),
         dtype=cfg.dtype,
         weight_dtype=cfg.weight_dtype,
-        kernel_axes=("embed", "mlp"),
+        kernel_axes=("embed", "gdn_head"),
         matmul_precision=cfg.matmul_precision,
         rngs=rngs,
     )
@@ -541,7 +550,7 @@ class Qwen3NextGatedDeltaNet(nnx.Module):
 
     self.norm = Qwen3NextRMSNormGated(
         num_features=self.head_v_dim,  # Normalize over the head dimension (D_v)
-        eps=cfg.normalization_layer_epsilon,
+        epsilon=cfg.normalization_layer_epsilon,
         dtype=cfg.dtype,
         weight_dtype=cfg.weight_dtype,
         rngs=rngs,
@@ -551,7 +560,7 @@ class Qwen3NextGatedDeltaNet(nnx.Module):
         out_features_shape=(in_features,),
         dtype=cfg.dtype,
         weight_dtype=cfg.weight_dtype,
-        kernel_axes=("mlp", "embed"),
+        kernel_axes=("gdn_head", "embed"),
         matmul_precision=cfg.matmul_precision,
         rngs=rngs,
     )
@@ -562,6 +571,7 @@ class Qwen3NextGatedDeltaNet(nnx.Module):
       model_mode: str = MODEL_MODE_TRAIN,
       kv_cache=None,
       decoder_segment_ids: None | Array = None,
+      attention_metadata=None,
       **kwargs,
   ) -> tuple[Array, Any | None]:
     # hidden_states: (B, S, E)
@@ -569,6 +579,17 @@ class Qwen3NextGatedDeltaNet(nnx.Module):
     batch, seq_len, _ = hidden_states.shape
 
     active_cache = kv_cache if kv_cache is not None else self.cache
+
+    # When kv_cache is a 2-tuple of paged mamba state arrays from vLLM, use
+    # run_jax_gdn_attention from tpu_inference for correct sequential token processing.
+    use_paged_state = (
+        kv_cache is not None
+        and isinstance(kv_cache, tuple)
+        and len(kv_cache) == 2
+        and attention_metadata is not None
+        and getattr(attention_metadata, "mamba_state_indices", None) is not None
+        and self.mesh is not None
+    )
 
     # =========================================================================
     # STEP A: Input Projections
@@ -578,7 +599,9 @@ class Qwen3NextGatedDeltaNet(nnx.Module):
     # ba: (B, S, 2 * H_v)
     ba = self.in_proj_ba(hidden_states)
 
-    # QKVZ Reshaping and Splitting
+    # =========================================================================
+    # QKVZ and BA Reshaping and Splitting (shared by both paths)
+    # =========================================================================
     # Per-K_head group dim: 2 * D_k + 2 * D_v * V_per_K
     new_shape_qkvz = (
         batch,
@@ -588,6 +611,11 @@ class Qwen3NextGatedDeltaNet(nnx.Module):
     )
     # mixed_qkvz: (B, S, H_k, 2*D_k + 2*D_v*V_per_K)
     mixed_qkvz = qkvz.reshape(new_shape_qkvz)
+    if self.mesh is not None:
+      logical_rules = get_logical_axis_rules()
+      qkvz_pspec = logical_to_mesh_axes((KV_BATCH, None, KV_HEAD, None), mesh=self.mesh, rules=logical_rules)
+      qkvz_sharding = jax.sharding.NamedSharding(self.mesh, qkvz_pspec)
+      mixed_qkvz = jax.lax.with_sharding_constraint(mixed_qkvz, qkvz_sharding)
 
     split_indices_qkvz = [
         self.head_k_dim,  # D_k
@@ -624,6 +652,85 @@ class Qwen3NextGatedDeltaNet(nnx.Module):
     b = b_raw.reshape(batch, seq_len, self.num_v_heads)
     # a: (B, S, H_v)
     a = a_raw.reshape(batch, seq_len, self.num_v_heads)
+
+    if use_paged_state:
+      # =========================================================================
+      # vLLM PAGED STATE PATH: use tpu_inference fused conv + ragged delta-rule.
+      # =========================================================================
+      try:
+        from tpu_inference.layers.common.gdn_attention import run_jax_gdn_attention  # pylint: disable=import-outside-toplevel # pytype: disable=import-error
+        from tpu_inference.layers.common.sharding import ShardingAxisName  # pylint: disable=import-outside-toplevel # pytype: disable=import-error
+        from tpu_inference.layers.common.utils import reorder_concatenated_tensor_for_sharding  # pylint: disable=import-outside-toplevel # pytype: disable=import-error
+        from tpu_inference.utils import get_mesh_shape_product  # pylint: disable=import-outside-toplevel # pytype: disable=import-error
+        from jax.sharding import PartitionSpec as P_spec  # pylint: disable=import-outside-toplevel # pytype: disable=import-error
+      except ImportError as e:
+        raise ImportError(
+            "GDN attention kernel require the vllm-tpu package. Please install it with `pip install vllm-tpu`."
+        ) from e
+
+      attn_data = ShardingAxisName.ATTN_DATA
+      # Head axis for the GDN kernel + the producer-side reshapes. Default ATTN_HEAD
+      # (model*expert); the experimental MAXTEXT_GDN_REPLICATE_EXPERT path uses 'model' only
+      # so GDN replicates over the expert axis (no expert-axis transpose all-to-all).
+      attn_head = ShardingAxisName.MODEL if self._gdn_replicate_expert else ShardingAxisName.ATTN_HEAD
+      tp_size = get_mesh_shape_product(self.mesh, attn_head)
+      num_tokens = batch * seq_len
+
+      # Build mixed_qkv in the kernel's per-shard layout via shard_map concatenation.
+      # Each TP shard already holds its local q/k/v head slices → concatenate locally
+      # to get [q_local | k_local | v_local] with no cross-device communication.
+      q_flat = query.reshape(num_tokens, self.key_dim)  # (T, key_dim) sharded on ATTN_HEAD
+      k_flat = key.reshape(num_tokens, self.key_dim)
+      v_flat = value_raw.reshape(num_tokens, self.value_dim)  # (T, value_dim) sharded on ATTN_HEAD
+      mixed_qkv = jax.shard_map(
+          lambda q, k, v: jnp.concatenate([q, k, v], axis=-1),
+          mesh=self.mesh,
+          in_specs=(P_spec(attn_data, attn_head),) * 3,
+          out_specs=P_spec(attn_data, attn_head),
+          check_vma=False,
+      )(q_flat, k_flat, v_flat)
+
+      b_flat = b.reshape(num_tokens, self.num_v_heads)
+      a_flat = a.reshape(num_tokens, self.num_v_heads)
+
+      # Conv weight: transpose from (kernel_size, 1, conv_dim) → (conv_dim, 1, kernel_size),
+      # then reorder so each TP shard gets its local [q_local | k_local | v_local] channels.
+      conv_weight = jnp.transpose(self.conv1d.kernel.value, (2, 1, 0))
+      conv_weight = reorder_concatenated_tensor_for_sharding(
+          conv_weight, [self.key_dim, self.key_dim, self.value_dim], tp_size, 0
+      )
+
+      conv_state_paged, recurrent_state_paged = kv_cache
+
+      (new_conv_state_paged, new_recurrent_state_paged), gdn_output = run_jax_gdn_attention(
+          mixed_qkv,
+          b_flat,
+          a_flat,
+          conv_state_paged,
+          recurrent_state_paged,
+          conv_weight,
+          None,  # conv_bias: MaxText conv1d uses use_bias=False.
+          jnp.asarray(self.A_log[...], dtype=cfg.dtype),
+          jnp.asarray(self.dt_bias[...], dtype=cfg.dtype),
+          attention_metadata.mamba_state_indices.astype(jnp.int32),  # pyrefly: ignore[missing-attribute]
+          attention_metadata.query_start_loc,  # pyrefly: ignore[missing-attribute]
+          attention_metadata.request_distribution,  # pyrefly: ignore[missing-attribute]
+          attention_metadata.seq_lens,  # pyrefly: ignore[missing-attribute]
+          self.num_k_heads,
+          self.num_v_heads,
+          self.head_k_dim,
+          self.head_v_dim,
+          cfg.gdn_conv_kernel_dim,
+          mesh=self.mesh,
+      )
+
+      # Reshape GDN output and apply gated norm + out projection.
+      gdn_output = gdn_output.reshape(batch, seq_len, self.num_v_heads, self.head_v_dim)
+      gated_output = self.norm(gdn_output, z)
+      gated_output = gated_output.reshape(batch, seq_len, -1)
+      output = self.out_proj(gated_output)
+
+      return output, (new_conv_state_paged, new_recurrent_state_paged)
 
     # Flatten head dimensions for concatenation before conv
     # q: (B, S, K_dim)
@@ -728,10 +835,52 @@ class Qwen3NextGatedDeltaNet(nnx.Module):
           value,
           g,
           beta,
-          initial_state=recurrent_state,
+          initial_state=recurrent_state,  # pyrefly: ignore[bad-argument-type]
           use_qk_norm_in_gdn=cfg.use_qk_norm_in_gdn,
           compute_dtype=cfg.dtype,
       )
+    elif self.mesh is not None:
+      logical_rules = get_logical_axis_rules()
+      recurrent_state_arg = (
+          recurrent_state
+          if recurrent_state is not None
+          else jnp.zeros((batch, self.num_v_heads, self.head_k_dim, self.head_v_dim), dtype=cfg.dtype)
+      )
+      qkv_pspec = logical_to_mesh_axes((KV_BATCH, None, KV_HEAD, None), mesh=self.mesh, rules=logical_rules)
+      g_beta_pspec = logical_to_mesh_axes((KV_BATCH, None, KV_HEAD), mesh=self.mesh, rules=logical_rules)
+      state_pspec = logical_to_mesh_axes((KV_BATCH, KV_HEAD, None, None), mesh=self.mesh, rules=logical_rules)
+
+      @functools.partial(
+          jax.shard_map,
+          mesh=self.mesh,
+          in_specs=(
+              qkv_pspec,  # query
+              qkv_pspec,  # key
+              qkv_pspec,  # value
+              g_beta_pspec,  # g
+              g_beta_pspec,  # beta
+              state_pspec,  # initial_state
+          ),
+          out_specs=(
+              qkv_pspec,  # core_attn_out
+              state_pspec,  # final_state
+          ),
+          check_vma=False,
+      )
+      def shard_mapped_delta_rule(q, k, v, g_val, beta_val, init_h):
+        return jax_chunk_gated_delta_rule(
+            query=q,
+            key=k,
+            value=v,
+            g=g_val,
+            beta=beta_val,
+            chunk_size=cfg.gdn_chunk_size,
+            initial_state=init_h,
+            use_qk_norm_in_gdn=cfg.use_qk_norm_in_gdn,
+            compute_dtype=cfg.dtype,
+        )
+
+      core_attn_out, next_recurrent_state = shard_mapped_delta_rule(query, key, value, g, beta, recurrent_state_arg)
     else:
       core_attn_out, next_recurrent_state = jax_chunk_gated_delta_rule(
           query,
@@ -748,7 +897,7 @@ class Qwen3NextGatedDeltaNet(nnx.Module):
     if model_mode != MODEL_MODE_TRAIN and active_cache is not None:
       assert next_conv_state is not None
       assert next_recurrent_state is not None
-      if next_conv_state.shape[0] != orig_cache_batch:
+      if next_conv_state.shape[0] != orig_cache_batch:  # pyrefly: ignore[unbound-name]
         if next_conv_state.shape[0] == 1:
           next_conv_state = jnp.broadcast_to(next_conv_state, (orig_cache_batch,) + next_conv_state.shape[1:])
           next_recurrent_state = jnp.broadcast_to(
@@ -763,7 +912,7 @@ class Qwen3NextGatedDeltaNet(nnx.Module):
           next_recurrent_state = next_recurrent_state[:orig_cache_batch]
 
     if model_mode != MODEL_MODE_TRAIN and active_cache is not None:
-      active_cache.update_gdn_states(next_recurrent_state, next_conv_state)
+      active_cache.update_gdn_states(next_recurrent_state, next_conv_state)  # pyrefly: ignore[bad-argument-type]
 
     # =========================================================================
     # STEP D: Final Output Stage
@@ -799,12 +948,12 @@ class Qwen3NextGatedDeltaNet(nnx.Module):
         value_heads=self.num_v_heads,
         key_head_size=self.head_k_dim,
         value_head_size=self.head_v_dim,
-        dtype=self.dtype,
+        dtype=self.dtype,  # pyrefly: ignore[missing-attribute]
         is_gdn=True,
         conv_kernel_size=conv_kernel_size,
         conv_dim=conv_dim,
-        model_mode=self.model_mode,
-        rngs=self.rngs,
+        model_mode=self.model_mode,  # pyrefly: ignore[missing-attribute]
+        rngs=self.rngs,  # pyrefly: ignore[missing-attribute]
     )
 
 
@@ -1102,7 +1251,7 @@ class Qwen3NextDecoderLayer(nnx.Module):
     # First LayerNorm, applied before the attention block.
     self.input_layernorm = Qwen3NextRMSNorm(
         num_features=cfg.emb_dim,
-        eps=cfg.normalization_layer_epsilon,
+        epsilon=cfg.normalization_layer_epsilon,
         dtype=cfg.dtype,
         weight_dtype=cfg.weight_dtype,
         rngs=rngs,
@@ -1125,13 +1274,13 @@ class Qwen3NextDecoderLayer(nnx.Module):
       batch_size, seq_len = max_utils.get_batch_seq_len_for_mode(config, model_mode)
       dummy_inputs_shape = (batch_size, seq_len, config.emb_dim)
       self.attention = Qwen3NextGatedDeltaNet(
-          config=cfg, inputs_shape=dummy_inputs_shape, dtype=cfg.dtype, model_mode=model_mode, rngs=rngs
+          config=cfg, inputs_shape=dummy_inputs_shape, mesh=self.mesh, dtype=cfg.dtype, model_mode=model_mode, rngs=rngs
       )
 
     # Second LayerNorm, applied before the MoE block.
     self.post_attention_layernorm = Qwen3NextRMSNorm(
         num_features=cfg.emb_dim,
-        eps=cfg.normalization_layer_epsilon,
+        epsilon=cfg.normalization_layer_epsilon,
         dtype=cfg.dtype,
         weight_dtype=cfg.weight_dtype,
         rngs=rngs,
@@ -1169,7 +1318,7 @@ class Qwen3NextDecoderLayer(nnx.Module):
           decoder_positions,
           deterministic,
           model_mode,
-          kv_cache=kv_cache,
+          kv_cache=kv_cache,  # pyrefly: ignore[bad-argument-type]
           attention_metadata=attention_metadata,
       )
     else:
@@ -1178,6 +1327,7 @@ class Qwen3NextDecoderLayer(nnx.Module):
           model_mode=model_mode,
           kv_cache=kv_cache,
           decoder_segment_ids=decoder_segment_ids,
+          attention_metadata=attention_metadata,
       )
 
     # First residual connection after attention
@@ -1456,8 +1606,8 @@ class Qwen3MoeDecoderLayer(AttentionWithNorm):
           return cache.at[layer_idx].set(val)
         return cache
 
-      stacked_kv_cache = jax.tree_util.tree_map(update_cache, stacked_kv_cache, kv_cache)
-      return (layer_output, stacked_kv_cache, layer_idx + 1), None
+      stacked_kv_cache = jax.tree_util.tree_map(update_cache, stacked_kv_cache, kv_cache)  # pyrefly: ignore[unbound-name]
+      return (layer_output, stacked_kv_cache, layer_idx + 1), None  # pyrefly: ignore[unbound-name]
     else:
       return layer_output, kv_cache
 
@@ -1485,7 +1635,7 @@ class Qwen3OmniMoeVisionPatchMerger(nnx.Module):
       dtype: DType = jnp.float32,
       weight_dtype: DType = jnp.float32,
       kernel_init: max_initializers.NdInitializer = max_initializers.nd_dense_init(1.0, "fan_in", "normal"),
-      rngs: nnx.Rngs = None,
+      rngs: nnx.Rngs = None,  # pyrefly: ignore[bad-function-definition]
   ):
     """Initializes the Qwen3Omni vision patch merger.
 
@@ -1599,7 +1749,7 @@ class Qwen3OmniMoeVisionMLP(nnx.Module):
       dtype: DType = jnp.float32,
       weight_dtype: DType = jnp.float32,
       kernel_init: max_initializers.NdInitializer = max_initializers.nd_dense_init(1.0, "fan_in", "normal"),
-      rngs: nnx.Rngs = None,
+      rngs: nnx.Rngs = None,  # pyrefly: ignore[bad-function-definition]
   ):
     """Initializes the Qwen3Omni vision MLP.
 
@@ -1676,7 +1826,7 @@ class Qwen3OmniMoeVisionPatchEmbed(nnx.Module):
       # Default to float32 for numerical stability in 3D convolutions on image/video inputs
       dtype: DType = jnp.float32,
       weight_dtype: DType = jnp.float32,
-      rngs: nnx.Rngs = None,
+      rngs: nnx.Rngs = None,  # pyrefly: ignore[bad-function-definition]
   ):
     """Initializes the Qwen3Omni vision patch embedding.
 
@@ -1709,19 +1859,29 @@ class Qwen3OmniMoeVisionPatchEmbed(nnx.Module):
         rngs=rngs,
     )
 
-  def __call__(self, hidden_states: Array) -> Array:
+  def __call__(self, hidden_states: Array, video_mask: Array | None = None) -> tuple[Array, Array | None]:
     """
     Args:
         hidden_states: Input tensor of shape (batch, in_channels, temporal*patch_size, height*patch_size, width*patch_size)
+        video_mask: Optional pixel-level mask with shape
+          (batch, 1, temporal*patch_size, height*patch_size, width*patch_size).
     Returns:
-        Output tensor of shape (batch, T*H*W, embed_dim) where T, H, W are the number of patches
+        Tuple of:
+        - Output tensor of shape (batch, T*H*W, embed_dim) where T, H, W are the number of patches
+        - Attention mask of shape (batch, T*H*W), or None when video_mask is not provided
     """
     hidden_states = jnp.transpose(hidden_states, (0, 2, 3, 4, 1))
     hidden_states = self.proj(hidden_states)
     batch_size = hidden_states.shape[0]
     seq_len = hidden_states.shape[1] * hidden_states.shape[2] * hidden_states.shape[3]
     hidden_states = hidden_states.reshape(batch_size, seq_len, self.embed_dim)
-    return hidden_states
+
+    attention_mask = None
+    if video_mask is not None:
+      mask_patch_elements = self.temporal_patch_size * self.patch_size * self.patch_size
+      attention_mask = video_mask.reshape(video_mask.shape[0], -1, mask_patch_elements).max(axis=-1).astype(jnp.int32)
+
+    return hidden_states, attention_mask
 
 
 class Qwen3OmniMoeVisionAttention(nnx.Module):
@@ -1732,7 +1892,7 @@ class Qwen3OmniMoeVisionAttention(nnx.Module):
       attn: Underlying attention module
   """
 
-  def __init__(self, config: Config, *, mesh=None, rngs: nnx.Rngs = None):
+  def __init__(self, config: Config, *, mesh=None, rngs: nnx.Rngs = None):  # pyrefly: ignore[bad-function-definition]
     """Initializes the Qwen3Omni vision attention layer.
 
     Args:
@@ -1749,14 +1909,14 @@ class Qwen3OmniMoeVisionAttention(nnx.Module):
         num_kv_heads=self.config.num_attention_heads_for_vit,
         head_dim=head_dim,
         max_target_length=self.config.num_position_embeddings_for_vit,
-        attention_kernel="dot_product",
+        attention_kernel=self.config.attention_for_vit,
         inputs_q_shape=(1, 1, self.config.hidden_size_for_vit),
         inputs_kv_shape=(1, 1, self.config.hidden_size_for_vit),
         float32_qk_product=self.config.float32_qk_product,
         float32_logits=self.config.float32_logits,
         dtype=self.config.dtype_mm,
         weight_dtype=self.config.weight_dtype,
-        mesh=mesh,
+        mesh=mesh,  # pyrefly: ignore[bad-argument-type]
         dropout_rate=0.0,
         attention_type=AttentionType.FULL,
         is_nope_layer=False,
@@ -1774,6 +1934,8 @@ class Qwen3OmniMoeVisionAttention(nnx.Module):
       num_frames: int,
       height: int,
       width: int,
+      attention_mask: Array | None = None,
+      valid_grid: tuple[int, int, int] | None = None,
       deterministic: bool = True,
   ) -> Array:
     """
@@ -1782,6 +1944,8 @@ class Qwen3OmniMoeVisionAttention(nnx.Module):
         num_frames: Number of temporal frames (static)
         height: Height in patches (static)
         width: Width in patches (static)
+        attention_mask: Optional mask identifying valid tokens in the padded sequence.
+        valid_grid: Optional unpadded `(frames, height, width)` grid used for vision RoPE.
         deterministic: Whether to use deterministic mode (disable dropout)
 
     Returns:
@@ -1792,11 +1956,14 @@ class Qwen3OmniMoeVisionAttention(nnx.Module):
         "num_frames": num_frames,
         "height": height,
         "width": width,
+        "token_mask": attention_mask,
+        "valid_grid": valid_grid,
     }
     output, _ = self.attn(
         inputs_q=hidden_states,
         inputs_kv=hidden_states,
         deterministic=deterministic,
+        decoder_segment_ids=attention_mask,
         rope_kwargs=rope_kwargs,
     )
 
@@ -1815,7 +1982,7 @@ class Qwen3OmniMoeVisionBlock(nnx.Module):
       mlp_out: Second MLP layer
   """
 
-  def __init__(self, config: Config, *, mesh=None, rngs: nnx.Rngs = None):
+  def __init__(self, config: Config, *, mesh=None, rngs: nnx.Rngs = None):  # pyrefly: ignore[bad-function-definition]
     """Initializes the Qwen3Omni vision transformer block.
 
     Args:
@@ -1849,6 +2016,8 @@ class Qwen3OmniMoeVisionBlock(nnx.Module):
       num_frames: int,
       height: int,
       width: int,
+      attention_mask: Array | None = None,
+      valid_grid: tuple[int, int, int] | None = None,
   ) -> Array:
     """
     Args:
@@ -1860,7 +2029,14 @@ class Qwen3OmniMoeVisionBlock(nnx.Module):
     Returns:
         Output tensor of shape (batch, T*H*W, hidden_size)
     """
-    x = x + self.attn(self.ln1(x), num_frames=num_frames, height=height, width=width)
+    x = x + self.attn(
+        self.ln1(x),
+        num_frames=num_frames,
+        height=height,
+        width=width,
+        attention_mask=attention_mask,
+        valid_grid=valid_grid,
+    )
     y = self.ln2(x)
     y = self.mlp(y)
     y = jax.nn.gelu(y)
@@ -1881,7 +2057,7 @@ class Qwen3OmniMoeVisionEncoder(nnx.Module):
       deep_idx: Indices of layers to extract deep features from
   """
 
-  def __init__(self, config: Config, *, mesh=None, rngs: nnx.Rngs = None):
+  def __init__(self, config: Config, *, mesh=None, rngs: nnx.Rngs = None):  # pyrefly: ignore[bad-function-definition]
     """Initializes the Qwen3Omni vision encoder.
 
     Args:
@@ -1921,6 +2097,8 @@ class Qwen3OmniMoeVisionEncoder(nnx.Module):
   def __call__(
       self,
       hidden_states: Array,
+      video_mask: Array | None = None,
+      video_grid_thw: Array | tuple[int, int, int] | None = None,
       deterministic: bool = True,
   ):
     """
@@ -1937,6 +2115,12 @@ class Qwen3OmniMoeVisionEncoder(nnx.Module):
     num_frames = num_frames // self.config.temporal_patch_size_for_vit
     height = height // self.config.patch_size_for_vit
     width = width // self.config.patch_size_for_vit
+    attention_mask = None
+    if video_mask is not None:
+      mask_patch_elements = (
+          self.config.temporal_patch_size_for_vit * self.config.patch_size_for_vit * self.config.patch_size_for_vit
+      )
+      attention_mask = video_mask.reshape(batch_size, -1, mask_patch_elements).max(axis=-1).astype(jnp.int32)
     hidden_states = hidden_states.reshape(
         -1,
         self.config.num_channels_for_vit,
@@ -1945,18 +2129,32 @@ class Qwen3OmniMoeVisionEncoder(nnx.Module):
         self.config.patch_size_for_vit,
     )
 
-    x = self.patch_embed(hidden_states)
+    x, _ = self.patch_embed(hidden_states)
     x = x.reshape(batch_size, -1, self.config.hidden_size_for_vit)
-    pos = self.pos_embed_interpolate(num_frames, height, width)
-
-    pos = pos[jnp.newaxis, :, :]
+    if attention_mask is not None and video_grid_thw is None:
+      raise ValueError("video_grid_thw is required when video_mask is provided.")
+    pos = self.pos_embed_interpolate(
+        num_frames,
+        height,
+        width,
+        video_grid_thw=video_grid_thw,  # pyrefly: ignore[bad-argument-type]
+        attention_mask=attention_mask,
+    )
     x = x + pos
+    valid_grid = video_grid_thw
 
     h_traj = []
     for i in range(self.depth):
       block_name = f"blocks_{i}"
       blk = getattr(self, block_name)
-      x = blk(x, num_frames=num_frames, height=height, width=width)
+      x = blk(
+          x,
+          num_frames=num_frames,
+          height=height,
+          width=width,
+          attention_mask=attention_mask,
+          valid_grid=valid_grid,
+      )
       h_traj.append(x)
 
     deep_feats = []
@@ -1978,7 +2176,7 @@ class Qwen3OmniMoeVisionProjector(nnx.Module):
       merger: Patch merger for spatial reduction
   """
 
-  def __init__(self, config: Config, *, rngs: nnx.Rngs = None):
+  def __init__(self, config: Config, *, rngs: nnx.Rngs = None):  # pyrefly: ignore[bad-function-definition]
     """Initializes the Qwen3Omni vision projector.
 
     Args:
@@ -2026,7 +2224,7 @@ def qwen3omni_visionprojector_as_linen(config: Config, mesh: Mesh) -> nn.Module:
 class Qwen3OmniAudioEncoderLayer(nnx.Module):
   """Transformer encoder layer for audio model."""
 
-  def __init__(self, config: Config, mesh: Mesh, *, rngs: nnx.Rngs = None):
+  def __init__(self, config: Config, mesh: Mesh, *, rngs: nnx.Rngs = None):  # pyrefly: ignore[bad-function-definition]
     self.config = config
     self.mesh = mesh
     self.rngs = rngs
@@ -2131,7 +2329,7 @@ class Qwen3OmniAudioEncoder(nnx.Module):
       mesh: Mesh, JAX device mesh (used for sharding)
   """
 
-  def __init__(self, config: Config, mesh: Mesh, *, rngs: nnx.Rngs = None):
+  def __init__(self, config: Config, mesh: Mesh, *, rngs: nnx.Rngs = None):  # pyrefly: ignore[bad-function-definition]
     self.config = config
     self.mesh = mesh
     self.rngs = rngs
@@ -2282,7 +2480,7 @@ class Qwen3OmniAudioEncoder(nnx.Module):
 class Qwen3OmniAudioProjector(nnx.Module):
   """Projection layer that converts audio encoder output to model embedding space."""
 
-  def __init__(self, config: Config, *, rngs: nnx.Rngs = None):
+  def __init__(self, config: Config, *, rngs: nnx.Rngs = None):  # pyrefly: ignore[bad-function-definition]
     self.config = config
     self.proj1 = DenseGeneral(
         in_features_shape=config.d_model_for_audio,

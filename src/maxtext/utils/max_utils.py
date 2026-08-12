@@ -246,6 +246,17 @@ def maybe_initialize_jax_distributed_system(raw_keys):
     return
   if raw_keys["enable_single_controller"]:
     max_logging.log("Skipping jax distributed system since its not needed for single controller.")
+    if raw_keys["enable_multi_tier_checkpointing"]:
+      max_logging.log("Initializing multi-tier checkpointing for single controller...")
+      mtc_init_kwargs = elastic_utils.single_controller_mtc_init_kwargs(raw_keys)
+      initialize_multi_tier_checkpointing(
+          local_checkpoint_directory=raw_keys["local_checkpoint_directory"],
+          backup_interval_minutes=raw_keys["multi_tier_checkpointing_backup_interval_minutes"],
+          run_name=raw_keys["run_name"],
+          jax_initialization_timeout_seconds=raw_keys["jax_distributed_initialization_timeout"],
+          use_colocated_python=True,
+          **mtc_init_kwargs,
+      )
     return
   if jax.distributed.is_initialized():
     max_logging.log("Jax distributed system is already initialized.")
@@ -290,6 +301,7 @@ def maybe_initialize_jax_distributed_system(raw_keys):
         run_name=raw_keys["run_name"],
         jax_initialization_timeout_seconds=raw_keys["jax_distributed_initialization_timeout"],
         data_parallelism=raw_keys["mtc_data_parallelism"],
+        num_slices=raw_keys["num_slices"],
     )
     max_logging.log("Jax distributed system initialized on TPUs for multi-tier checkpointing!")
   elif raw_keys["enable_checkpointing"] and raw_keys["compile_topology_num_slices"] == -1:
@@ -324,8 +336,8 @@ def initialize_jax_for_gpu(raw_keys):
 
     jax.distributed.initialize(
         coordinator_address=f"{coordinator_ip}:{coordinator_port}",
-        num_processes=int(os.getenv("NNODES")),
-        process_id=int(os.getenv("NODE_RANK")),
+        num_processes=int(os.getenv("NNODES")),  # pyrefly: ignore[bad-argument-type]
+        process_id=int(os.getenv("NODE_RANK")),  # pyrefly: ignore[bad-argument-type]
         initialization_timeout=raw_keys["jax_distributed_initialization_timeout"],
         local_device_ids=devices,
     )
@@ -337,16 +349,16 @@ def initialize_jax_for_cpu(raw_keys):
   coordinator_ip_address = get_coordinator_ip_address()
   coordinator_address = coordinator_ip_address + ":1234"  # JAX coordinator port used in XPK
   # Env variables to be set in XPK or otherwise
-  job_index = int(os.environ.get("JOB_INDEX"))
-  job_completion_index = int(os.environ.get("JOB_COMPLETION_INDEX"))
-  processes_in_job = int(os.environ.get("PROCESSES_IN_JOB"))
+  job_index = int(os.environ.get("JOB_INDEX"))  # pyrefly: ignore[bad-argument-type]
+  job_completion_index = int(os.environ.get("JOB_COMPLETION_INDEX"))  # pyrefly: ignore[bad-argument-type]
+  processes_in_job = int(os.environ.get("PROCESSES_IN_JOB"))  # pyrefly: ignore[bad-argument-type]
   pid = job_index * processes_in_job + job_completion_index
   max_logging.log(f" Jax process id is {pid} ")
   # Explicit initialize is needed only for CPUs
   jax.distributed.initialize(
       coordinator_address=coordinator_address,
       process_id=pid,
-      num_processes=int(os.environ.get("JAX_PROCESS_COUNT")),
+      num_processes=int(os.environ.get("JAX_PROCESS_COUNT")),  # pyrefly: ignore[bad-argument-type]
       initialization_timeout=raw_keys["jax_distributed_initialization_timeout"],
   )
 
@@ -399,7 +411,7 @@ def get_num_slices(raw_keys, config=None):
   if raw_keys.get("num_slices", -1) != -1:
     max_logging.log(f"Using num_slices={raw_keys['num_slices']} per user request.")
     return raw_keys["num_slices"]
-  if raw_keys["hardware"] == "cpu":
+  if getattr(raw_keys, "hardware", None) == "cpu":
     max_logging.log(" Setting num_slices=1 for CPU hardware type")
     return 1
   if int(raw_keys["compile_topology_num_slices"]) > 0:
@@ -432,7 +444,7 @@ def get_coordinator_ip_address():
     max_coordinator_lookups = 50
     while not coordinator_found and lookup_attempt <= max_coordinator_lookups:
       try:
-        coordinator_ip_address = socket.gethostbyname(coordinator_address)
+        coordinator_ip_address = socket.gethostbyname(coordinator_address)  # pyrefly: ignore[bad-argument-type]
         coordinator_found = True
       except socket.gaierror:
         max_logging.log(
@@ -862,7 +874,7 @@ def _cross_entropy_with_logits_fwd(logits: jnp.ndarray, targets: jnp.ndarray, z_
   log_z = jnp.squeeze(jnp.log(sum_exp) + max_logit, axis=-1)
   total_z_loss = z_loss * jax.lax.square(log_z)
   loss += total_z_loss
-  return (loss, total_z_loss), (
+  return (loss, total_z_loss), (  # pyrefly: ignore[bad-return]
       logits,
       targets,
       z_loss,
@@ -884,11 +896,11 @@ def _cross_entropy_with_logits_bwd(
     g: tuple[jnp.ndarray, jnp.ndarray],
 ) -> tuple[jnp.ndarray, None, None]:
   """Backward-mode of `cross_entropy_with_logits`."""
-  g = g[0]  # Ignore z_loss component as that is only used for logging.
+  g = g[0]  # Ignore z_loss component as that is only used for logging.  # pyrefly: ignore[bad-assignment]
   logits, targets, z_loss, exp_shifted, sum_exp, log_z = res
   # z-loss term adds the (2 * z_loss * log_z) factor.
   deriv = jnp.expand_dims(1 + 2 * z_loss * log_z, -1) * exp_shifted / sum_exp - targets
-  g_logits = jnp.expand_dims(g, axis=-1) * deriv
+  g_logits = jnp.expand_dims(g, axis=-1) * deriv  # pyrefly: ignore[bad-argument-type]
 
   return (
       jnp.asarray(g_logits, logits.dtype),
@@ -1002,9 +1014,12 @@ def print_compiled_memory_stats(compiled_stats):
   total_gb = output_gb + temp_gb + argument_gb - alias_gb
 
   max_logging.log(
-      f"Total memory size: {total_gb:.1f} GB, Output size: {output_gb:.1f} GB, Temp size: {temp_gb:.1f} GB, "
-      f"Argument size: {argument_gb:.1f} GB, Host temp size: {host_temp_gb:.1f} GB."
+      f"Total estimated memory size: {total_gb:.1f} GB, estimated output"
+      f" size: {output_gb:.1f} GB, estimated temp size: {temp_gb:.1f} GB, "
+      f"estimated argument size: {argument_gb:.1f} GB, Estimated host temp"
+      f" size: {host_temp_gb:.1f} GB."
   )
+  max_logging.log("Note that compiler could over-estimate the HBM usage.")
 
 
 def print_system_information():
@@ -1057,9 +1072,13 @@ def reorder_sequence(tensor, cp_size: int, seq_dim: int = 1, to_contiguous: bool
   if seq_len % (cp_size * 2) != 0:
     raise ValueError(f"{tensor.shape=} is not a multiple of {cp_size*2=}")
 
-  # [B, S, H, D]: [B, 2*cp_size, S/2*cp_size, H, D] -> [B, 2, S/2*cp_size, H, D]
-  # [S, B, H, D]: [2*cp_size, S/2*cp_size, B, H, D] -> [2, S/2*cp_size, B, H, D]
+  seq_dim = seq_dim % tensor.ndim
   ori_tensor_shape = tensor.shape
+
+  # Generic transformation: Isolates the target sequence dimension into `2 * cp_size` discrete chunks.
+  # Note: The shape walkthrough below uses [b, s, h, d] with seq_dim=1 as an illustrative example,
+  # but actual dimensions depend on the input tensor (e.g., [s, b, h, d], [b, t, d], etc.):
+  # [b, s, h, d] -> [b, 2*cp_size, group_size, h, d]
   reshaped = tensor.reshape(
       *ori_tensor_shape[:seq_dim],
       2 * cp_size,
@@ -1067,36 +1086,29 @@ def reorder_sequence(tensor, cp_size: int, seq_dim: int = 1, to_contiguous: bool
       *ori_tensor_shape[seq_dim + 1 :],
   )
 
+  # Swap target seq_dim with axis 0 to perform slicing/concat easily:
+  # e.g., [b, 2*cp_size, group_size, h, d] -> [2*cp_size, b, group_size, h, d]
+  swapped = jnp.swapaxes(reshaped, 0, seq_dim)
+
   if not to_contiguous:
-    # Create first and second halves
-    first_half = jnp.arange(cp_size)
-    second_half = jnp.arange(2 * cp_size - 1, cp_size - 1, -1)
-
-    # Stack and reshape to interleave
-    src_indices = jnp.stack([first_half, second_half], axis=1).reshape(-1)
-
+    # Split along axis 0 into halves: each [cp_size, b, group_size, h, d]
+    first_half, second_half = jnp.split(swapped, 2, axis=0)
+    second_half_reversed = second_half[::-1, ...]
+    # Stack along axis 1 to interleave: [cp_size, 2, b, group_size, h, d]
+    stacked = jnp.stack([first_half, second_half_reversed], axis=1)
+    # Reshape squashes the [cp_size, 2] pair dimensions back into [2*cp_size]: [2*cp_size, b, group_size, h, d]
+    permuted = stacked.reshape(2 * cp_size, *swapped.shape[1:])
   else:
+    # Strided slice extracts every other chunk natively: each [cp_size, b, group_size, h, d]
+    first_half = swapped[0::2, ...]
+    second_half_reversed = swapped[1::2, ...]
+    second_half = second_half_reversed[::-1, ...]
+    # Concatenate along axis 0: [2*cp_size, b, group_size, h, d]
+    permuted = jnp.concatenate([first_half, second_half], axis=0)
 
-    half = cp_size // 2
-
-    # Build the 1st and 2nd groups of contiguous‑pair indices:
-    first_pair = [4 * r for r in range(half)]  # [0, 4, 8, …]
-    second_pair = [4 * r + 2 for r in range(half)]  # [2, 6, 10, …]
-    third_pair = [2 * cp_size - 1 - 4 * r for r in range(half)]  # [2*cp_size-1, 2*cp_size-5, …]
-    fourth_pair = [i - 2 for i in third_pair]  # [2*cp_size-3, 2*cp_size-7, …]
-
-    # Concatenate so each rank’s two indices sit next to each other:
-    # e.g. [0,2, 4,6, …, (2cp‑1),(2cp‑3), …]
-    first_block = first_pair + third_pair
-    second_block = second_pair + fourth_pair
-
-    # Stack into shape (2*cp_size//2, 2) → then flatten → length=2*cp_size
-    src_indices = jnp.stack([jnp.array(first_block), jnp.array(second_block)], axis=1).reshape(-1)
-
-  # One gather and one reshape
-  reordered = jnp.take(reshaped, src_indices, axis=seq_dim)
-
-  # Reshape back to original dimensions
+  # Swap axis 0 back to seq_dim: e.g., [b, 2*cp_size, group_size, h, d]
+  reordered = jnp.swapaxes(permuted, 0, seq_dim)
+  # Restore original tensor shape: e.g., [b, s, h, d]
   return reordered.reshape(ori_tensor_shape)
 
 
@@ -1371,6 +1383,22 @@ def print_non_trivial_mesh_axis(mesh):
       print(f"{mesh_axis}: {axis_size}", flush=True)
 
 
+def bootstrap_transformer_engine_cgemm(config):
+  """Potentially initialize NCCL communicators for Collective GEMM operations if
+  the environment is distributed and has the appropriate config."""
+  import transformer_engine.jax.cpp_extensions as tex  # pylint: disable=import-outside-toplevel # pytype: disable=import-error
+
+  tsp_size = config.ici_tensor_sequence_parallelism * config.dcn_tensor_sequence_parallelism
+
+  # Setup NCCL buffers for GPU Collective GEMM operations
+  tex.collective_gemm_bootstrap(
+      jax.device_count(),
+      jax.local_device_count(),
+      jax.process_index(),
+      tsp_size,
+  )
+
+
 @contextmanager
 def maybe_get_transformer_engine_context(config):
   """Runs a transformer engine context engine manager for GPUs only."""
@@ -1398,9 +1426,9 @@ def transformer_engine_context():
     mesh_resource = MeshResource(  # pytype: disable=wrong-arg-types
         dp_resource="data",
         tp_resource="tensor",
-        # tpsp_resource = "tensor_sequence", #TODO(Phuong): add this back when upstreaming CGEMM
+        tpsp_resource="tensor_sequence",
         fsdp_resource="fsdp",
-        pp_resource=None,
+        pp_resource=None,  # pyrefly: ignore[bad-argument-type]
         cp_resource="context",
     )
     with global_shard_guard(mesh_resource):
@@ -1415,5 +1443,9 @@ def maybe_pad(inputs, tile_size):
   padding_amount = 0
   if inputs_dim % tile_size:
     padding_amount = tile_size - inputs_dim % tile_size
-    inputs = jax.lax.pad(inputs, jnp.array(0.0, dtype=inputs.dtype), [(0, padding_amount, 0), (0, 0, 0)])
+    inputs = jax.lax.pad(
+        inputs,
+        jnp.array(0.0, dtype=inputs.dtype),
+        [(0, padding_amount, 0), (0, 0, 0)],
+    )
   return inputs, padding_amount

@@ -81,7 +81,7 @@ def generate_responses(
     )
     responses = responses.text
 
-    if tmvp_config.debug.rl:
+    if tmvp_config.debug:
       max_logging.log(f"Pass {p+1}/{num_passes}, responses: {responses}")
 
     for idx, response in enumerate(responses):
@@ -101,13 +101,13 @@ def _score_single(
   has_correct_format = match_format.search(raw_response) is not None
   try:
     is_correct, is_partially_correct = utils_rl.check_correctness(extracted_response, answers, tmvp_config)
-    if tmvp_config.debug.rl:
+    if tmvp_config.debug:
       max_logging.log(f"Result has_correct_format: {has_correct_format}")
       max_logging.log(f"Result is_correct: {is_correct}")
       max_logging.log(f"Result is_partially_correct: {is_partially_correct}")
   except Exception as e:  # pylint: disable=broad-exception-caught
     is_correct, is_partially_correct = False, False
-    if tmvp_config.debug.rl:
+    if tmvp_config.debug:
       max_logging.log(f"Evaluation Exception: {e} — SKIPPED")
   return is_correct, is_partially_correct, has_correct_format
 
@@ -124,7 +124,7 @@ def score_responses(tmvp_config, question, responses, answers):
   Returns:
       Tuple of (is_correct, is_partially_correct, has_correct_format)
   """
-  if tmvp_config.debug.rl:
+  if tmvp_config.debug:
     max_logging.log("========================================")
     max_logging.log(f"Evaluation Question: {question}")
     max_logging.log(f"Evaluation Answer: {answers}")
@@ -142,7 +142,7 @@ def score_responses(tmvp_config, question, responses, answers):
     # extract the single-most frequent response
     counter = collections.Counter(extracted_responses)
     majority = counter.most_common(1)[0][0]
-    if tmvp_config.debug.rl:
+    if tmvp_config.debug:
       max_logging.log(f"Majority Response: {majority} (Count: {counter[majority]})")
 
     # Check the format for the majority response
@@ -174,7 +174,7 @@ def score_responses(tmvp_config, question, responses, answers):
     frac_correct = sum(s[0] for s in scores) / n_samples
     frac_partial = sum(s[1] for s in scores) / n_samples
     frac_format = sum(s[2] for s in scores) / n_samples
-    if tmvp_config.debug.rl:
+    if tmvp_config.debug:
       max_logging.log(f"{frac_correct*n_samples:.0f}/{n_samples} correct")
       max_logging.log(f"{frac_partial*n_samples:.0f}/{n_samples} partial")
       max_logging.log(f"{frac_format*n_samples:.0f}/{n_samples} format")
@@ -183,7 +183,7 @@ def score_responses(tmvp_config, question, responses, answers):
   raise ValueError(f"Unknown eval_mode: {eval_mode!r}")
 
 
-def _compute_row_reward(reward_fns, prompt, responses, answer, row_idx):
+def _compute_row_reward(reward_fns, prompt, question, responses, answer, row_idx):
   """Sum the per-function reward scores across all sampled responses for one prompt.
 
   Honors the sampling strategy `evaluate()` ran with: when `num_passes > 1`
@@ -192,6 +192,12 @@ def _compute_row_reward(reward_fns, prompt, responses, answer, row_idx):
   helper sums the reward across all of them. The caller divides the
   total by the number of (prompt, response) pairs to get the per-sample
   mean reward, mirroring tunix's GRPO per-rollout reward aggregation.
+
+  `question` is forwarded as a reward-fn kwarg because the built-in
+  `check_numbers` reward (and any user reward that wants to inspect the
+  raw question) reads it from `kwargs`. Training-time tunix passes the
+  whole dataset row to each reward fn; we mirror the kwargs the trainer
+  passes so eval-time and train-time reward calls are interchangeable.
 
   Returns a tuple `(score_sum, n_responses)`. On any exception the
   failure is logged and `(0.0, 0)` is returned so the caller's running
@@ -203,7 +209,7 @@ def _compute_row_reward(reward_fns, prompt, responses, answer, row_idx):
     score_sum = 0.0
     for resp in responses:
       for fn in reward_fns:
-        scores = fn(prompts=[prompt], completions=[resp], answer=[answer])
+        scores = fn(prompts=[prompt], completions=[resp], answer=[answer], question=question)
         if scores:
           score_sum += float(scores[0])
     return score_sum, len(responses)
@@ -283,7 +289,7 @@ def evaluate(
       # the actual per-(prompt, response) count at the end. See
       # `_compute_row_reward` for details.
       if use_reward:
-        row_sum, row_count = _compute_row_reward(reward_fns, prompt, responses, answer, total)
+        row_sum, row_count = _compute_row_reward(reward_fns, prompt, question, responses, answer, total)
         reward_sum += row_sum
         reward_count += row_count
 

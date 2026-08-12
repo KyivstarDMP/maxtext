@@ -19,7 +19,7 @@ while staying simple and "optimization-free" thanks to the power of Jax and the 
 """
 
 __author__ = "Google LLC"
-__version__ = "0.2.2"
+__version__ = "0.2.3"
 __description__ = (
     "MaxText is a high performance, highly scalable, open-source LLM written in pure Python/Jax and "
     "targeting Google Cloud TPUs and GPUs for training and **inference."
@@ -36,9 +36,12 @@ del os
 from jax.sharding import Mesh
 
 from maxtext.configs import pyconfig
+from maxtext.configs.types import MaxTextConfig
 from maxtext.models import models
 from maxtext.utils import maxtext_utils
 from maxtext.utils import model_creation_utils
 
 Transformer = models.Transformer
 transformer_as_linen = models.transformer_as_linen
+from_config = model_creation_utils.from_config
+from_pretrained = model_creation_utils.from_pretrained

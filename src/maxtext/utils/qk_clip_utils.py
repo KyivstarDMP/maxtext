@@ -83,13 +83,14 @@ def _max_logits_at(curr):
 
 
 def _scale_from_max_logits(max_logits_batch, tau):
-  s_max = jnp.max(max_logits_batch, axis=0)
+  axes = tuple(range(max_logits_batch.ndim - 1))
+  s_max = jnp.max(max_logits_batch, axis=axes)
   return jnp.minimum(1.0, tau / (s_max + 1e-6))
 
 
 def _clip_mla_weight(layer_name, param, scale, qk_nope):
   """Apply the per-head scale to a wq_b or wkv_b kernel."""
-  scale_b = scale[None, :, None]  # broadcasts over [rank, heads, dim]
+  scale_b = jnp.expand_dims(scale, axis=-1)  # broadcasts over [..., rank, heads, dim]
   head = param[..., :qk_nope]
   tail = param[..., qk_nope:]
   head_new = head * jnp.sqrt(scale_b)
@@ -150,7 +151,7 @@ def apply_qk_clip_nnx(state, intermediate_outputs, config):
   tau = float(config.qk_clip_threshold)
 
   _, params_state, _ = nnx.split(state.model, nnx.Param, ...)
-  params_dict = params_state.to_pure_dict()
+  params_dict = params_state.to_pure_dict()  # pyrefly: ignore[missing-attribute]
 
   def clip_mla_weights(path, param):
     if len(path) < 2:

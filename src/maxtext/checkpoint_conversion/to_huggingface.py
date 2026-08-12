@@ -57,7 +57,7 @@ Example Usage:
   To merge a LoRA adapter into a base model and save as a full HF model:
 
   export HF_AUTH_TOKEN="hf_YOUR_TOKEN"
-  python src/maxtext/checkpoint_conversion/to_huggingface.py \
+  python -m maxtext.checkpoint_conversion.to_huggingface \
     src/maxtext/configs/base.yml \
     model_name="gemma3-4b" \
     load_parameters_path="/path/to/base/checkpoint/" \
@@ -97,6 +97,8 @@ from maxtext.checkpoint_conversion.utils.utils import (
 from maxtext.utils import max_logging
 from maxtext.utils import max_utils
 from maxtext.utils.globals import HF_IDS
+from maxtext.utils.lora_utils import sync_lora_metadata
+from maxtext.utils.model_creation_utils import verify_and_sync_scan_layers
 
 
 flags.DEFINE_bool(
@@ -104,6 +106,26 @@ flags.DEFINE_bool(
     False,
     "If True, overrides Hugging Face config architecture parameters (heads, layers, dims) "
     "with values from the MaxText config. If False, raises a ValueError on mismatch.",
+)
+
+flags.DEFINE_string(
+    "hf_model_path",
+    None,
+    "(Optional) Customized remote HF repo (or local path) to source the tokenizer/processor "
+    "from. If not specified, defaults to maxtext.utils.globals.HF_IDS[model_name]. Use this to "
+    "bundle a different tokenizer than the default (e.g., the base model's tokenizer instead of "
+    "the instruction-tuned one).",
+)
+
+flags.DEFINE_integer(
+    "parallel_threads",
+    4,
+    "Number of threads used for parallel saving of weights. Lower this value to reduce peak host RAM usage.",
+)
+flags.register_validator(
+    "parallel_threads",
+    lambda value: value > 0,
+    message="--parallel_threads must be a positive integer.",
 )
 
 FLAGS = flags.FLAGS
@@ -116,12 +138,35 @@ def _get_lora_delta(key, lora_state_dict, lora_scaling):
     a_key, b_key = key[7:] + "_lora_a", key[7:] + "_lora_b"
 
   if a_key in lora_state_dict and b_key in lora_state_dict:
-    data_a, data_b = jnp.asarray(lora_state_dict[a_key], dtype=jnp.float32), jnp.asarray(
-        lora_state_dict[b_key], dtype=jnp.float32
-    )
-    if data_a.ndim > 2:
+    data_a = jnp.asarray(lora_state_dict[a_key], dtype=jnp.float32)
+    data_b = jnp.asarray(lora_state_dict[b_key], dtype=jnp.float32)
+
+    is_attention = "attention" in key.lower() or "attn" in key.lower()
+
+    if is_attention and data_a.ndim > 2:
+      if data_a.ndim == 4:
+        # Scanned attention projection: [num_layers, input_dim, heads, rank] & [num_layers, rank, heads, output_dim]
+        return jnp.einsum("lipr,lrpo->lipo", data_a, data_b) * lora_scaling
+      # Unscanned attention projection: [input_dim, heads, rank] & [rank, heads, output_dim]
       return jnp.einsum("ipr,rpo->ipo", data_a, data_b) * lora_scaling
-    return jnp.matmul(data_a, data_b) * lora_scaling
+    else:
+      if data_a.ndim == 3:
+        # Scanned standard linear projection: can be [num_layers, input_dim, rank] or [input_dim, num_layers, rank]
+        rank = data_a.shape[2]
+        if rank == data_b.shape[1] and rank != data_b.shape[0]:
+          # Case A: [num_layers, input_dim, rank] & [num_layers, rank, output_dim]
+          return jnp.einsum("lir,lro->lio", data_a, data_b) * lora_scaling
+        elif rank == data_b.shape[0] and rank != data_b.shape[1]:
+          # Case B: [input_dim, num_layers, rank] & [rank, num_layers, output_dim]
+          return jnp.einsum("ilr,rlo->ilo", data_a, data_b) * lora_scaling
+        else:
+          # Disambiguate using key names (Case B is typically 'wo' or 'out-kernel' / 'out_proj')
+          if any(term in key for term in ["wo", "out-kernel", "out_proj"]):
+            return jnp.einsum("ilr,rlo->ilo", data_a, data_b) * lora_scaling
+          else:
+            return jnp.einsum("lir,lro->lio", data_a, data_b) * lora_scaling
+      # Unscanned standard linear projection
+      return jnp.matmul(data_a, data_b) * lora_scaling
   return None
 
 
@@ -275,6 +320,32 @@ def _validate_or_update_architecture(hf_config, max_config, override: bool):
     raise ValueError(error_msg)
 
 
+def _apply_yarn_rope_config(hf_config, max_config) -> None:
+  """Apply MaxText YaRN RoPE values without dropping HF model-specific fields."""
+  rope_scaling = getattr(hf_config, "rope_scaling", None)
+  if isinstance(rope_scaling, dict):
+    rope_scaling = dict(rope_scaling)
+  else:
+    rope_scaling = {}
+
+  rope_type_key = "type" if "type" in rope_scaling and "rope_type" not in rope_scaling else "rope_type"
+  rope_scaling.update(
+      {
+          "beta_fast": float(getattr(max_config, "beta_fast", 32.0)),
+          "beta_slow": float(getattr(max_config, "beta_slow", 1.0)),
+          "factor": float(getattr(max_config, "rope_factor", 32.0)),
+          "original_max_position_embeddings": getattr(max_config, "original_max_position_embeddings", 4096),
+          "rope_theta": getattr(max_config, "rope_max_timescale"),
+          rope_type_key: "yarn",
+          "truncate": getattr(max_config, "rope_truncate", False),
+      }
+  )
+
+  hf_config.rope_theta = getattr(max_config, "rope_max_timescale")
+  hf_config.rope_scaling = rope_scaling
+  hf_config.rope_parameters = rope_scaling
+
+
 def _transform_weights_to_adapter(param_map, state_dict):
   """Extracts standalone PEFT weights from MaxText state dict."""
   processed_params_list = []
@@ -286,19 +357,38 @@ def _transform_weights_to_adapter(param_map, state_dict):
     if a_key in state_dict and b_key in state_dict:
       data_a, data_b = state_dict[a_key], state_dict[b_key]
       hf_paths = [hf_paths] if not isinstance(hf_paths, list) else hf_paths
-      for i in range(min(data_a.shape[1] if data_a.ndim > 2 else 1, len(hf_paths))):
-        found_hf_modules.add(hf_paths[i].split(".")[-2])
-        name = hf_paths[i].replace(".weight", "")
+      for i, hf_path in enumerate(hf_paths):
+        found_hf_modules.add(hf_path.split(".")[-2])
+        name = hf_path.replace(".weight", "")
+
+        if data_a.ndim > 2:
+          if data_a.shape[0] == len(hf_paths):
+            # Case A: layer dimension is axis 0
+            layer_a = data_a[i, ...]
+            layer_b = data_b[i, ...]
+          else:
+            # Case B: layer dimension is axis 1
+            layer_a = data_a[:, i, ...]
+            layer_b = data_b[:, i, ...]
+        else:
+          layer_a = data_a
+          layer_b = data_b
+
+        if layer_a.ndim > 2:
+          layer_a = layer_a[:, 0, :]
+        if layer_b.ndim > 2:
+          layer_b = layer_b[:, 0, :]
+
         processed_params_list.append(
             (
                 f"base_model.model.{name}.lora_A.weight",
-                jax.numpy.asarray((data_a[:, i, :] if data_a.ndim > 2 else data_a).T),
+                jax.numpy.asarray(layer_a.T),
             )
         )
         processed_params_list.append(
             (
                 f"base_model.model.{name}.lora_B.weight",
-                jax.numpy.asarray((data_b[:, i, :] if data_b.ndim > 2 else data_b).T),
+                jax.numpy.asarray(layer_b.T),
             )
         )
   return dict(processed_params_list), found_hf_modules
@@ -352,7 +442,14 @@ def _transform_and_save_weights(
       raise ValueError("Error: No weights were transformed. Check mappings and parameter paths.")
 
     max_logging.log("\nSaving HuggingFace model...")
-    save_model_files(transformed_hf_weights, hf_config_obj, tokenizer, processor, output_directory)
+    save_model_files(
+        transformed_hf_weights,
+        hf_config_obj,
+        tokenizer,
+        processor,
+        output_directory,
+        parallel_threads=FLAGS.parallel_threads,
+    )
     max_logging.log(f"✅ MaxText model successfully saved in HuggingFace format at {output_directory}")
 
   max_logging.log(f"Elapse for transform and save: {(time.time() - start) / 60:.2f} min")
@@ -374,6 +471,14 @@ def main(argv: Sequence[str]) -> None:
   assert (
       config.load_full_state_path == ""
   ), "This script expects parameters, not a full state. Use generate_param_only_checkpoint first if needed."
+
+  if not config.load_parameters_path and config.lora.lora_restore_path:
+    # Standalone LoRA conversion uses lora_restore_path for metadata
+    temp_config = config.model_copy(update={"load_parameters_path": config.lora.lora_restore_path})
+    temp_config = verify_and_sync_scan_layers(temp_config)
+    config = config.model_copy(update={"scan_layers": temp_config.scan_layers})
+  else:
+    config = verify_and_sync_scan_layers(config)
   max_utils.print_system_information()
   overall_start = time.time()
 
@@ -382,6 +487,9 @@ def main(argv: Sequence[str]) -> None:
 
   if not load_parameters_path and not lora_restore_path:
     raise ValueError("Either load_parameters_path or lora_restore_path must be specified.")
+
+  if lora_restore_path:
+    sync_lora_metadata(config)
 
   # Load Maxtext checkpoint using Orbax (now smart enough to load both if present)
   max_logging.log("\nLoading Orbax checkpoint(s)...")
@@ -404,11 +512,15 @@ def main(argv: Sequence[str]) -> None:
   # Validate architecture consistency (raising ValueError on mismatch) or override HF config if specified.
   _validate_or_update_architecture(hf_config_obj, config, override=FLAGS.override_model_architecture)
 
+  # Ensure YaRN rope params are preserved if specified in the maxtext config
+  if getattr(config, "rope_type", None) == "yarn":
+    _apply_yarn_rope_config(hf_config_obj, config)
+
   # 2. Load Tokenizer
   if model_key not in HF_IDS:
     raise ValueError(f"HF Tokenizer ID not found for model key: {model_key}")
   hf_token = config.hf_access_token
-  hf_tokenizer_id = HF_IDS[model_key]
+  hf_tokenizer_id = FLAGS.hf_model_path or HF_IDS[model_key]
   tokenizer = AutoTokenizer.from_pretrained(hf_tokenizer_id, token=hf_token)
 
   # For multi-modal case:
@@ -424,9 +536,7 @@ def main(argv: Sequence[str]) -> None:
   maxtext_state_dict = detect_and_extract_checkpoint(checkpoint_dict)
 
   # Validate that checkpoint keys match the parameter mapping
-  state_keys = set(maxtext_state_dict) | {
-      k.replace("_lora_a", "").replace("_lora_b", "") for k in maxtext_state_dict if "_lora_" in k
-  }
+  state_keys = {k.replace("_lora_a", "").replace("_lora_b", "") for k in maxtext_state_dict}
   filtered_map_keys = validate_and_filter_param_map_keys(param_map, state_keys)
 
   # When not converting a multimodal model, skip vision encoder weights even if

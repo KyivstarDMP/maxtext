@@ -67,10 +67,12 @@ from maxtext.common import train_state_nnx
 
 import transformers
 
-from ml_goodput_measurement.src.goodput import GoodputRecorder
+from maxtext.common.goodput import goodput as _goodput_module
+
+GoodputRecorder = _goodput_module.GoodputRecorder
 
 import maxtext as mt
-from maxtext.configs import pyconfig
+from maxtext.configs import pyconfig, types
 from maxtext.utils.globals import EPS
 from maxtext.trainers.pre_train.train import get_first_step
 from maxtext.common import checkpointing, profiler
@@ -87,7 +89,7 @@ from maxtext.common.goodput import (
 from maxtext.experimental.rl import grpo_input_pipeline
 from maxtext.experimental.rl import grpo_utils
 from maxtext.common.metric_logger import MetricLogger
-from maxtext.common.vertex_tensorboard import VertexTensorboardManager
+from maxtext.common.gcloud_stub import vertex_tensorboard_modules
 from maxtext.utils import exceptions
 from maxtext.utils import gcs_utils
 from maxtext.utils import max_logging
@@ -97,6 +99,8 @@ from maxtext.utils import model_creation_utils
 from maxtext.utils import maxtext_utils
 from maxtext.utils import sharding
 from maxtext.utils import train_utils
+
+VertexTensorboardManager, _vertex_tb_is_stub = vertex_tensorboard_modules()
 
 # pylint: disable=too-many-positional-arguments
 
@@ -467,8 +471,8 @@ def _train_step_nnx(model_graphdef, config, state_mesh_shardings, state, data):
   Args:
     model_graphdef: NNX `GraphDef` of the `TrainStateNNX`.
     config: Training configuration object.
-    state_mesh_shardings: Sharding spec for the train state. Unused on this
-      path; kept for signature parity with `train_step`.
+    state_mesh_shardings: Sharding spec for the train state; used to move the
+      optimizer state to device when `optimizer_memory_host_offload` is set.
     state: Flat `nnx.State` matching `model_graphdef`.
     data: A batch dict produced by the GRPO input pipeline.
 
@@ -476,14 +480,6 @@ def _train_step_nnx(model_graphdef, config, state_mesh_shardings, state, data):
     A tuple `(new_state, metrics)`. `new_state` is filtered to exclude
     `nnx.Intermediate`. `metrics` is a dict shaped like the Linen path's.
   """
-  del state_mesh_shardings  # Host-offload paths are not yet wired up here.
-
-  if config.gradient_accumulation_steps > 1:
-    raise NotImplementedError(
-        "GRPO + pure_nnx + gradient_accumulation_steps>1 not supported yet. "
-        "Set gradient_accumulation_steps=1 or pure_nnx=False."
-    )
-
   state = nnx.merge(model_graphdef, state)  # Reconstruct the TrainStateNNX.
   policy_graphdef, curr_params, rest = nnx.split(state.model, nnx.Param, ...)
   # Split the reference model into (graphdef, state) so we pass `ref_state` as
@@ -501,13 +497,61 @@ def _train_step_nnx(model_graphdef, config, state_mesh_shardings, state, data):
     return loss, (aux, new_rest)
 
   grad_func = jax.value_and_grad(diff_wrapper, argnums=0, has_aux=True)
-  (loss, (aux, new_rest)), raw_grads = grad_func(curr_params, rest, ref_state, config, data)
+
+  if config.gradient_accumulation_steps <= 1:
+    (loss, (aux, new_rest)), raw_grads = grad_func(curr_params, rest, ref_state, config, data)
+  else:
+    # Mirror the pre-train NNX gradient-accumulation loop and the Linen GRPO one:
+    # params stay fixed across microbatches while the non-param state (rest, e.g.
+    # RNGs) advances in the scan carry. Grads are accumulated weighted by each
+    # microbatch's total_weights, then normalized once after the scan.
+    def reshape_to_microbatch_accumulations(batch_arr):
+      microbatches = config.gradient_accumulation_steps
+      microbatch_shape = (microbatches, batch_arr.shape[0] // microbatches) + batch_arr.shape[1:]
+      return jnp.reshape(batch_arr, microbatch_shape)
+
+    ga_data = jax.tree_util.tree_map(reshape_to_microbatch_accumulations, data)
+
+    def accumulate_gradient(carry, microbatch):
+      (_, (aux, new_rest)), cur_grad = grad_func(curr_params, carry["rest"], ref_state, config, microbatch)
+      carry["loss"] += aux.total_loss
+      carry["grad"] = jax.tree_util.tree_map(lambda x, y: x * aux.total_weights + y, cur_grad, carry["grad"])
+      carry["total_weights"] += aux.total_weights
+      carry["rest"] = new_rest
+      return carry, aux
+
+    init_carry = {
+        "loss": 0.0,
+        "grad": jax.tree_util.tree_map(jnp.zeros_like, curr_params),
+        "total_weights": 0.0,
+        "rest": rest,
+    }
+    carry, aux = jax.lax.scan(accumulate_gradient, init_carry, ga_data, length=config.gradient_accumulation_steps)
+    # total_loss is already a per-batch mean (and includes moe_lb), so the full-batch
+    # loss is the mean across the equal-sized microbatches.
+    loss = carry["loss"] / config.gradient_accumulation_steps
+    raw_grads = jax.tree_util.tree_map(lambda arr: arr / carry["total_weights"], carry["grad"])
+    aux = jax.tree.map(lambda x: jnp.sum(x, axis=0), aux)
+    new_rest = carry["rest"]
+
   nnx.update(state.model, new_rest)
 
   if config.gradient_clipping_threshold > 0:
     grads = maxtext_utils.apply_gradient_clipping(raw_grads, None, config.gradient_clipping_threshold)
   else:
     grads = raw_grads
+  if config.optimizer_memory_host_offload:
+    # Mirror the pre-train NNX path: move the optimizer state from pinned_host to
+    # device before the in-place optimizer update. (The Linen GRPO path also casts
+    # params/reference to bf16 under this flag; NNX host-offload moves the memory
+    # kind without casting, matching the pre-train NNX convention.)
+    device_opt_shardings = jax.tree_util.tree_map_with_path(
+        maxtext_utils_nnx.move_memory_to_device,
+        state_mesh_shardings.optimizer,
+        is_leaf=lambda x: isinstance(x, jax.sharding.NamedSharding),
+    )
+    opt_state = nnx.state(state.optimizer)
+    nnx.update(state.optimizer, jax.device_put(opt_state, device_opt_shardings))
   state.apply_gradients(grads)
   new_state = state
 
@@ -520,11 +564,14 @@ def _train_step_nnx(model_graphdef, config, state_mesh_shardings, state, data):
       "learning/completion_length": aux.completion_length,
       "learning/moe_lb_loss": aux.moe_lb_loss,
       "learning/total_weights": aux.total_weights,
-      "learning/grad_norm": max_utils.l2norm_pytree(grads),
-      "learning/raw_grad_norm": max_utils.l2norm_pytree(raw_grads),
   }
-  new_policy_params = nnx.state(new_state.model, nnx.Param)
-  scalar_metrics["learning/param_norm"] = max_utils.l2norm_pytree(new_policy_params)
+  # These norms pull host-resident tensors back to device, defeating the offload,
+  # so skip them when offloading (matches the Linen GRPO path).
+  if not config.optimizer_memory_host_offload:
+    scalar_metrics["learning/grad_norm"] = max_utils.l2norm_pytree(grads)
+    scalar_metrics["learning/raw_grad_norm"] = max_utils.l2norm_pytree(raw_grads)
+    new_policy_params = nnx.state(new_state.model, nnx.Param)
+    scalar_metrics["learning/param_norm"] = max_utils.l2norm_pytree(new_policy_params)
   metrics = {"scalar": scalar_metrics, "scalars": {}}
 
   return nnx.state(new_state, nnx.Not(nnx.Intermediate)), metrics
@@ -817,7 +864,7 @@ def setup_train_loop(
 
   with maybe_record_goodput(recorder, GoodputEvent.TRAINING_PREPARATION):
     data_iterator = grpo_input_pipeline.create_data_iterator(config_inference, inference_mesh)
-    state, _, state_mesh_shardings, data_iterator = maxtext_utils.setup_training_state(
+    state, _, state_mesh_shardings, data_iterator, _ = maxtext_utils.setup_training_state(
         data_iterator, config, mesh, checkpoint_manager, init_state_fn
     )
 
@@ -1191,7 +1238,7 @@ def train_loop(config, config_inference, recorder, state=None):
         checkpointing.maybe_save_checkpoint(checkpoint_manager, state_to_save, config, data_iterator)
       elif checkpoint_manager is not None:
         # in case the last checkpoint_period checkpoint is still in progress
-        checkpoint_manager.wait_until_finished()
+        checkpointing.wait_until_finished(checkpoint_manager)
     _job_completed_gracefully = True
   except exceptions.StopTraining as e:
     prof.deactivate()
@@ -1230,7 +1277,7 @@ def main(argv: Sequence[str]) -> None:
         os.environ.get("LIBTPU_INIT_ARGS", "") + " --xla_tpu_spmd_rng_bit_generator_unsafe=true"
     )
   configs_argv = max_utils.parse_custom_args(argv)
-  config = pyconfig.initialize(configs_argv[0])
+  config = pyconfig.initialize(configs_argv[0], config_class=types.RLConfig)
   if not config.use_grpo:
     raise ValueError("Please set the value of use_grpo to True")
   if config.inference_rollouts < 1 or config.inference_rollouts > config.steps:
@@ -1247,7 +1294,7 @@ def main(argv: Sequence[str]) -> None:
         f"Invalid value chosen for {config.inference_devices_per_replica=} and {config.inference_replicas=} "
         f"with {jax.device_count()} devices"
     )
-  config_inference = pyconfig.initialize(configs_argv[1])
+  config_inference = pyconfig.initialize(configs_argv[1], config_class=types.RLConfig)
 
   if config.per_device_batch_size < 1.0 or config_inference.per_device_batch_size < 1.0:
     raise ValueError("GRPO does not support setting per_device_batch_size < 1.0")

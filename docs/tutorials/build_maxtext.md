@@ -14,6 +14,8 @@
  limitations under the License.
  -->
 
+(build-docker)=
+
 # Build and upload MaxText Docker images
 
 This guide covers setting up a MaxText development environment and building container images for TPU and GPU workloads. These images can be used to run MaxText on GKE clusters with TPUs or GPUs, and are also required for running MaxText through XPK.
@@ -48,7 +50,21 @@ If the `docker run hello-world` command fails with a permission denied error (e.
 
 ## Installation Modes
 
-Follow the instructions in the [Installation guide](install_maxtext.md) to install the `maxtext[runner]` extra, which includes all necessary dependencies for building MaxText Docker images and running workloads through XPK. It automatically installs XPK, so you do not need to install it separately to manage your clusters and workloads.
+Follow the instructions in the [Installation guide](../install_maxtext.md) to install the `maxtext[runner]` extra, which includes all necessary dependencies for building MaxText Docker images and running workloads through XPK. It automatically installs XPK, so you do not need to install it separately to manage your clusters and workloads.
+
+## Pre-built MaxText Docker images
+
+MaxText publishes pre-built container images for TPU pre-training and TPU
+post-training workloads in Google Artifact Registry. You can use these images
+directly with Google Kubernetes Engine (GKE) or XPK without building images from
+scratch.
+
+| MaxText Version | TPU Pre-Training Image                                                     | TPU Post-Training Image                                                     |
+| --------------- | -------------------------------------------------------------------------- | --------------------------------------------------------------------------- |
+| `0.2.3`         | `us-docker.pkg.dev/cloud-tpu-images/maxtext-images/tpu_pre_training:0.2.3` | `us-docker.pkg.dev/cloud-tpu-images/maxtext-images/tpu_post_training:0.2.3` |
+
+If you need to customize dependencies or build from source, follow the
+instructions below to build your own MaxText Docker image.
 
 ## Build MaxText Docker image
 

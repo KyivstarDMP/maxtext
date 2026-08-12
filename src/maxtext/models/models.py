@@ -85,12 +85,14 @@ class TransformerLinenPure(nn.Module):
         config=cfg,
         mesh=self.mesh,
     )
-    self.vision_encoder = vision_encoder_as_linen(config=cfg, mesh=mesh) if cfg.use_multimodal else None
-    self.audio_encoder = audio_encoder_as_linen(config=cfg, mesh=mesh) if cfg.use_audio else None
+    self.vision_encoder = (
+        vision_encoder_as_linen(config=cfg, mesh=mesh) if getattr(self.config, "use_multimodal", False) else None
+    )
+    self.audio_encoder = audio_encoder_as_linen(config=cfg, mesh=mesh) if getattr(cfg, "use_audio", False) else None
     self.decoder = Decoder(config=cfg, mesh=mesh, quant=self.quant, model_mode=self.model_mode)
 
     # If MTP is enabled via config, set up the MTP block.
-    if self.config.mtp_num_layers > 0:
+    if getattr(self.config, "mtp_num_layers", 0) > 0:
       # Get the list of layer blueprints for the current model.
       # For MTP, we use the DecoderLayer blueprint to ensure architectural consistency.
       # By convention, this is the last layer in the list.
@@ -102,9 +104,9 @@ class TransformerLinenPure(nn.Module):
       self.mtp_block = multi_token_prediction_block_as_linen(
           config=self.config,
           mesh=self.mesh,
-          transformer_layer_module=mtp_layer_nnx,
-          decoder=self.decoder,
-          rngs=self.make_rng("mtp_block"),
+          transformer_layer_module=mtp_layer_nnx,  # pyrefly: ignore[bad-argument-type]
+          decoder=self.decoder,  # pyrefly: ignore[bad-argument-type]
+          rngs=self.make_rng("mtp_block"),  # pyrefly: ignore[bad-argument-type]
       )
 
   def logits_from_hidden_states_for_vocab_tiling(self, hidden_states, deterministic, model_mode):
@@ -129,6 +131,7 @@ class TransformerLinenPure(nn.Module):
       encoder_image_masks: None | jnp.ndarray = None,
       encoder_videos: None | jnp.ndarray = None,
       encoder_video_masks: None | jnp.ndarray = None,
+      encoder_video_grid_thw: None | jnp.ndarray = None,
       encoder_audios: None | jnp.ndarray = None,
       enable_dropout=True,
       model_mode=MODEL_MODE_TRAIN,
@@ -162,23 +165,27 @@ class TransformerLinenPure(nn.Module):
     audio_embeddings = None
     deepstack_visual_embeds = None
 
-    if self.config.use_multimodal and encoder_images is not None:
-      image_embeddings, deepstack_visual_embeds = self.vision_encoder(
+    if getattr(self.config, "use_multimodal", False) and encoder_images is not None:
+      image_embeddings, deepstack_visual_embeds = self.vision_encoder(  # pyrefly: ignore[not-callable]
           input_images=encoder_images, deterministic=not enable_dropout
       )
       bidirectional_mask_image = mm_processor.get_bidirectional_mask_vision(
           self.config, decoder_input_tokens, is_video=False
       )
 
-    if self.config.use_multimodal and encoder_videos is not None:
-      video_embeddings, deepstack_visual_embeds = self.vision_encoder(
-          input_images=encoder_videos, deterministic=not enable_dropout
+    if getattr(self.config, "use_multimodal", False) and encoder_videos is not None:
+      video_embeddings, deepstack_visual_embeds = self.vision_encoder(  # pyrefly: ignore[not-callable]
+          input_images=encoder_videos,
+          input_masks=encoder_video_masks,
+          video_grid_thw=encoder_video_grid_thw,
+          deterministic=not enable_dropout,
       )
+      encoder_video_masks = mm_processor.downsample_video_mask_to_tokens(encoder_video_masks, self.config)
       bidirectional_mask_video = mm_processor.get_bidirectional_mask_vision(
           self.config, decoder_input_tokens, is_video=True
       )
 
-    if self.config.use_multimodal and encoder_audios is not None and self.audio_encoder is not None:
+    if getattr(self.config, "use_multimodal", False) and encoder_audios is not None and self.audio_encoder is not None:
       audio_embeddings = self.audio_encoder(input_audio=encoder_audios, deterministic=not enable_dropout)
 
     # Create audio mask for placeholder tokens (qwen3-omni models)
@@ -218,7 +225,7 @@ class TransformerLinenPure(nn.Module):
     # dummy target tensors. This allows Flax to trace the MTPBlock and create
     # all its necessary parameters, without requiring the main training pipeline
     # to be aware of this initialization detail.
-    if self.is_initializing() and self.config.mtp_num_layers > 0:
+    if self.is_initializing() and getattr(self.config, "mtp_num_layers", 0) > 0:
       if decoder_target_tokens is None:
         dummy_shape = decoder_input_tokens.shape
         decoder_target_tokens = jnp.ones(dummy_shape, dtype=jnp.int32)
@@ -233,7 +240,7 @@ class TransformerLinenPure(nn.Module):
     #   2. The `shared_embedding` for both embedding future tokens and for its final
     #      logit projection.
     # Its only effect is to "sow" these losses; it does not alter the primary logits output.
-    if self.config.mtp_num_layers > 0:
+    if getattr(self.config, "mtp_num_layers", 0) > 0:
       self.mtp_block(
           shared_embedding=self.shared_embedding,
           main_hidden_state=hidden_state,
@@ -246,7 +253,7 @@ class TransformerLinenPure(nn.Module):
           model_mode=model_mode,
       )
 
-    if self.config.attention == "vllm_rpa":
+    if self.config.attention in ("vllm_rpa", "vllm_batched_rpa"):
       # In vLLM, logits are computed separately after updating the KV cache.
       return hidden_state, kv_caches
 
@@ -353,20 +360,21 @@ class Transformer(nnx.Module):
         config=cfg,
         rngs=rngs,
     )
-    self.vision_encoder = VisionEncoder(config=cfg, mesh=mesh, rngs=rngs) if cfg.use_multimodal else None
-    self.audio_encoder = AudioEncoder(config=cfg, mesh=mesh, rngs=rngs) if cfg.use_audio else None
+    self.vision_encoder = (
+        VisionEncoder(config=cfg, mesh=mesh, rngs=rngs) if getattr(cfg, "use_multimodal", False) else None
+    )
+    self.audio_encoder = AudioEncoder(config=cfg, mesh=mesh, rngs=rngs) if getattr(cfg, "use_audio", False) else None
     if cfg.pure_nnx_decoder:
       self.decoder = NNXDecoder(config=cfg, mesh=mesh, quant=self.quant, model_mode=self.model_mode, rngs=rngs)
     else:
       decoder_linen = Decoder(config=cfg, mesh=mesh, quant=self.quant, model_mode=self.model_mode)
       self.decoder = nnx_wrappers.ToNNX(decoder_linen, rngs=rngs)
-    self.hidden_states = None
 
     batch_size, seq_len = max_utils.get_batch_seq_len_for_mode(config=cfg, model_mode=model_mode)
     dummy_decoder_input_tokens = jnp.ones((batch_size, seq_len), dtype=jnp.int32)
     dummy_decoder_positions = jnp.ones((batch_size, seq_len), dtype=jnp.int32)
 
-    if self.config.attention == "vllm_rpa":
+    if self.config.attention in ("vllm_rpa", "vllm_batched_rpa"):
       try:
         # pylint: disable=import-outside-toplevel
         from tpu_inference.layers.common.attention_metadata import AttentionMetadata  # pytype: disable=import-error
@@ -385,7 +393,7 @@ class Transformer(nnx.Module):
       dummy_attention_metadata = None
 
     if not cfg.pure_nnx_decoder:
-      self.decoder.lazy_init(
+      self.decoder.lazy_init(  # pyrefly: ignore[missing-attribute]
           shared_embedding=self.token_embedder,
           decoder_input_tokens=dummy_decoder_input_tokens,
           decoder_positions=dummy_decoder_positions,
@@ -393,7 +401,7 @@ class Transformer(nnx.Module):
       )
 
     # If MTP is enabled via config, set up the MTP block.
-    if self.config.mtp_num_layers > 0:
+    if getattr(self.config, "mtp_num_layers", 0) > 0:
       # Get the list of layer blueprints for the current model.
       layer_types = self.decoder.get_decoder_layers()
       # For MTP, we use the DecoderLayer blueprint to ensure architectural consistency.
@@ -443,6 +451,7 @@ class Transformer(nnx.Module):
       encoder_image_masks: jax.Array | None = None,
       encoder_videos: jax.Array | None = None,
       encoder_video_masks: jax.Array | None = None,
+      encoder_video_grid_thw: jax.Array | None = None,
       encoder_audios: jax.Array | None = None,
       enable_dropout=True,
       model_mode=MODEL_MODE_TRAIN,
@@ -490,23 +499,27 @@ class Transformer(nnx.Module):
     video_embeddings = None
     audio_embeddings = None
     deepstack_visual_embeds = None
-    if self.config.use_multimodal and encoder_images is not None:
-      image_embeddings, deepstack_visual_embeds = self.vision_encoder(
+    if getattr(self.config, "use_multimodal", False) and encoder_images is not None:
+      image_embeddings, deepstack_visual_embeds = self.vision_encoder(  # pyrefly: ignore[not-callable]
           input_images=encoder_images, deterministic=not enable_dropout
       )
       bidirectional_mask_image = mm_processor.get_bidirectional_mask_vision(
           self.config, decoder_input_tokens, is_video=False
       )
 
-    if self.config.use_multimodal and encoder_videos is not None:
-      video_embeddings, deepstack_visual_embeds = self.vision_encoder(
-          input_images=encoder_videos, deterministic=not enable_dropout
+    if getattr(self.config, "use_multimodal", False) and encoder_videos is not None:
+      video_embeddings, deepstack_visual_embeds = self.vision_encoder(  # pyrefly: ignore[not-callable]
+          input_images=encoder_videos,
+          input_masks=encoder_video_masks,
+          video_grid_thw=encoder_video_grid_thw,
+          deterministic=not enable_dropout,
       )
+      encoder_video_masks = mm_processor.downsample_video_mask_to_tokens(encoder_video_masks, self.config)
       bidirectional_mask_video = mm_processor.get_bidirectional_mask_vision(
           self.config, decoder_input_tokens, is_video=True
       )
 
-    if self.config.use_multimodal and encoder_audios is not None and self.audio_encoder is not None:
+    if getattr(self.config, "use_multimodal", False) and encoder_audios is not None and self.audio_encoder is not None:
       audio_embeddings = self.audio_encoder(input_audio=encoder_audios, deterministic=not enable_dropout)
 
     # Create audio mask for placeholder tokens (qwen3-omni models)
@@ -528,11 +541,11 @@ class Transformer(nnx.Module):
       )
 
     mutable_collections = []
-    if self.config.record_internal_nn_metrics:
+    if getattr(self.config, "record_internal_nn_metrics", False):
       mutable_collections.append("intermediates")
-    if self.config.distill_beta > 0.0 and "intermediates" not in mutable_collections:
+    if getattr(self.config, "distill_beta", 0.0) > 0.0 and "intermediates" not in mutable_collections:
       mutable_collections.append("intermediates")
-    if self.config.load_balance_loss_weight > 0.0 and "intermediates" not in mutable_collections:
+    if getattr(self.config, "load_balance_loss_weight", 0.0) > 0.0 and "intermediates" not in mutable_collections:
       mutable_collections.append("intermediates")
 
     if self.config.pure_nnx_decoder:
@@ -564,12 +577,8 @@ class Transformer(nnx.Module):
           kv_caches=kv_caches,
           attention_metadata=attention_metadata,
           deepstack_visual_embeds=deepstack_visual_embeds,
-          mutable=mutable_collections,
+          mutable=mutable_collections,  # pyrefly: ignore[unexpected-keyword]
       )  # pytype: disable=wrong-keyword-args
-
-    # Materialize hidden state when vocab tiling is enabled
-    if self.config.num_vocab_tiling > 1:
-      self.hidden_states = hidden_state
 
     # If we are initializing the model AND MTP is enabled, we must create
     # dummy target tensors. This allows Flax to trace the MTPBlock and create
@@ -590,7 +599,7 @@ class Transformer(nnx.Module):
     #   2. The `shared_embedding` for both embedding future tokens and for its final
     #      logit projection.
     # Its only effect is to "sow" these losses; it does not alter the primary logits output.
-    if self.config.mtp_num_layers > 0:
+    if getattr(self.config, "mtp_num_layers", 0) > 0:
       self.mtp_block(
           shared_embedding=self.token_embedder,
           main_hidden_state=hidden_state,
@@ -603,7 +612,7 @@ class Transformer(nnx.Module):
           model_mode=model_mode,
       )
 
-    if self.config.attention == "vllm_rpa":
+    if self.config.attention in ("vllm_rpa", "vllm_batched_rpa"):
       # In vLLM, logits are computed separately after updating the KV cache.
       return hidden_state, kv_caches
 

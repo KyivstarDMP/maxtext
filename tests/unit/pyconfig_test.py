@@ -15,11 +15,14 @@
 """Tests for pyconfig."""
 
 import os.path
+import subprocess
+import sys
 import tempfile
 import unittest
 
 from maxtext.configs import pyconfig
 from maxtext.configs.pyconfig import resolve_config_path, _CONFIG_FILE_MAPPING, _module_from_path
+from maxtext.configs.types import _normalize_axes, infer_cp_axes, infer_ep_axes
 from maxtext.input_pipeline import data_processing_utils
 from maxtext.utils.globals import MAXTEXT_CONFIGS_DIR, MAXTEXT_PKG_DIR
 from tests.utils.test_helpers import get_test_config_path, get_post_train_test_config_path
@@ -148,6 +151,38 @@ class PyconfigTest(unittest.TestCase):
     result = _module_from_path(module_file)
     self.assertEqual(result, "maxtext.trainers.pre_train.train")
 
+  def test_train_import_without_tensorflow(self):
+    """Verifies that importing the pre-training entrypoint does not require TensorFlow.
+
+    This runs in a subprocess because TensorFlow may already be cached in the main process.
+    The subprocess temporarily replaces Python's built-in import function with
+    a wrapper that raises ``ModuleNotFoundError`` only for TensorFlow imports.
+    A successful subprocess proves that ``train`` remains importable and sets
+    ``_TF_AVAILABLE`` to False when TensorFlow is absent.
+    """
+    script = """
+import builtins
+
+# Save Python's real import function so non-TensorFlow imports continue to work.
+original_import = builtins.__import__
+
+
+def import_without_tensorflow(name, *args, **kwargs):
+  if name == "tensorflow" or name.startswith("tensorflow."):
+    raise ModuleNotFoundError("TensorFlow blocked by test")
+  return original_import(name, *args, **kwargs)
+
+
+# Simulate TensorFlow not being installed for the remainder of this subprocess.
+builtins.__import__ = import_without_tensorflow
+
+from maxtext.trainers.pre_train import train
+
+assert train._TF_AVAILABLE is False
+"""
+
+    subprocess.run([sys.executable, "-c", script], check=True)
+
   def test_hlo_dump_module_names_none_coercion(self):
     config = pyconfig.initialize(
         [os.path.join(MAXTEXT_PKG_DIR, "train.py"), get_test_config_path()],
@@ -237,6 +272,162 @@ class PyconfigTest(unittest.TestCase):
 
     # Verify that passing this coerced list to the SFT column validator passes without error (Scenario A)
     data_processing_utils.validate_and_configure_sft_columns(config.train_data_columns, None)
+
+  def test_local_sa_flags_inherit_from_global_when_unset(self):
+    """local_sa_* flags default to None and should inherit the corresponding sa_* value."""
+    config = pyconfig.initialize(
+        [os.path.join(MAXTEXT_PKG_DIR, "train.py"), get_test_config_path()],
+        skip_jax_distributed_system=True,
+        sa_block_q=64,
+        sa_block_kv=128,
+        sa_block_kv_compute=192,
+        sa_block_q_dkv=64,
+        sa_block_kv_dkv=128,
+        sa_block_kv_dkv_compute=192,
+        sa_block_q_dq=64,
+        sa_block_kv_dq=128,
+        sa_use_fused_bwd_kernel=True,
+        sa_q_layout="HEAD_DIM_MINOR",
+        sa_k_layout="HEAD_DIM_MINOR",
+        sa_v_layout="HEAD_DIM_MINOR",
+        use_splash_scheduler=True,
+    )
+    self.assertEqual(config.local_sa_block_q, 64)
+    self.assertEqual(config.local_sa_block_kv, 128)
+    self.assertEqual(config.local_sa_block_kv_compute, 192)
+    self.assertEqual(config.local_sa_block_q_dkv, 64)
+    self.assertEqual(config.local_sa_block_kv_dkv, 128)
+    self.assertEqual(config.local_sa_block_kv_dkv_compute, 192)
+    self.assertEqual(config.local_sa_block_q_dq, 64)
+    self.assertEqual(config.local_sa_block_kv_dq, 128)
+    self.assertTrue(config.local_sa_use_fused_bwd_kernel)
+    self.assertEqual(config.local_sa_q_layout, "HEAD_DIM_MINOR")
+    self.assertEqual(config.local_sa_k_layout, "HEAD_DIM_MINOR")
+    self.assertEqual(config.local_sa_v_layout, "HEAD_DIM_MINOR")
+    self.assertTrue(config.local_use_splash_scheduler)
+
+  def test_local_sa_flags_explicit_override(self):
+    """Explicitly set local_sa_* flags should not be overridden by the global sa_* value."""
+    config = pyconfig.initialize(
+        [os.path.join(MAXTEXT_PKG_DIR, "train.py"), get_test_config_path()],
+        skip_jax_distributed_system=True,
+        sa_block_q=512,
+        local_sa_block_q=64,
+        sa_block_kv=512,
+        local_sa_block_kv=128,
+        sa_block_kv_compute=512,
+        local_sa_block_kv_compute=192,
+        sa_block_q_dkv=512,
+        local_sa_block_q_dkv=64,
+        sa_block_kv_dkv=512,
+        local_sa_block_kv_dkv=128,
+        sa_block_kv_dkv_compute=512,
+        local_sa_block_kv_dkv_compute=192,
+        sa_block_q_dq=512,
+        local_sa_block_q_dq=64,
+        sa_block_kv_dq=512,
+        local_sa_block_kv_dq=128,
+        sa_use_fused_bwd_kernel=False,
+        local_sa_use_fused_bwd_kernel=True,
+        sa_q_layout="HEAD_DIM_MINOR",
+        local_sa_q_layout="SEQ_MINOR",
+        sa_k_layout="HEAD_DIM_MINOR",
+        local_sa_k_layout="SEQ_MINOR",
+        sa_v_layout="HEAD_DIM_MINOR",
+        local_sa_v_layout="SEQ_MINOR",
+        use_splash_scheduler=True,
+        local_use_splash_scheduler=False,
+    )
+    self.assertEqual(config.local_sa_block_q, 64)
+    self.assertEqual(config.local_sa_block_kv, 128)
+    self.assertEqual(config.local_sa_block_kv_compute, 192)
+    self.assertEqual(config.local_sa_block_q_dkv, 64)
+    self.assertEqual(config.local_sa_block_kv_dkv, 128)
+    self.assertEqual(config.local_sa_block_kv_dkv_compute, 192)
+    self.assertEqual(config.local_sa_block_q_dq, 64)
+    self.assertEqual(config.local_sa_block_kv_dq, 128)
+    self.assertTrue(config.local_sa_use_fused_bwd_kernel)
+    self.assertEqual(config.local_sa_q_layout, "SEQ_MINOR")
+    self.assertEqual(config.local_sa_k_layout, "SEQ_MINOR")
+    self.assertEqual(config.local_sa_v_layout, "SEQ_MINOR")
+    self.assertFalse(config.local_use_splash_scheduler)
+
+  def test_eval_start_step_config(self):
+    """Verifies that eval_start_step defaults to 0 and can be overridden via pyconfig."""
+    config_default = pyconfig.initialize(
+        [os.path.join(MAXTEXT_PKG_DIR, "train.py"), get_test_config_path()],
+        skip_jax_distributed_system=True,
+    )
+    self.assertEqual(config_default.eval_start_step, 0)
+
+    config_override = pyconfig.initialize(
+        [os.path.join(MAXTEXT_PKG_DIR, "train.py"), get_test_config_path()],
+        skip_jax_distributed_system=True,
+        eval_start_step=50,
+    )
+    self.assertEqual(config_override.eval_start_step, 50)
+
+  def test_eval_start_step_negative_raises_error(self):
+    """Verifies that eval_start_step < 0 raises a validation error."""
+    with self.assertRaises((ValueError, Exception)):
+      pyconfig.initialize(
+          [os.path.join(MAXTEXT_PKG_DIR, "train.py"), get_test_config_path()],
+          skip_jax_distributed_system=True,
+          eval_start_step=-1,
+      )
+
+  # ------------------------------------------------------------------
+  # Tests for infer_cp_axes / infer_ep_axes and EP rank flag disabling
+  # ------------------------------------------------------------------
+
+  def test_normalize_axes_basics(self):
+    """_normalize_axes handles None, str, list, and empty list."""
+    self.assertEqual(_normalize_axes(None), ())
+    self.assertEqual(_normalize_axes("expert"), ("expert",))
+    self.assertEqual(_normalize_axes(["a", "b"]), ("a", "b"))
+    self.assertEqual(_normalize_axes([]), ())
+
+  def test_ep_rank_1_raises_on_ep_flags(self):
+    """When EP rank is 1 (no EP rules), setting EP-only flags must raise ValueError."""
+    # No 'exp' rule -> infer_ep_axes returns () -> EP rank is 1.
+    rules_no_ep = [["activation_length", ["context"]]]
+    self.assertEqual(infer_ep_axes(rules_no_ep), ())
+
+    # Each flag that must be disabled when EP rank == 1.
+    ep_disabled_flags = {
+        "use_random_routing": (False, True),
+        "use_ragged_sort": (False, True),
+        "ragged_buffer_factor": (-1.0, 2.0),
+        "use_ring_of_experts": (False, True),
+        "num_moe_emb_chunks": (0, 2),
+    }
+    for flag_name, (_, bad_value) in ep_disabled_flags.items():
+      with self.subTest(flag=flag_name):
+        with self.assertRaises(ValueError, msg=f"{flag_name}={bad_value} should raise when EP rank is 1"):
+          pyconfig.initialize(
+              [os.path.join(MAXTEXT_PKG_DIR, "train.py"), get_test_config_path()],
+              skip_jax_distributed_system=True,
+              **{flag_name: bad_value},
+          )
+
+  def test_cp_as_ep_infer_axes(self):
+    """cp-as-ep: exp -> ['context', 'expert'], so ici_context_parallelism contributes to EP rank."""
+    cp_as_ep_rules = [
+        ["exp", ["context", "expert"]],
+        ["activation_length", ["context"]],
+    ]
+    self.assertEqual(infer_ep_axes(cp_as_ep_rules), ("context", "expert"))
+    # CP still inferred from activation_length
+    self.assertEqual(infer_cp_axes(cp_as_ep_rules), ("context",))
+
+  def test_ep_as_cp_infer_axes(self):
+    """ep-as-cp: activation_length -> ['expert'], exp -> 'expert'. Expert axis serves both CP and EP."""
+    ep_as_cp_rules = [
+        ["activation_length", ["expert"]],
+        ["exp", "expert"],
+    ]
+    self.assertEqual(infer_cp_axes(ep_as_cp_rules), ("expert",))
+    self.assertEqual(infer_ep_axes(ep_as_cp_rules), ("expert",))
 
 
 if __name__ == "__main__":

@@ -78,7 +78,7 @@ def preprocess_mm_data_gemma4(images):
 def get_image_offsets_gemma4(processor_output: mm_utils.PreprocessorOutput | None):
   """Gets the increase in total token count after inserting image token placeholders."""
   has_images = processor_output is not None and processor_output.pixel_values is not None
-  num_images = processor_output.pixel_values.shape[0] if has_images else 1
+  num_images = processor_output.pixel_values.shape[0] if has_images else 1  # pyrefly: ignore[missing-attribute]
 
   # Calculate soft tokens taking 3x3 pooling into account
   num_patches = (GEMMA4_IMAGE_HEIGHT // GEMMA4_PATCH_SIZE) * (GEMMA4_IMAGE_WIDTH // GEMMA4_PATCH_SIZE)
@@ -94,7 +94,7 @@ def reformat_prompt_gemma4(prompt, image_placeholder, num_images):
   image_placeholder_count = prompt.count(GEMMA4_IMAGE_PLACEHOLDER_IN_PROMPT)
   if image_placeholder_count < num_images:
     prompt = GEMMA4_IMAGE_PLACEHOLDER_IN_PROMPT * (num_images - image_placeholder_count) + prompt
-  formatted_prompt = f"<start_of_turn>user\n{prompt}<end_of_turn>\n<start_of_turn>model\n"
+  formatted_prompt = f"<bos><|turn>user\n{prompt}<turn|>\n<|turn>model\n"
   return formatted_prompt
 
 

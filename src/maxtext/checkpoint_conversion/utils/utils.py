@@ -23,7 +23,8 @@ import tempfile
 import time
 import json
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any
+from functools import partial
+from typing import Any, Callable, List
 from tqdm import tqdm
 import resource
 import numpy as np
@@ -162,22 +163,17 @@ def convert_jax_weight_to_numpy(weight: "jax.Array", dtype_str: None | str = Non
     A NumPy array containing the data from `weight`, cast to `dtype_str` if provided.
   """
   final_dtype_str = str(weight.dtype) if dtype_str is None else dtype_str
-  # JAX dtypes like 'bfloat16', 'float32' are understood by np.dtype()
-  target_np_dtype = np.dtype(final_dtype_str)
   expected_shape = weight.shape
 
-  # Gather the array across devices if it's sharded.
-  # process_allgather typically returns the array on the host.
+  if str(weight.dtype) != final_dtype_str:
+    # Cast in JAX before process_allgather to reduce interconnect data transfer and host RAM
+    # usage when downcasting dtypes.
+    weight = weight.astype(final_dtype_str)
+
   weight = multihost_utils.process_allgather(weight)
-
-  # Convert JAX array to NumPy array.
-  np_array = np.array(weight)
-
-  # Cast to the target NumPy dtype if it's different.
-  if np_array.dtype != target_np_dtype:
-    np_array = np_array.astype(target_np_dtype)
-
-  return np_array.reshape(expected_shape)  # Reshape for safety, though usually preserved.
+  # Use np.asarray to avoid redundant copies when the gathered buffer can be viewed directly.
+  np_array = np.asarray(weight)
+  return np_array.reshape(expected_shape)
 
 
 def _process(hf_path, processed_slice, output_weights, current_hook_fns, hf_shape_map, save_dtype):
@@ -253,6 +249,9 @@ def process_maxtext_param(
   if maxtext_param_key not in param_map:
     raise ValueError(f"MaxText param key '{maxtext_param_key}' not found in param_map.")
   hf_target_paths = param_map[maxtext_param_key]
+  if hf_target_paths is None:
+    max_logging.log(f"\tskipping parameter mapped to None: {maxtext_param_key}")
+    return []
   if not hf_target_paths:
     raise ValueError(f"No HF target paths found for MaxText key '{maxtext_param_key}'")
 
@@ -312,36 +311,42 @@ def process_maxtext_param(
 
     return output_weights
 
-  # Case 4: Multi-axis stacked (Scanned MoE layer)
-  # The tensor is stacked on expert and layer axes. We slice experts first, then layers.
-  # MaxText format is (experts, layers, ...), so expert axis is 0, layer axis is 1.
-  max_logging.log("\tscan moe")
-  expert_axis_to_slice = 0
+  # Case 4: Multi-axis stacked. Two sub-cases (the inverse of _build_multi_axis_stacked_tensor):
+  #   - Scanned MoE: the tensor is stacked on (experts, layers) at the LEADING two axes, so we
+  #     slice axis 0 (experts) then axis 0 again (layers, after the expert axis is removed).
+  #   - Gemma4 nested block scan (scanned_blocks-local_layers): the block's local layers are an
+  #     inner scan nested in the block scan, so the two axes are at (param_scan_axis,
+  #     param_scan_axis + 1) -- outer = blocks, inner = local. We slice param_scan_axis (blocks),
+  #     then param_scan_axis again (local shifts down into that slot once blocks is removed).
+  key_str = maxtext_param_key[0] if isinstance(maxtext_param_key, tuple) else maxtext_param_key
+  if isinstance(key_str, str) and "scanned_blocks-local_layers" in key_str:
+    max_logging.log("\tscan gemma4 local")
+    outer_axis_to_slice = maxtext_config.param_scan_axis
+    inner_axis_to_slice = maxtext_config.param_scan_axis
+  else:
+    max_logging.log("\tscan moe")
+    outer_axis_to_slice = 0
+    inner_axis_to_slice = 0
 
-  # Outer loop for experts
-  for expert_idx, expert_paths_for_layer in enumerate(hf_target_paths):
-    # Slice along the expert axis to get the tensor for the current expert across all layers.
+  # Outer loop (experts for MoE, blocks for gemma4 local)
+  for outer_idx, inner_paths in enumerate(hf_target_paths):
     if isinstance(maxtext_param_weight, list):
-      expert_tensor_slice = [
-          jax.lax.index_in_dim(x, expert_idx, axis=expert_axis_to_slice, keepdims=False) for x in maxtext_param_weight
+      outer_slice = [
+          jax.lax.index_in_dim(x, outer_idx, axis=outer_axis_to_slice, keepdims=False) for x in maxtext_param_weight
       ]
     else:
-      expert_tensor_slice = jax.lax.index_in_dim(
-          maxtext_param_weight, expert_idx, axis=expert_axis_to_slice, keepdims=False
-      )
+      outer_slice = jax.lax.index_in_dim(maxtext_param_weight, outer_idx, axis=outer_axis_to_slice, keepdims=False)
 
-    # Inner loop for layers
-    for layer_idx, hf_path in enumerate(expert_paths_for_layer):
-      # Slice the expert tensor along the layer axis to get the final individual weight.
-      # axis is 0 on the new sliced tensor
-      if isinstance(expert_tensor_slice, list):
-        layer_tensor_slice = [jax.lax.index_in_dim(x, layer_idx, axis=0, keepdims=False) for x in expert_tensor_slice]
+    # Inner loop (layers for MoE, local layers for gemma4)
+    for inner_idx, hf_path in enumerate(inner_paths):
+      if isinstance(outer_slice, list):
+        inner_slice = [jax.lax.index_in_dim(x, inner_idx, axis=inner_axis_to_slice, keepdims=False) for x in outer_slice]
       else:
-        layer_tensor_slice = jax.lax.index_in_dim(expert_tensor_slice, layer_idx, axis=0, keepdims=False)
+        inner_slice = jax.lax.index_in_dim(outer_slice, inner_idx, axis=inner_axis_to_slice, keepdims=False)
 
       _process(
           hf_path,
-          layer_tensor_slice,
+          inner_slice,
           output_weights,
           current_hook_fns,
           hf_shape_map,
@@ -372,7 +377,8 @@ def save_config_file(
 ):
   """Saves the model configuration file(config.json)."""
   if jax.process_index() == 0:
-    config.architectures = [MODEL_FOR_CAUSAL_LM_MAPPING_NAMES[config.model_type]]
+    if config.model_type in MODEL_FOR_CAUSAL_LM_MAPPING_NAMES:
+      config.architectures = [MODEL_FOR_CAUSAL_LM_MAPPING_NAMES[config.model_type]]
     if output_dir_final.startswith("hf://"):
       max_logging.log(f"  Serializing {file_name} to memory for Hugging Face Hub upload...")
       json_string = config.to_json_string()
@@ -538,7 +544,7 @@ def save_weight_files(
     index,
     local_dir_to_save_to: str,
     output_dir_final: str,
-    parallel_threads=8,
+    parallel_threads=4,
     remove_local_copy_after_upload: bool = False,
 ):
   """Saves weight files and index if needed.
@@ -597,7 +603,7 @@ def save_model_files(
     tokenizer: None | Any,  # transformers.PreTrainedTokenizerBase
     processor,
     output_dir: str,
-    parallel_threads=8,
+    parallel_threads=4,
 ):
   """
   Saves model files (config and weights) to the specified directory.
@@ -817,6 +823,16 @@ class MemoryMonitorTqdm(tqdm):
     return super().format_meter(n=n, total=total, elapsed=elapsed, postfix=postfix, **extra_kwargs)
 
 
+def _recursive_update(d: dict, u: dict) -> dict:
+  """Recursively updates dictionary d with dictionary u in place."""
+  for k, v in u.items():
+    if isinstance(v, dict) and isinstance(d.get(k), dict):
+      _recursive_update(d[k], v)
+    else:
+      d[k] = v
+  return d
+
+
 def load_orbax_checkpoint(config) -> dict:
   """Loads Orbax checkpoints from Base and/or LoRA paths in config.
 
@@ -852,15 +868,35 @@ def load_orbax_checkpoint(config) -> dict:
   paths = [p for p in [config.load_parameters_path, lora_path] if p]
 
   merged_dict = {}
-  for path in paths:
+  for i, path in enumerate(paths):
     checkpoint_path = epath.Path(path)
     metadata = ckptr.metadata(checkpoint_path)
+    checkpoint_tree = metadata.item_metadata.tree
+    if isinstance(checkpoint_tree, dict):
+      if "params" in checkpoint_tree:
+        checkpoint_tree = {"params": checkpoint_tree["params"]}
+        max_logging.log(f"Filtering checkpoint to only load 'params' from {path}")
+      else:
+        filtered_tree = {k: v for k, v in checkpoint_tree.items() if k not in ("opt_state", "optimizer")}
+        if len(filtered_tree) < len(checkpoint_tree):
+          checkpoint_tree = filtered_tree
+          max_logging.log(f"Filtering checkpoint to exclude optimizer keys from {path}")
+
     restore_args = jax.tree_util.tree_map(
         lambda x: create_restore_args(x) if hasattr(x, "shape") else None,
-        metadata.item_metadata.tree,
+        checkpoint_tree,
         is_leaf=lambda x: hasattr(x, "shape"),
     )
-    merged_dict.update(ckptr.restore(checkpoint_path, restore_args=restore_args))
+    restored = ckptr.restore(
+        checkpoint_path,
+        args=ocp.args.PyTreeRestore(item=checkpoint_tree, restore_args=restore_args, partial_restore=True),
+    )
+
+    if i == 0:
+      merged_dict = restored
+    else:
+      # Recursively update base checkpoint with LoRA adapter checkpoint keys to avoid overwriting
+      _recursive_update(merged_dict, restored)
 
   return merged_dict
 
@@ -888,6 +924,51 @@ def save_adapter_files(output_dir, weights, config, found_modules, model_id):
     json.dump(adapter_config, f, indent=4)
 
 
+def param_key_parts_from_path(path_tuple) -> list[str]:
+  """Convert a JAX tree path into MaxText dash-joined key segments.
+
+  Normalizes two NNX storage artifacts so the result follows the MaxText-Linen
+  naming convention and matches the param-mapping tables (e.g.
+  ``params-decoder-layers_0-self_attention-query-kernel``):
+
+  * ``nnx.List`` layer stacks flatten to an *integer* path key
+    (``decoder -> layers -> 0 -> ...``), which Orbax may restore as a numeric
+    *string* (``"0"``). Either form is folded into the preceding segment as
+    ``<name>_<idx>`` (``layers_0``), matching Linen's ``layers_0`` name. (A pure
+    integer key would otherwise raise ``TypeError: sequence item N: expected str
+    instance, int found`` when joined; a string ``"0"`` would mismatch the
+    ``layers_0`` mapping.)
+  * ``nnx.Variable`` leaves flatten with a trailing ``value`` key
+    (``...-kernel -> value``). That wrapper segment is dropped, since MaxText-Linen
+    param keys have no such suffix.
+
+  Scanned / plain Linen string paths (no integer key, no trailing ``value``) are
+  returned unchanged.
+
+  Args:
+    path_tuple: A path produced by ``jax.tree_util.tree_flatten_with_path`` or
+      ``tree_leaves_with_path`` (a sequence of ``DictKey`` / ``SequenceKey`` /
+      ``GetAttrKey`` / ``FlattenedIndexKey`` entries).
+
+  Returns:
+    The list of string key segments, e.g. ``["decoder", "layers_0", "kernel"]``.
+  """
+  parts: list[str] = []
+  for entry in path_tuple:
+    key = getattr(entry, "key", getattr(entry, "idx", getattr(entry, "name", entry)))
+    # Fold a layer/expert index (an int, or a numeric string after an Orbax
+    # round-trip) into the preceding segment: ["layers", 0] -> "layers_0".
+    if (isinstance(key, int) or (isinstance(key, str) and key.isdigit())) and parts:
+      parts[-1] = f"{parts[-1]}_{key}"
+    else:
+      parts.append(str(key))
+  # Drop the trailing ``value`` segment that NNX adds for each ``nnx.Variable``
+  # leaf (``...-kernel -> value``); MaxText-Linen param keys have no such wrapper.
+  if parts and parts[-1] == "value":
+    parts.pop()
+  return parts
+
+
 def extract_nnx_weights(weights_dict: dict) -> dict[str, np.ndarray]:
   """Extract weights from NNX checkpoint structure.
 
@@ -903,13 +984,10 @@ def extract_nnx_weights(weights_dict: dict) -> dict[str, np.ndarray]:
   result = {}
   leaves_with_paths = jax.tree_util.tree_leaves_with_path(weights_dict)
   for path_tuple, leaf_value in leaves_with_paths:
-    path_keys = [k.key for k in path_tuple]
+    path_keys = param_key_parts_from_path(path_tuple)
     # Skip NNX RNG state variables (not model weights)
-    if "to_nnx__rngs" in path_keys or any(k.endswith("_rngs") for k in path_keys):
+    if "to_nnx__rngs" in path_keys or any(k == "rngs" or k.endswith("_rngs") for k in path_keys):
       continue
-    # Skip if this is the "value" key itself - we want the parent path
-    if path_keys[-1] == "value":
-      path_keys = path_keys[:-1]
     maxtext_param_key = "params-" + "-".join(path_keys)
     if not isinstance(leaf_value, (jax.Array, np.ndarray)):
       raise ValueError(f"Leaf value for {maxtext_param_key} is not an array. Type: {type(leaf_value)}.")
@@ -932,8 +1010,7 @@ def extract_linen_weights(weights_dict: dict) -> dict[str, np.ndarray]:
   result = {}
   leaves_with_paths = jax.tree_util.tree_leaves_with_path(weights_dict)
   for path_tuple, leaf_value in leaves_with_paths:
-    path_keys = [k.key for k in path_tuple]
-    # Construct maxtext_param_key from path_tuple
+    path_keys = param_key_parts_from_path(path_tuple)
     maxtext_param_key = "params-" + "-".join(path_keys)
     if not isinstance(leaf_value, (jax.Array, np.ndarray)):
       raise ValueError(f"Leaf value for {maxtext_param_key} is not an array. Type: {type(leaf_value)}.")
@@ -1131,6 +1208,7 @@ def save_weights_to_checkpoint(
     device_count: int,
     use_ocdbt: bool,
     use_zarr3: bool,
+    config=None,
 ):
   """Saves model weights to a MaxText-compatible checkpoint with optional sharding.
 
@@ -1146,6 +1224,7 @@ def save_weights_to_checkpoint(
       use_ocdbt: If True, enables the Optimized Checkpoint Database with Transactions
           (OCDBT) format for improved metadata handling.
       use_zarr3: If True, uses the Zarr3 storage format for the underlying array data.
+      config: Optional config to save along with checkpoint metadata.
   """
   mem_info = psutil.Process()
   logging.debug("Memory usage: %f GB", mem_info.memory_info().rss / (1024**3))
@@ -1182,9 +1261,141 @@ def save_weights_to_checkpoint(
   )
 
   logging.debug("Memory usage: %f GB", mem_info.memory_info().rss / (1024**3))
-  if checkpointing.save_checkpoint(checkpoint_manager, step_number_to_save_new_ckpt, state_new):
+  if checkpointing.save_checkpoint(checkpoint_manager, step_number_to_save_new_ckpt, state_new, config=config):
     max_logging.log(f"saved a checkpoint at step {step_number_to_save_new_ckpt}")
   # Upon preemption, exit when and only when all ongoing saves are complete.
-  checkpoint_manager.wait_until_finished()
+  checkpointing.wait_until_finished(checkpoint_manager)
 
   max_logging.log(f"Elapse for checkpoint save: {(time.time() - start) / 60:.2f} min")
+
+
+def _build_multi_axis_stacked_tensor(
+    hf_source_keys: List[List[str]],
+    tensor_getter_fn: Callable[[str], np.ndarray],
+    hook_fns: Any,
+    target_shape: tuple,
+    config,
+) -> np.ndarray:
+  """Builds a MaxText tensor by stacking HF weights along two axes (experts and layers).
+
+  This function handles the complex case for scanned MoE layers, producing a tensor
+  with the shape (num_experts, num_layers, ...).
+
+  Args:
+      hf_source_keys: A nested (2D) list of Hugging Face parameter names.
+                      Outer list iterates experts, inner list iterates layers.
+      tensor_getter_fn: A callable that takes a HF key and returns the tensor (as numpy array).
+      hook_fns: The hook function(s) to apply to each individual weight.
+      target_shape: The final shape of the target MaxText tensor.
+      config: The MaxText pyconfig object.
+
+  Returns:
+      The final, assembled NumPy array for the MaxText parameter.
+  """
+  all_expert_tensors = []
+  # The hook function needs the shape of an individual slice, not the full stacked tensor.
+  # For multi-axis stacking (experts, layers, ...), the slice shape is target_shape[2:]
+  mt_slice_shape = target_shape[2:]
+
+  # Outer loop iterates through experts
+  for layer_keys_for_expert in hf_source_keys:
+    layer_tensors_for_expert = []
+    # Inner loop iterates through layers for the current expert
+    for hf_key_single in layer_keys_for_expert:
+      hf_tensor_numpy = tensor_getter_fn(hf_key_single)
+      processed_hf_tensor = apply_hook_fns(hf_tensor_numpy, mt_slice_shape, hook_fns)
+      layer_tensors_for_expert.append(processed_hf_tensor)
+    all_expert_tensors.append(np.stack(layer_tensors_for_expert, axis=0))
+  return np.stack(all_expert_tensors, axis=0)
+
+
+def _build_single_axis_stacked_tensor(
+    hf_source_keys: List[str],
+    tensor_getter_fn: Callable[[str], np.ndarray],
+    hook_fns: Any,
+    target_shape: tuple,
+    config,
+) -> np.ndarray:
+  """Builds a MaxText tensor by stacking HF weights along a single axis.
+
+  This function handles both standard scanned layers (e.g., attention) and
+  unscanned MoE layers (which are stacked along the expert axis).
+
+  Args:
+      hf_source_keys: A 1D list of Hugging Face parameter names.
+      tensor_getter_fn: A callable that takes a HF key and returns the tensor (as numpy array).
+      hook_fns: The hook function(s) to apply to each individual weight.
+      target_shape: The final shape of the target MaxText tensor.
+      config: The MaxText pyconfig object.
+
+  Returns:
+      The final, assembled NumPy array for the MaxText parameter.
+  """
+  tensors_to_stack = []
+
+  if config.scan_layers:
+    # If it's a standard scanned layer, we use the configured param_scan_axis.
+    axis_to_stack = config.param_scan_axis
+  else:
+    # Otherwise, if an unscanned MoE layer, and we stack along the expert axis (0).
+    axis_to_stack = 0
+
+  # The hook function needs the shape of an individual slice, not the full stacked tensor.
+  # We calculate it by removing the stacking dimension from the final target shape.
+  mt_slice_shape_list = list(target_shape)
+  del mt_slice_shape_list[axis_to_stack]
+  mt_slice_shape = tuple(mt_slice_shape_list)
+
+  for hf_key_single in hf_source_keys:
+    hf_tensor_numpy = tensor_getter_fn(hf_key_single)
+    processed_hf_tensor = apply_hook_fns(hf_tensor_numpy, mt_slice_shape, hook_fns)
+    tensors_to_stack.append(processed_hf_tensor)
+
+  # Stack all processed tensors along the determined axis.
+  return np.stack(tensors_to_stack, axis=axis_to_stack)
+
+
+def _get_hf_loading_function(hf_source_keys_or_key, tensor_getter, hook_fn, mt_target_shape_or_shapes, config):
+  """Determine the loading function for HF keys.
+  HF keys can take four forms:
+    Case 1: Unscanned (single string)
+    Case 2: Scanned (list of strings)
+    Case 3: Unscanned with expert stacking (list of strings)
+    Case 4: Scanned with expert stacking (nested list of strings)
+  """
+  load_fn = None
+  if not isinstance(hf_source_keys_or_key, list):
+    # Case 1: Single hf key (str)
+    def _loader(getter, key, shape, hook):
+      return apply_hook_fns(getter(key), shape, hook)
+
+    load_fn = partial(
+        _loader,
+        tensor_getter,
+        hf_source_keys_or_key,
+        mt_target_shape_or_shapes,
+        hook_fn,
+    )
+  # Stacked mapping
+  elif not isinstance(hf_source_keys_or_key[0], list):
+    # Case 2 or 3: Single-Axis Stacked hf keys (un-nested list)
+    load_fn = partial(
+        _build_single_axis_stacked_tensor,
+        hf_source_keys_or_key,
+        tensor_getter,
+        hook_fn,
+        mt_target_shape_or_shapes,
+        config,
+    )
+  else:
+    # isinstance(hf_source_keys_or_key[0], list)
+    # Case 4: Multi-Axis Stacked hf keys (nested list)
+    load_fn = partial(
+        _build_multi_axis_stacked_tensor,
+        hf_source_keys_or_key,
+        tensor_getter,
+        hook_fn,
+        mt_target_shape_or_shapes,
+        config,
+    )
+  return load_fn

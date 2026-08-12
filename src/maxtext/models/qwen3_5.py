@@ -136,7 +136,7 @@ class Qwen3_5DecoderLayer(nnx.Module):
     # First LayerNorm, applied before the attention block.
     self.input_layernorm = Qwen3NextRMSNorm(
         num_features=cfg.emb_dim,
-        eps=cfg.normalization_layer_epsilon,
+        epsilon=cfg.normalization_layer_epsilon,
         dtype=cfg.dtype,
         weight_dtype=cfg.weight_dtype,
         rngs=rngs,
@@ -159,13 +159,13 @@ class Qwen3_5DecoderLayer(nnx.Module):
       batch_size, seq_len = max_utils.get_batch_seq_len_for_mode(config, model_mode)
       dummy_inputs_shape = (batch_size, seq_len, config.emb_dim)
       self.attention = Qwen3_5GatedDeltaNet(
-          config=cfg, inputs_shape=dummy_inputs_shape, dtype=cfg.dtype, model_mode=model_mode, rngs=rngs
+          config=cfg, inputs_shape=dummy_inputs_shape, mesh=self.mesh, dtype=cfg.dtype, model_mode=model_mode, rngs=rngs
       )
 
     # Second LayerNorm, applied before the MoE block.
     self.post_attention_layernorm = Qwen3NextRMSNorm(
         num_features=cfg.emb_dim,
-        eps=cfg.normalization_layer_epsilon,
+        epsilon=cfg.normalization_layer_epsilon,
         dtype=cfg.dtype,
         weight_dtype=cfg.weight_dtype,
         rngs=rngs,
@@ -212,6 +212,7 @@ class Qwen3_5DecoderLayer(nnx.Module):
           model_mode=model_mode,
           kv_cache=kv_cache,
           decoder_segment_ids=decoder_segment_ids,
+          attention_metadata=attention_metadata,
       )
 
     # First residual connection after attention
@@ -231,7 +232,7 @@ class Qwen3_5DecoderLayer(nnx.Module):
     # We sow the load balancing loss so it can be collected and added to the total loss
     # during training.
     if self.config.load_balance_loss_weight > 0.0 and load_balance_loss is not None:
-      self.sow("intermediates", "moe_lb_loss", load_balance_loss)
+      self.sow(nnx.Intermediate, "moe_lb_loss", load_balance_loss)
 
     # Final residual connection (after the MoE block)
     layer_output = residual + mlp_output

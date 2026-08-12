@@ -19,6 +19,13 @@ Get started quickly on a single machine. Clone the repo, install dependencies, a
 Run MaxText on single-host NVIDIA GPUs (e.g., A3 High/Mega). Includes Docker setup, NVIDIA Container Toolkit installation, and 1B/7B model training examples.
 :::
 
+:::{grid-item-card} 🚀 At scale with Cluster Toolkit (GKE)
+:link: run_maxtext/run_maxtext_via_cluster_toolkit
+:link-type: doc
+
+Deploy to Google Kubernetes Engine (GKE) using Cluster Toolkit's `gcluster` CLI. Package and run multi-host JAX workloads with on-the-fly container builds.
+:::
+
 :::{grid-item-card} 🏗️ At scale with XPK (GKE)
 :link: run_maxtext/run_maxtext_via_xpk
 :link-type: doc
@@ -39,6 +46,13 @@ Run large-scale JAX jobs on TPUs using Pathways. Supports batch and headless (in
 
 Run tests and local development without Google Cloud dependencies (no `gcloud`, GCS, or Vertex AI required).
 :::
+
+:::{grid-item-card} ♻️ Elastic training (demo)
+:link: run_maxtext/run_maxtext_elastic_training
+:link-type: doc
+
+Demonstrate fault-tolerant training with Pathways on GKE: lose a TPU slice mid-run and recover in-process from the last checkpoint, no job restart.
+:::
 ::::
 
 ```{toctree}
@@ -48,7 +62,9 @@ maxdepth: 1
 ---
 run_maxtext/run_maxtext_localhost.md
 run_maxtext/run_maxtext_single_host_gpu.md
+run_maxtext/run_maxtext_via_cluster_toolkit.md
 run_maxtext/run_maxtext_via_xpk.md
 run_maxtext/run_maxtext_via_pathways.md
 run_maxtext/decoupled_mode.md
+run_maxtext/run_maxtext_elastic_training.md
 ```

@@ -103,6 +103,14 @@ Refer to the steps in [Hugging Face to MaxText](../../guides/checkpointing_solut
 export MAXTEXT_CKPT_PATH=<CKPT_PATH> # e.g., gs://my-bucket/my-model-checkpoint/0/items
 ```
 
+> [!IMPORTANT]
+> **Automatic `scan_layers` Resolution:**
+> MaxText automatically loads `scan_layers` from the checkpoint's saved metadata when resuming (via `load_parameters_path`) if you do not explicitly specify it on the command-line.
+>
+> - You do not need to manually supply `scan_layers=False` (or `scan_layers=True`) when loading checkpoints; MaxText will configure this automatically.
+> - If you do explicitly provide a `scan_layers` argument, it must match the checkpoint's saved setting or a `ValueError` mismatch error will be raised.
+>   See the [Checkpoints concept guide](../../reference/core_concepts/checkpoints.md) for more details.
+
 ## Running DPO Training
 
 You can run the DPO training using the specialized post-training script:

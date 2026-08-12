@@ -11,8 +11,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Smoke test for sparsity.
-"""
+
+"""Smoke test for sparsity."""
 
 import os
 import tempfile
@@ -28,7 +28,7 @@ gettempdir = tempfile.gettempdir
 
 @pytest.mark.integration_test
 class Train(parameterized.TestCase):
-  """Smoke test for sparsity in G3 only."""
+  """Smoke test for sparsity."""
 
   @parameterized.named_parameters(
       {
@@ -69,7 +69,7 @@ class Train(parameterized.TestCase):
         "shared_experts=1",
         "sparse_matmul=True",
         "megablox=False",
-        f'quantization="{quantization}"',
+        f"quantization={quantization}",
         "use_qwix_quantization=True",
         "per_device_batch_size=2",
         "max_target_length=128",
@@ -79,6 +79,8 @@ class Train(parameterized.TestCase):
         "enable_goodput_recording=False",
         "enable_checkpoint_cloud_logger=False",
         "monitor_goodput=False",
+        # Toy MoE dims don't divide evenly across fsdp; loosen the sharded-params assert.
+        "sharding_tolerance=0.08",
         f"metrics_file={os.path.join(outputs_dir, 'metrics.json')}",
     ]
     if use_sparsity:
@@ -89,7 +91,7 @@ class Train(parameterized.TestCase):
               "weight_sparsity_update_step=1",
           ]
       )
-    train_main(args)
+    train_main(args)  # pyrefly: ignore[bad-argument-type]
 
 
 if __name__ == "__main__":

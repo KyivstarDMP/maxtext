@@ -15,24 +15,20 @@
 """Tests for the common Max Utils"""
 import os
 import sys
-import unittest
 import time
-import pytest
-
-
+import unittest
+from unittest import mock
+from flax import linen as nn
+from flax import nnx
 import jax
 from jax import numpy as jnp
 from jax import random
-
-from flax import linen as nn
-
-import optax
-
 from maxtext.configs import pyconfig
 from maxtext.utils import max_utils
 from maxtext.utils.train_utils import setup_train_loop
 from tests.utils.test_helpers import get_test_config_path
-from unittest import mock
+import optax
+import pytest
 
 
 class MaxUtilsSummaryStats(unittest.TestCase):
@@ -181,8 +177,16 @@ class UnscanTest(unittest.TestCase):
     num_layers = config.base_num_decoder_layers
 
     # Make a copy to unscan, leaving the original state intact.
-    params_to_unscan = jax.tree_util.tree_map(lambda x: x, state.params)
-    sharding_to_unscan = jax.tree_util.tree_map(lambda x: x, sharding.params)
+    if hasattr(state, "model"):
+      _, params_state, _ = nnx.split(state.model, nnx.Param, ...)
+      params_to_unscan = {"params": params_state.to_pure_dict()}
+    else:
+      params_to_unscan = jax.tree_util.tree_map(lambda x: x, state.params)
+    if hasattr(sharding, "model"):
+      _, sharding_params, _ = nnx.split(sharding.model, nnx.Param, ...)
+      sharding_to_unscan = {"params": sharding_params.to_pure_dict()}
+    else:
+      sharding_to_unscan = jax.tree_util.tree_map(lambda x: x, sharding.params)
 
     # Time the unscan operation.
     start_time = time.time()
@@ -210,8 +214,18 @@ class UnscanTest(unittest.TestCase):
     self.assertEqual(unstacked_shape, expected_shape)
 
     # Check that the original state is unchanged.
-    self.assertIn("layers", state.params["params"]["decoder"])
-    self.assertNotIn("layers_0", state.params["params"]["decoder"])
+
+    if hasattr(state, "model"):
+      _, params_state, _ = nnx.split(state.model, nnx.Param, ...)
+      state_decoder_params = params_state.to_pure_dict()["decoder"]
+      self.assertIn("layers", state_decoder_params)
+    else:
+      self.assertIn("layers", state.params["params"]["decoder"])
+
+    if hasattr(state, "model"):
+      self.assertNotIn("layers_0", state_decoder_params)
+    else:
+      self.assertNotIn("layers_0", state.params["params"]["decoder"])
 
 
 class TestGpuDistributedInitialization(unittest.TestCase):
@@ -387,6 +401,7 @@ class TestMaybeInitializeJaxDistributedSystem(unittest.TestCase):
         "multi_tier_checkpointing_backup_interval_minutes": 5,
         "run_name": "test_run",
         "mtc_data_parallelism": 1,
+        "num_slices": 2,
         "enable_checkpointing": True,
         "compile_topology_num_slices": -1,
     }
@@ -458,6 +473,61 @@ class TestMaybeInitializeJaxDistributedSystem(unittest.TestCase):
         run_name=self._base_keys()["run_name"],
         jax_initialization_timeout_seconds=self._base_keys()["jax_distributed_initialization_timeout"],
         data_parallelism=self._base_keys()["mtc_data_parallelism"],
+        num_slices=self._base_keys()["num_slices"],
+    )
+
+  @mock.patch("maxtext.utils.max_utils.initialize_multi_tier_checkpointing")
+  @mock.patch("jax.distributed.initialize")
+  def test_single_controller_multi_tier_checkpointing_uses_colocated_python(self, mock_init, mock_mtc):
+    raw_keys = self._base_keys(enable_single_controller=True, enable_multi_tier_checkpointing=True)
+    max_utils.maybe_initialize_jax_distributed_system(raw_keys)
+    mock_init.assert_not_called()
+    mock_mtc.assert_called_once_with(
+        local_checkpoint_directory=self._base_keys()["local_checkpoint_directory"],
+        backup_interval_minutes=self._base_keys()["multi_tier_checkpointing_backup_interval_minutes"],
+        run_name=self._base_keys()["run_name"],
+        jax_initialization_timeout_seconds=self._base_keys()["jax_distributed_initialization_timeout"],
+        data_parallelism=self._base_keys()["mtc_data_parallelism"],
+        num_slices=self._base_keys()["num_slices"],
+        use_colocated_python=True,
+    )
+
+  @mock.patch("maxtext.utils.max_utils.elastic_utils.single_controller_mtc_init_kwargs")
+  @mock.patch("maxtext.utils.max_utils.initialize_multi_tier_checkpointing")
+  @mock.patch("jax.distributed.initialize")
+  def test_single_controller_multi_tier_checkpointing_uses_elastic_utils_kwargs(
+      self, mock_init, mock_mtc, mock_mtc_init_kwargs
+  ):
+    active_devices = (
+        mock.Mock(slice_index=0),
+        mock.Mock(slice_index=0),
+    )
+    mock_mtc_init_kwargs.return_value = {
+        "data_parallelism": 1,
+        "num_slices": 1,
+        "devices": active_devices,
+    }
+    raw_keys = self._base_keys(
+        enable_single_controller=True,
+        enable_multi_tier_checkpointing=True,
+        elastic_enabled=True,
+        mtc_data_parallelism=0,
+        num_slices=2,
+    )
+
+    max_utils.maybe_initialize_jax_distributed_system(raw_keys)
+
+    mock_init.assert_not_called()
+    mock_mtc_init_kwargs.assert_called_once_with(raw_keys)
+    mock_mtc.assert_called_once_with(
+        local_checkpoint_directory=self._base_keys()["local_checkpoint_directory"],
+        backup_interval_minutes=self._base_keys()["multi_tier_checkpointing_backup_interval_minutes"],
+        run_name=self._base_keys()["run_name"],
+        jax_initialization_timeout_seconds=self._base_keys()["jax_distributed_initialization_timeout"],
+        data_parallelism=1,
+        num_slices=1,
+        use_colocated_python=True,
+        devices=active_devices,
     )
 
   @mock.patch("jax.distributed.initialize")
@@ -469,7 +539,9 @@ class TestMaybeInitializeJaxDistributedSystem(unittest.TestCase):
   @mock.patch("maxtext.utils.max_utils.initialize_jax_for_tpu_with_emergency_checkpointing")
   def test_tpu_checkpointing_with_emergency(self, mock_tpu_emergency):
     raw_keys = self._base_keys(
-        enable_checkpointing=True, compile_topology_num_slices=-1, enable_emergency_checkpoint=True
+        enable_checkpointing=True,
+        compile_topology_num_slices=-1,
+        enable_emergency_checkpoint=True,
     )
     max_utils.maybe_initialize_jax_distributed_system(raw_keys)
     mock_tpu_emergency.assert_called_once_with(raw_keys)
@@ -479,6 +551,109 @@ class TestMaybeInitializeJaxDistributedSystem(unittest.TestCase):
     raw_keys = self._base_keys(enable_checkpointing=False, enable_multi_tier_checkpointing=False)
     max_utils.maybe_initialize_jax_distributed_system(raw_keys)
     mock_init.assert_not_called()
+
+
+class TestReorderSequence(unittest.TestCase):
+  """Tests for reorder_sequence optimization in max_utils.py"""
+
+  def _old_reorder_sequence(self, tensor, cp_size: int, seq_dim: int = 1, to_contiguous: bool = False):
+    """Original gather-based reorder_sequence implementation used as a reference."""
+    if tensor is None:
+      return tensor
+
+    seq_len = tensor.shape[seq_dim]
+    group_size = seq_len // (2 * cp_size)
+
+    if cp_size % 2 != 0:
+      raise ValueError(f"{cp_size=} must be a multiple of 2.")
+
+    if seq_len % (cp_size * 2) != 0:
+      raise ValueError(f"{tensor.shape=} is not a multiple of {cp_size*2=}")
+
+    seq_dim = seq_dim % tensor.ndim
+    ori_tensor_shape = tensor.shape
+    reshaped = tensor.reshape(
+        *ori_tensor_shape[:seq_dim],
+        2 * cp_size,
+        group_size,
+        *ori_tensor_shape[seq_dim + 1 :],
+    )
+
+    if not to_contiguous:
+      first_half = jnp.arange(cp_size)
+      second_half = jnp.arange(2 * cp_size - 1, cp_size - 1, -1)
+      src_indices = jnp.stack([first_half, second_half], axis=1).reshape(-1)
+    else:
+      half = cp_size // 2
+      first_pair = [4 * r for r in range(half)]
+      second_pair = [4 * r + 2 for r in range(half)]
+      third_pair = [2 * cp_size - 1 - 4 * r for r in range(half)]
+      fourth_pair = [i - 2 for i in third_pair]
+      first_block = first_pair + third_pair
+      second_block = second_pair + fourth_pair
+      src_indices = jnp.stack([jnp.array(first_block), jnp.array(second_block)], axis=1).reshape(-1)
+
+    reordered = jnp.take(reshaped, src_indices, axis=seq_dim)
+    return reordered.reshape(ori_tensor_shape)
+
+  def test_reorder_equivalence_sweep(self):
+    key = random.key(42)
+
+    # Sweep configurations
+    cp_sizes = [2, 4, 8]
+    to_contiguous_options = [False, True]
+
+    # Test cases: (shape, seq_dim)
+    test_cases = [
+        ((64,), 0),  # 1D
+        ((2, 128, 4, 8), 1),  # 4D (standard B, S, H, D)
+        ((256, 2, 4, 8), 0),  # 4D (S, B, H, D)
+        ((2, 4, 8, 128), -1),  # Negative seq_dim (last dimension)
+        ((2, 128, 4, 8), -3),  # Negative seq_dim (-3 corresponding to S)
+    ]
+
+    for cp_size in cp_sizes:
+      for to_contiguous in to_contiguous_options:
+        for shape, seq_dim in test_cases:
+          with self.subTest(
+              cp_size=cp_size,
+              to_contiguous=to_contiguous,
+              shape=shape,
+              seq_dim=seq_dim,
+          ):
+            # Generate random input
+            x = random.normal(key, shape)
+
+            # Run old (reference) implementation
+            ref_out = self._old_reorder_sequence(x, cp_size, seq_dim, to_contiguous)
+
+            # Run new (optimized) implementation
+            opt_out = max_utils.reorder_sequence(x, cp_size, seq_dim, to_contiguous)
+
+            # Assert mathematical equivalence
+            self.assertTrue(
+                jnp.allclose(ref_out, opt_out, rtol=1e-5, atol=1e-6),
+                msg=f"Failed for cp_size={cp_size}, to_contiguous={to_contiguous}, shape={shape}, seq_dim={seq_dim}",
+            )
+
+  def test_reorder_roundtrip(self):
+    # If we reorder to load-balanced (to_contiguous=False) and then restore (to_contiguous=True),
+    # we should get back the exact original tensor. Also tests negative seq_dim.
+    key = random.key(123)
+    shape = (2, 128, 4, 8)
+    seq_dim = -3
+    cp_size = 4
+
+    x = random.normal(key, shape)
+
+    # 1. Reorder to load-balanced
+    balanced = max_utils.reorder_sequence(x, cp_size, seq_dim, to_contiguous=False)
+
+    # 2. Restore to contiguous
+    restored = max_utils.reorder_sequence(balanced, cp_size, seq_dim, to_contiguous=True)
+
+    # 3. Assert roundtrip is lossless
+    self.assertTrue(jnp.allclose(x, restored, rtol=1e-5, atol=1e-6))
 
 
 if __name__ == "__main__":

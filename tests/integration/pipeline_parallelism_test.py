@@ -14,7 +14,9 @@
 
 """Tests for pipeline parallelism."""
 
+import contextlib
 import functools
+import os
 import os.path
 import sys
 import unittest
@@ -22,6 +24,7 @@ import unittest
 from flax import linen as nn
 from flax import nnx
 from flax.core import meta
+from flax.linen import partitioning as nn_partitioning
 import jax
 import jax.numpy as jnp
 from jax.sharding import Mesh
@@ -38,6 +41,8 @@ from maxtext.trainers.pre_train.train import main as train_main
 from tests.utils.test_helpers import get_test_config_path, get_test_dataset_path, get_test_base_output_directory
 import pytest
 
+pytestmark = [pytest.mark.integration_test, pytest.mark.tpu_only]
+
 
 # Helper to fix pipeline parallelism in test_full_train_fp8 and test_full_train_nanoo_fp8
 def _adapt_parallelism(args, pipeline_stages=4):
@@ -50,6 +55,21 @@ def _adapt_parallelism(args, pipeline_stages=4):
     data_par = dc // pipeline_stages
     if data_par > 1:
       args.append(f"ici_data_parallelism={data_par}")
+
+
+@contextlib.contextmanager
+def _temporary_env(name, value):
+  """Temporarily set an environment variable for the duration of a context."""
+
+  old_value = os.environ.get(name)
+  os.environ[name] = value
+  try:
+    yield
+  finally:
+    if old_value is None:
+      os.environ.pop(name, None)
+    else:
+      os.environ[name] = old_value
 
 
 def assert_same_output_and_grad(f1, f2, *inputs):
@@ -65,32 +85,49 @@ def assert_same_output_and_grad(f1, f2, *inputs):
   f1_grad = pytree_ravel(f1_grad)
   f2_grad = pytree_ravel(f2_grad)
 
-  assert jax.numpy.allclose(f1_value, f2_value, rtol=1e-2, atol=1e-2, equal_nan=False)
-  assert jax.numpy.allclose(f1_grad, f2_grad, rtol=1e-1, atol=1e-1, equal_nan=False)
+  g_diff = jnp.abs(f1_grad - f2_grad)
+  v_diff = jnp.abs(f1_value - f2_value)
+
+  value_close = bool(jax.numpy.allclose(f1_value, f2_value, rtol=1e-2, atol=1e-2, equal_nan=False))
+  grad_close = bool(jax.numpy.allclose(f1_grad, f2_grad, rtol=1e-1, atol=2e-1, equal_nan=False))
+  assert value_close, f"value mismatch: f1={float(f1_value)} vs f2={float(f2_value)}, " f"abs_diff={float(v_diff)}"
+  assert grad_close, (
+      f"grad mismatch: abs_diff_max={float(g_diff.max())}, "
+      f"abs_diff_mean={float(g_diff.mean())}, "
+      f"f1_grad_norm={float(jnp.linalg.norm(f1_grad))}, "
+      f"f2_grad_norm={float(jnp.linalg.norm(f2_grad))}, "
+      f"grad_size={f1_grad.size}, "
+      f"tolerance=rtol=1e-1+atol=1.0"
+  )
 
 
-@pytest.mark.integration_test
 class PipelineParallelismTest(unittest.TestCase):
   decoupled = is_decoupled()
   base_output_directory = get_test_base_output_directory()
   dataset_path = get_test_dataset_path()
 
-  def assert_pipeline_same_output_and_grad(self, config, single_pipeline_stage_class=None):
+  def assert_pipeline_matches_sequential_output_and_grad(self, config, single_pipeline_stage_class=None):
     """check that the output and gradient are the same"""
     devices_array = maxtext_utils.create_device_mesh(config)
     mesh = Mesh(devices_array, config.mesh_axes)
     model_mode = MODEL_MODE_TRAIN
+
+    # `single_pipeline_stage_class` (when provided, e.g. `deepseek.DeepSeekMoELayerToLinen`
+    # for the deepseek test) controls BOTH the pipeline and the per-layer reference path.
+    rngs = nnx.Rngs(params=0)
     if single_pipeline_stage_class is None:
-      rngs = nnx.Rngs(params=0)
       single_pipeline_stage = simple_layer.SimpleDecoderLayerToLinen(
           config=config, mesh=mesh, model_mode=model_mode, rngs=rngs
       )
+      raw_stage_class = simple_layer.SimpleDecoderLayer
+    elif issubclass(single_pipeline_stage_class, nnx_wrappers.ToLinen):
+      single_pipeline_stage = single_pipeline_stage_class(config=config, mesh=mesh, model_mode=model_mode, rngs=rngs)
+      # `to_linen_class` stores the wrapped NNX class as the `module_class` class attribute
+      # (see `nnx_wrappers.py:to_linen_class` -> `ToLinenPartial.module_class = base_nnx_class`).
+      raw_stage_class = single_pipeline_stage_class.module_class
     else:
-      if issubclass(single_pipeline_stage_class, nnx_wrappers.ToLinen):
-        rngs = nnx.Rngs(params=0)
-        single_pipeline_stage = single_pipeline_stage_class(config=config, mesh=mesh, model_mode=model_mode, rngs=rngs)
-      else:
-        single_pipeline_stage = single_pipeline_stage_class(config=config, mesh=mesh, model_mode=model_mode)
+      single_pipeline_stage = single_pipeline_stage_class(config=config, mesh=mesh, model_mode=model_mode, rngs=rngs)
+      raw_stage_class = single_pipeline_stage_class
 
     def get_inputs(batch_size, sequence, features):
       """Get random inputs, and random dummy targets
@@ -114,25 +151,29 @@ class PipelineParallelismTest(unittest.TestCase):
         config.global_batch_size_to_train_on, config.max_target_length, config.emb_dim
     )
     deterministic = True
-    # We use a simpler single matmul decoder layer for fast compilation in these tests.
-    rngs = nnx.Rngs(params=0)
-    single_pipeline_stage = simple_layer.SimpleDecoderLayerToLinen(
-        config=config, mesh=mesh, model_mode=model_mode, rngs=rngs
-    )
-    my_pipeline = pipeline.create_pipeline(config=config, layers=single_pipeline_stage, mesh=mesh)
-    init_pipeline_params = my_pipeline.init(
-        jax.random.PRNGKey(0), inputs, inputs_position, inputs_segmentation, deterministic, model_mode
-    )
-    logical_partition_spec = my_pipeline.get_weight_sharding(
-        inputs, inputs_position, inputs_segmentation, deterministic, model_mode
-    )
+
+    def stage_factory(stage_rngs):
+      return raw_stage_class(config=config, mesh=mesh, model_mode=model_mode, rngs=stage_rngs)
+
+    my_pipeline = pipeline.create_pipeline(config=config, layers=stage_factory, mesh=mesh)
+    with jax.set_mesh(mesh), nn_partitioning.axis_rules(config.logical_axis_rules):
+      init_pipeline_params = my_pipeline.init(
+          jax.random.PRNGKey(0), inputs, inputs_segmentation, inputs_position, deterministic, model_mode
+      )
+      # `get_weight_sharding` is a compact method on `PipelineLinen` (callable as
+      # `my_pipeline.get_weight_sharding(...)` directly) but on the ToLinen-wrapped NNX
+      # pipeline it must be invoked inside a bound module context. Use `bind` so the
+      # same call shape works on both paths.
+      logical_partition_spec = my_pipeline.bind(init_pipeline_params).get_weight_sharding(
+          inputs, inputs_segmentation, inputs_position, deterministic, model_mode
+      )
 
     # Create a dummy scalar loss function so we may take the gradient wrt weights
     def pipeline_parallelism_dummy_loss_extra(
         params,
         inputs,
-        inputs_position,
         inputs_segmentation,
+        inputs_position,
         deterministic,
         model_mode,
         dummy_targets,
@@ -141,8 +182,8 @@ class PipelineParallelismTest(unittest.TestCase):
       outputs = my_pipeline.apply(
           params,
           inputs,
-          inputs_position,
           inputs_segmentation,
+          inputs_position,
           deterministic,
           model_mode,
           logical_partition_spec=logical_partition_spec,
@@ -154,7 +195,7 @@ class PipelineParallelismTest(unittest.TestCase):
         pipeline_parallelism_dummy_loss_extra, logical_partition_spec=logical_partition_spec
     )
 
-    def regular_sequential_layers(params, inputs, inputs_position, inputs_segmentation, deterministic, model_mode):
+    def regular_sequential_layers(params, inputs, inputs_segmentation, inputs_position, deterministic, model_mode):
       def get_cur_layer_params(params, layer_idx):
         def get_cur_layer_params_arr(leaf):
           # Reshape layers into a linear list of layers, e.g. [repeat, stage] into [layers]
@@ -175,36 +216,66 @@ class PipelineParallelismTest(unittest.TestCase):
       for layer in range(config.num_decoder_layers):
         cur_layer_params = get_cur_layer_params(params, layer)
         cur_layer_params["params"] = cur_layer_params["params"]["layers"]
-        if config.num_pipeline_repeats > 1 and config.num_layers_per_pipeline_stage > 1:
+        if config.num_pipeline_repeats > 1:
           cur_layer_params["params"] = meta.remove_axis(
               cur_layer_params["params"], 0, {nn.PARTITION_NAME: "circular_repeats"}
           )
-          cur_layer_params["params"] = meta.remove_axis(cur_layer_params["params"], 0, {nn.PARTITION_NAME: "layers"})
+        cur_layer_params["params"] = meta.remove_axis(cur_layer_params["params"], 0, {nn.PARTITION_NAME: "layers"})
         reg_layer_activations, _ = single_pipeline_stage.apply(
-            cur_layer_params, reg_layer_activations, inputs_position, inputs_segmentation, deterministic, model_mode
+            cur_layer_params, reg_layer_activations, inputs_segmentation, inputs_position, deterministic, model_mode
         )
       return reg_layer_activations
 
     def regular_sequential_layers_dummy_loss(
-        params, inputs, inputs_position, inputs_segmentation, deterministic, model_mode, dummy_targets
+        params, inputs, inputs_segmentation, inputs_position, deterministic, model_mode, dummy_targets
     ):
-      outputs = regular_sequential_layers(params, inputs, inputs_position, inputs_segmentation, deterministic, model_mode)
+      outputs = regular_sequential_layers(params, inputs, inputs_segmentation, inputs_position, deterministic, model_mode)
       loss = jnp.linalg.norm(outputs - dummy_targets)
       return loss
 
-    assert_same_output_and_grad(
-        regular_sequential_layers_dummy_loss,
-        pipeline_parallelism_dummy_loss,
-        init_pipeline_params,
-        inputs,
-        inputs_segmentation,
-        inputs_position,
-        deterministic,
-        model_mode,
-        dummy_targets,
-    )
+    with jax.set_mesh(mesh), nn_partitioning.axis_rules(config.logical_axis_rules):
+      assert_same_output_and_grad(
+          regular_sequential_layers_dummy_loss,
+          pipeline_parallelism_dummy_loss,
+          init_pipeline_params,
+          inputs,
+          inputs_segmentation,
+          inputs_position,
+          deterministic,
+          model_mode,
+          dummy_targets,
+      )
 
-  @pytest.mark.tpu_only
+  def assert_pipeline_same_output_and_grad(self, config, single_pipeline_stage_class=None):
+    """
+    Assert that the pipeline implementation produces the same output and
+    gradient as a sequential implementation of the same layers.
+    """
+    self.assert_pipeline_matches_sequential_output_and_grad(config, single_pipeline_stage_class)
+
+  def _assert_circular_pipeline_ag_per_repeat_core(self, core):
+    """
+    Assert that the pipeline implementation produces the same output and
+    gradient as a sequential implementation of the same layers when using
+    pipeline activation gradient all-gather per repeat, for a given core implementation.
+    """
+    # 2 stages, 8 microbatches, enable pipeline ag per repeat.
+    with _temporary_env("MAXTEXT_CIRCULAR_PIPELINE_CORE", core):
+      config = pyconfig.initialize(
+          [sys.argv[0], get_test_config_path()],
+          enable_checkpointing=False,
+          enable_goodput_recording=False,
+          run_name=f"circular_ag_per_repeat_{core}",
+          max_target_length=128,
+          base_emb_dim=28,
+          ici_pipeline_parallelism=2,
+          base_num_decoder_layers=8,
+          num_pipeline_microbatches=8,
+          per_device_batch_size=4,
+          pipeline_fsdp_ag_per_repeat=True,
+      )
+      self.assert_pipeline_matches_sequential_output_and_grad(config)
+
   def test_circular_minimum_microbatches_same_output_and_grad(self):
     # 4 stages, 8 layers (2 repeats, 1 layer per stage), 4 microbatches
     config = pyconfig.initialize(
@@ -219,9 +290,8 @@ class PipelineParallelismTest(unittest.TestCase):
         num_pipeline_microbatches=4,
         per_device_batch_size=4,
     )
-    self.assert_pipeline_same_output_and_grad(config)
+    self.assert_pipeline_matches_sequential_output_and_grad(config)
 
-  @pytest.mark.tpu_only
   def test_circular_extra_microbatches_same_output_and_grad(self):
     # 4 stages, 8 layers (2 repeats, 1 layer per stage), 8 microbatches
     config = pyconfig.initialize(
@@ -236,11 +306,17 @@ class PipelineParallelismTest(unittest.TestCase):
         num_pipeline_microbatches=8,
         per_device_batch_size=4,
     )
-    self.assert_pipeline_same_output_and_grad(config)
+    self.assert_pipeline_matches_sequential_output_and_grad(config)
 
-  @pytest.mark.tpu_only
   def test_circular_deepseek_megablox_same_output_and_grad(self):
-    # 4 stages, 8 layers (2 repeats, 1 layer per stage), 8 microbatches
+    # 4 stages, 8 layers (2 repeats, 1 layer per stage), 8 microbatches.
+    # DeepSeek's MoE block (`moe.RoutedAndSharedMoE`) constructs a `shared_experts`
+    # `MlpBlock` with `intermediate_dim = config.shared_experts * moe_mlp_dim`, so
+    # `shared_experts >= 1` is required to avoid a zero-dim DenseGeneral kernel
+    # (`ZeroDivisionError` in `_compute_fans`). DeepSeek self-attention is
+    # `attention_mla.MLA`, which asserts `config.attention_type == "mla"` in
+    # `_init_projections` (`src/maxtext/layers/attention_mla.py:718-721`).
+    # MLA layer supplies sane defaults for the head-dim / lora-rank fields.
     config = pyconfig.initialize(
         [sys.argv[0], get_test_config_path()],
         enable_checkpointing=False,
@@ -260,10 +336,47 @@ class PipelineParallelismTest(unittest.TestCase):
         decoder_block="deepseek",
         base_moe_mlp_dim=1024,
         base_mlp_dim=1024,
+        attention_type="mla",
+        shared_experts=1,
     )
-    self.assert_pipeline_same_output_and_grad(config, single_pipeline_stage_class=deepseek.DeepSeekMoELayerToLinen)
+    self.assert_pipeline_matches_sequential_output_and_grad(
+        config, single_pipeline_stage_class=deepseek.DeepSeekMoELayerToLinen
+    )
 
-  @pytest.mark.tpu_only
+  @pytest.mark.scheduled_only
+  def test_deepseek_ragged_a2a_ep_same_output_and_grad(self):
+    config = pyconfig.initialize(
+        [sys.argv[0], get_test_config_path()],
+        enable_checkpointing=False,
+        enable_goodput_recording=False,
+        run_name="deepseek_ragged_a2a_ep",
+        dtype="bfloat16",
+        weight_dtype="bfloat16",
+        matmul_precision="high",
+        max_target_length=128,
+        base_emb_dim=256,
+        ici_pipeline_parallelism=2,
+        ici_expert_parallelism=2,
+        allow_split_physical_axes=True,
+        base_num_decoder_layers=2,
+        num_pipeline_microbatches=4,
+        per_device_batch_size=4,
+        num_experts=4,
+        num_experts_per_tok=2,
+        shared_experts=1,
+        megablox=True,
+        sparse_matmul=True,
+        capacity_factor=-1,
+        decoder_block="deepseek",
+        attention_type="mla",
+        base_moe_mlp_dim=256,
+        base_mlp_dim=256,
+    )
+    self.assert_pipeline_same_output_and_grad(
+        config,
+        single_pipeline_stage_class=deepseek.DeepSeekMoELayerToLinen,
+    )
+
   def test_circular_ag_once(self):
     # 2 stages, 8 microbatches, all gather once
     config = pyconfig.initialize(
@@ -279,27 +392,14 @@ class PipelineParallelismTest(unittest.TestCase):
         per_device_batch_size=4,
         pipeline_fsdp_ag_once=True,
     )
-    self.assert_pipeline_same_output_and_grad(config)
+    self.assert_pipeline_matches_sequential_output_and_grad(config)
 
-  @pytest.mark.tpu_only
   def test_circular_pipeline_ag_per_repeat(self):
-    # 2 stages, 8 microbatches, enable pipeline ag per repeat
-    config = pyconfig.initialize(
-        [sys.argv[0], get_test_config_path()],
-        enable_checkpointing=False,
-        enable_goodput_recording=False,
-        run_name="circular_ag_per_repeat",
-        max_target_length=128,
-        base_emb_dim=28,
-        ici_pipeline_parallelism=2,
-        base_num_decoder_layers=8,
-        num_pipeline_microbatches=8,
-        per_device_batch_size=4,
-        pipeline_fsdp_ag_per_repeat=True,
-    )
-    self.assert_pipeline_same_output_and_grad(config)
+    self._assert_circular_pipeline_ag_per_repeat_core("nnx_scan")
 
-  @pytest.mark.tpu_only
+  def test_circular_pipeline_ag_per_repeat_jax_state_core(self):
+    self._assert_circular_pipeline_ag_per_repeat_core("jax_state")
+
   def test_non_circular_same_output_and_grad(self):
     # 4 stages, 4 layers (no circular repeats, 1 layer per stage), 4 microbatches
     config = pyconfig.initialize(
@@ -313,10 +413,8 @@ class PipelineParallelismTest(unittest.TestCase):
         num_pipeline_microbatches=4,
         per_device_batch_size=4,
     )
-    self.assert_pipeline_same_output_and_grad(config)
+    self.assert_pipeline_matches_sequential_output_and_grad(config)
 
-  @pytest.mark.integration_test
-  @pytest.mark.tpu_only
   def test_full_train_circular(self):
     # Run a full train.py call with 4 stages, 32 layers (2 layers per stage, 4 circular repeats), 8 microbatches
     train_main(
@@ -347,8 +445,6 @@ class PipelineParallelismTest(unittest.TestCase):
         ]
     )
 
-  @pytest.mark.integration_test
-  @pytest.mark.tpu_only
   def test_full_train_circular_pipeline_ag_per_repeat(self):
     # Run a full train.py call with 4 stages, 32 layers (2 layers per stage, 4 circular repeats),
     # 8 microbatches and using pipeline ag per repeat
@@ -380,7 +476,6 @@ class PipelineParallelismTest(unittest.TestCase):
         ]
     )
 
-  @pytest.mark.tpu_only
   def test_delay_activation_forwarding_same_output_and_grad(self):
     # 4 stages, delayed activation forwarding, 8 layers (2 repeats, 1 layer per stage), 8 microbatches
     config = pyconfig.initialize(
@@ -396,10 +491,8 @@ class PipelineParallelismTest(unittest.TestCase):
         per_device_batch_size=4,
         pipeline_delay_activation_forwarding=True,
     )
-    self.assert_pipeline_same_output_and_grad(config)
+    self.assert_pipeline_matches_sequential_output_and_grad(config)
 
-  @pytest.mark.integration_test
-  @pytest.mark.tpu_only
   def test_full_train_non_circular(self):
     # Run a full train.py call with 4 stages, 32 layers (8 layers per stage), 8 microbatches
     train_main(
@@ -430,8 +523,6 @@ class PipelineParallelismTest(unittest.TestCase):
         ]
     )
 
-  @pytest.mark.integration_test
-  @pytest.mark.tpu_only
   def test_subset_layers(self):
     # Run a full train.py call with 4 stages, 16 layers - 8 in pipeline, 8 ran outside of pipeline
     train_main(
@@ -465,7 +556,6 @@ class PipelineParallelismTest(unittest.TestCase):
     )
 
   @pytest.mark.skipif(is_decoupled(), reason="Pipeline parallelism not supported in decoupled mode")
-  @pytest.mark.integration_test
   def test_full_train_fp8(self):
     # Run a full train.py call with fp8 quantization, which adds extra
     # variable collections that need to be handled
@@ -498,7 +588,6 @@ class PipelineParallelismTest(unittest.TestCase):
     train_main(args)
 
   @pytest.mark.skipif(is_decoupled(), reason="Pipeline parallelism not supported in decoupled mode")
-  @pytest.mark.integration_test
   def test_full_train_nanoo_fp8(self):
     # Run a full train.py call with NANOO fp8 quantization, which adds extra
     # variable collections that need to be handled

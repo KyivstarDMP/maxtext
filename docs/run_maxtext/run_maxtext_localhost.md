@@ -69,6 +69,9 @@ python3 -m maxtext.inference.decode \
 
 **Note:** Because the model hasn't been properly trained, the output text will be random. To generate meaningful output, you need to load a trained checkpoint using the `load_parameters_path` argument. For instructions on how to convert pre-trained Hugging Face model checkpoints (like Llama or Gemma) to MaxText's Orbax format, please refer to the [Checkpoint Conversion Guide](../guides/checkpointing_solutions/convert_checkpoint.md).
 
+> [!NOTE]
+> **Checkpoints & `scan_layers` Auto-Resolution:** When resuming or loading an external or converted checkpoint via `load_parameters_path`, MaxText automatically loads `scan_layers` with the checkpoint's saved format (stacked vs unstacked). You do not need to explicitly specify `scan_layers` on your command line when resuming. If you do explicitly specify a `scan_layers` value, it must match the checkpoint's saved configuration, or a `ValueError` mismatch error will be raised.
+
 ### Running models using provided configs
 
 MaxText provides many OSS model configs that you can use directly to run training jobs on those model-specific architectures. These model-specific YAML files are located in `src/maxtext/configs/models` for TPU-oriented defaults, and `src/maxtext/configs/models/gpu` for GPU-oriented defaults.

@@ -19,7 +19,7 @@ This config defines the architectural configurations of the Hugging Face version
 
 import transformers
 
-if transformers.__version__ >= "5.0.0":
+if transformers.__version__ >= "5.0.0":  # pyrefly: ignore[missing-attribute]
   from transformers.configuration_utils import PreTrainedConfig as PTConfig  # pytype: disable=import-error
 else:
   from transformers.configuration_utils import PretrainedConfig as PTConfig
@@ -120,7 +120,7 @@ gemma4_26b_dict = {
 
 gemma4_31b_dict = gemma4_26b_dict.copy()
 gemma4_31b_dict["text_config"] = gemma4_26b_dict["text_config"].copy()
-gemma4_31b_dict["text_config"].update(
+gemma4_31b_dict["text_config"].update(  # pyrefly: ignore[no-matching-overload]
     {
         "enable_moe_block": False,
         "hidden_size": 5376,
@@ -265,10 +265,10 @@ gemma4_e4b_dict["text_config"].update(
 
 try:
   # Will execute successfully if Transformers is updated with Gemma 4 support
-  gemma4_26b_config = transformers.Gemma4Config(**gemma4_26b_dict)
-  gemma4_31b_config = transformers.Gemma4Config(**gemma4_31b_dict)
-  gemma4_e2b_config = transformers.Gemma4Config(**gemma4_e2b_dict)
-  gemma4_e4b_config = transformers.Gemma4Config(**gemma4_e4b_dict)
+  gemma4_26b_config = transformers.Gemma4Config(**gemma4_26b_dict)  # pyrefly: ignore[missing-attribute]
+  gemma4_31b_config = transformers.Gemma4Config(**gemma4_31b_dict)  # pyrefly: ignore[missing-attribute]
+  gemma4_e2b_config = transformers.Gemma4Config(**gemma4_e2b_dict)  # pyrefly: ignore[missing-attribute]
+  gemma4_e4b_config = transformers.Gemma4Config(**gemma4_e4b_dict)  # pyrefly: ignore[missing-attribute]
 except AttributeError:
   # Graceful fallback to raw dict-based PTConfig if Gemma 4 natively is missing
   gemma4_26b_config = PTConfig(**gemma4_26b_dict)  # pytype: disable=wrong-arg-types
@@ -718,6 +718,44 @@ qwen3_30b_a3b_thinking_2507_config = transformers.Qwen3MoeConfig(
     vocab_size=151936,
 )
 
+# Matches Qwen/Qwen3-30B-A3B-Base
+qwen3_30b_a3b_base_config = transformers.Qwen3MoeConfig(
+    architectures=["Qwen3MoeForCausalLM"],
+    attention_bias=False,
+    attention_dropout=0.0,
+    bos_token_id=151643,
+    decoder_sparse_step=1,
+    eos_token_id=151643,
+    head_dim=128,
+    hidden_act="silu",
+    hidden_size=2048,
+    initializer_range=0.02,
+    intermediate_size=6144,
+    max_position_embeddings=32768,
+    max_window_layers=48,
+    mlp_only_layers=[],
+    model_type="qwen3_moe",
+    moe_intermediate_size=768,
+    norm_topk_prob=True,
+    num_attention_heads=32,
+    num_experts=128,
+    num_experts_per_tok=8,
+    num_hidden_layers=48,
+    num_key_value_heads=4,
+    output_router_logits=False,
+    rms_norm_eps=1e-06,
+    rope_scaling=None,
+    rope_theta=1000000,
+    router_aux_loss_coef=0.001,
+    sliding_window=None,
+    tie_word_embeddings=False,
+    torch_dtype="bfloat16",
+    transformers_version="4.51.0",
+    use_cache=True,
+    use_sliding_window=False,
+    vocab_size=151936,
+)
+
 qwen3_235b_a22b_thinking_2507_config = transformers.Qwen3MoeConfig(
     architectures=["Qwen3MoeForCausalLM"],
     attention_bias=False,
@@ -973,7 +1011,7 @@ deepseek32_671b_dict = {
 
 
 # TODO(shuningjin): replace with DeepseekV32Config when available in transformers library
-class DeepseekV32Config(PTConfig):
+class DeepseekV32Config(PTConfig):  # pyrefly: ignore[invalid-inheritance]
   model_type = "deepseek_v32"
 
   def __init__(self, **kwargs):
@@ -982,6 +1020,127 @@ class DeepseekV32Config(PTConfig):
 
 
 deepseek32_671b_config = DeepseekV32Config(**deepseek32_671b_dict)
+
+
+deepseek4_284b_dict = {
+    "architectures": ["DeepseekV4ForCausalLM"],
+    "attention_bias": False,
+    "attention_dropout": 0.0,
+    "bos_token_id": 0,
+    "eos_token_id": 1,
+    "expert_dtype": "fp4",
+    "hc_eps": 1e-06,
+    "hc_mult": 4,
+    "hc_sinkhorn_iters": 20,
+    "head_dim": 512,
+    "hidden_act": "silu",
+    "hidden_size": 4096,
+    "index_head_dim": 128,
+    "index_n_heads": 64,
+    "index_topk": 512,
+    "initializer_range": 0.02,
+    "max_position_embeddings": 1048576,
+    "model_type": "deepseek_v4",
+    "moe_intermediate_size": 2048,
+    "n_routed_experts": 256,
+    "n_shared_experts": 1,
+    "norm_topk_prob": True,
+    "num_attention_heads": 64,
+    "num_experts_per_tok": 6,
+    "num_hidden_layers": 43,
+    "num_hash_layers": 3,
+    "num_key_value_heads": 1,
+    "num_nextn_predict_layers": 1,
+    "o_groups": 8,
+    "o_lora_rank": 1024,
+    "q_lora_rank": 1024,
+    "qk_rope_head_dim": 64,
+    "quantization_config": {
+        "activation_scheme": "dynamic",
+        "fmt": "e4m3",
+        "quant_method": "fp8",
+        "scale_fmt": "ue8m0",
+        "weight_block_size": [128, 128],
+    },
+    "rms_norm_eps": 1e-06,
+    "rope_scaling": {
+        "beta_fast": 32,
+        "beta_slow": 1,
+        "factor": 16,
+        "original_max_position_embeddings": 65536,
+        "type": "yarn",
+    },
+    "rope_theta": 10000,
+    "routed_scaling_factor": 1.5,
+    "scoring_func": "sqrtsoftplus",
+    "sliding_window": 128,
+    "swiglu_limit": 10.0,
+    "tie_word_embeddings": False,
+    "topk_method": "noaux_tc",
+    "torch_dtype": "bfloat16",
+    "transformers_version": "4.57.1",
+    "use_cache": True,
+    "vocab_size": 129280,
+    "compress_rope_theta": 160000,
+    "compress_ratios": [
+        0,
+        0,
+        4,
+        128,
+        4,
+        128,
+        4,
+        128,
+        4,
+        128,
+        4,
+        128,
+        4,
+        128,
+        4,
+        128,
+        4,
+        128,
+        4,
+        128,
+        4,
+        128,
+        4,
+        128,
+        4,
+        128,
+        4,
+        128,
+        4,
+        128,
+        4,
+        128,
+        4,
+        128,
+        4,
+        128,
+        4,
+        128,
+        4,
+        128,
+        4,
+        128,
+        4,
+    ],
+}
+
+
+# TODO(shuningjin): replace with DeepseekV4Config when available in transformers library
+class DeepseekV4Config(PTConfig):  # pyrefly: ignore[invalid-inheritance]
+  model_type = "deepseek_v4"
+
+  def __init__(self, **kwargs):
+    self.max_position_embeddings = kwargs.get("max_position_embeddings", 1048576)
+    super().__init__(**kwargs)
+
+
+deepseek4_284b_config = DeepseekV4Config(**deepseek4_284b_dict)
+
 
 # from https://huggingface.co/openai/gpt-oss-20b/blob/main/config.json
 # remove mxfp4 quantization_config, since we are using bf16
@@ -1051,7 +1210,7 @@ gpt_oss_20b_dict = {
     "use_cache": True,
     "vocab_size": 201088,
 }
-gpt_oss_20b_config = transformers.GptOssConfig(**gpt_oss_20b_dict)
+gpt_oss_20b_config = transformers.GptOssConfig(**gpt_oss_20b_dict)  # pyrefly: ignore[bad-argument-type]
 
 # from https://huggingface.co/openai/gpt-oss-120b/blob/main/config.json
 # remove mxfp4 quantization_config, since we are using bf16
@@ -1133,7 +1292,7 @@ gpt_oss_120b_dict = {
     "use_cache": True,
     "vocab_size": 201088,
 }
-gpt_oss_120b_config = transformers.GptOssConfig(**gpt_oss_120b_dict)
+gpt_oss_120b_config = transformers.GptOssConfig(**gpt_oss_120b_dict)  # pyrefly: ignore[bad-argument-type]
 
 
 qwen3_omni_30b_a3b_config = transformers.Qwen3OmniMoeConfig(
@@ -1443,8 +1602,8 @@ qwen3_5_35b_a3b_dict = {
 
 try:
   # Will execute successfully if Transformers is updated with Qwen3.5 support
-  qwen3_5_35b_a3b_config = transformers.Qwen3_5MoeConfig(**qwen3_5_35b_a3b_dict)
-  qwen3_5_397b_a17b_config = transformers.Qwen3_5MoeConfig(**qwen3_5_397b_a17b_dict)
+  qwen3_5_35b_a3b_config = transformers.Qwen3_5MoeConfig(**qwen3_5_35b_a3b_dict)  # pyrefly: ignore[missing-attribute]
+  qwen3_5_397b_a17b_config = transformers.Qwen3_5MoeConfig(**qwen3_5_397b_a17b_dict)  # pyrefly: ignore[missing-attribute]
 except AttributeError:
   qwen3_5_35b_a3b_config = PTConfig(**qwen3_5_35b_a3b_dict)  # pytype: disable=wrong-arg-types
   qwen3_5_397b_a17b_config = PTConfig(**qwen3_5_397b_a17b_dict)  # pytype: disable=wrong-arg-types
@@ -1548,6 +1707,183 @@ olmo3_32b_dict = {
 olmo3_32b_config = transformers.Olmo3Config(**olmo3_32b_dict)
 
 
+qwen3_vl_4b_dict = {
+    "architectures": ["Qwen3VLForConditionalGeneration"],
+    "image_token_id": 151655,
+    "model_type": "qwen3_vl",
+    "text_config": {
+        "attention_bias": False,
+        "attention_dropout": 0.0,
+        "bos_token_id": 151643,
+        "dtype": "bfloat16",
+        "eos_token_id": 151645,
+        "head_dim": 128,
+        "hidden_act": "silu",
+        "hidden_size": 2560,
+        "initializer_range": 0.02,
+        "intermediate_size": 9728,
+        "max_position_embeddings": 262144,
+        "model_type": "qwen3_vl_text",
+        "num_attention_heads": 32,
+        "num_hidden_layers": 36,
+        "num_key_value_heads": 8,
+        "pad_token_id": None,
+        "rms_norm_eps": 1e-06,
+        "rope_parameters": {
+            "mrope_interleaved": True,
+            "mrope_section": [24, 20, 20],
+            "rope_theta": 5000000,
+            "rope_type": "default",
+        },
+        "tie_word_embeddings": True,
+        "use_cache": True,
+        "vocab_size": 151936,
+    },
+    "tie_word_embeddings": True,
+    "transformers_version": "5.8.0",
+    "video_token_id": 151656,
+    "vision_config": {
+        "deepstack_visual_indexes": [5, 11, 17],
+        "depth": 24,
+        "hidden_act": "gelu_pytorch_tanh",
+        "hidden_size": 1024,
+        "in_channels": 3,
+        "initializer_range": 0.02,
+        "intermediate_size": 4096,
+        "model_type": "qwen3_vl_vision",
+        "num_heads": 16,
+        "num_position_embeddings": 2304,
+        "out_hidden_size": 2560,
+        "patch_size": 16,
+        "spatial_merge_size": 2,
+        "temporal_patch_size": 2,
+    },
+    "vision_end_token_id": 151653,
+    "vision_start_token_id": 151652,
+}
+qwen3_vl_4b_config = PTConfig(**qwen3_vl_4b_dict)
+
+qwen3_vl_2b_dict = {
+    "architectures": ["Qwen3VLForConditionalGeneration"],
+    "image_token_id": 151655,
+    "model_type": "qwen3_vl",
+    "text_config": {
+        "attention_bias": False,
+        "attention_dropout": 0.0,
+        "bos_token_id": 151643,
+        "dtype": "bfloat16",
+        "eos_token_id": 151645,
+        "head_dim": 128,
+        "hidden_act": "silu",
+        "hidden_size": 2048,
+        "initializer_range": 0.02,
+        "intermediate_size": 6144,
+        "max_position_embeddings": 262144,
+        "model_type": "qwen3_vl_text",
+        "num_attention_heads": 16,
+        "num_hidden_layers": 28,
+        "num_key_value_heads": 8,
+        "pad_token_id": None,
+        "rms_norm_eps": 1e-06,
+        "rope_parameters": {
+            "mrope_interleaved": True,
+            "mrope_section": [24, 20, 20],
+            "rope_theta": 5000000,
+            "rope_type": "default",
+        },
+        "tie_word_embeddings": True,
+        "use_cache": True,
+        "vocab_size": 151936,
+    },
+    "tie_word_embeddings": True,
+    "transformers_version": "4.57.0.dev0",
+    "video_token_id": 151656,
+    "vision_config": {
+        "deepstack_visual_indexes": [5, 11, 17],
+        "depth": 24,
+        "hidden_act": "gelu_pytorch_tanh",
+        "hidden_size": 1024,
+        "in_channels": 3,
+        "initializer_range": 0.02,
+        "intermediate_size": 4096,
+        "model_type": "qwen3_vl_vision",
+        "num_heads": 16,
+        "num_position_embeddings": 2304,
+        "out_hidden_size": 2048,
+        "patch_size": 16,
+        "spatial_merge_size": 2,
+        "temporal_patch_size": 2,
+    },
+    "vision_end_token_id": 151653,
+    "vision_start_token_id": 151652,
+}
+qwen3_vl_2b_config = PTConfig(**qwen3_vl_2b_dict)
+
+qwen3_vl_30b_a3b_dict = {
+    "architectures": ["Qwen3VLMoeForConditionalGeneration"],
+    "image_token_id": 151655,
+    "model_type": "qwen3_vl_moe",
+    "text_config": {
+        "attention_bias": False,
+        "attention_dropout": 0.0,
+        "bos_token_id": 151643,
+        "decoder_sparse_step": 1,
+        "dtype": "bfloat16",
+        "eos_token_id": 151645,
+        "head_dim": 128,
+        "hidden_act": "silu",
+        "hidden_size": 2048,
+        "initializer_range": 0.02,
+        "intermediate_size": 6144,
+        "max_position_embeddings": 262144,
+        "mlp_only_layers": [],
+        "model_type": "qwen3_vl_moe_text",
+        "moe_intermediate_size": 768,
+        "norm_topk_prob": True,
+        "num_attention_heads": 32,
+        "num_experts_per_tok": 8,
+        "num_hidden_layers": 48,
+        "num_key_value_heads": 4,
+        "num_local_experts": 128,
+        "pad_token_id": None,
+        "rms_norm_eps": 1e-06,
+        "rope_parameters": {
+            "mrope_interleaved": True,
+            "mrope_section": [24, 20, 20],
+            "rope_theta": 5000000,
+            "rope_type": "default",
+        },
+        "router_aux_loss_coef": 0.001,
+        "sliding_window": None,
+        "tie_word_embeddings": True,
+        "use_cache": True,
+        "vocab_size": 151936,
+    },
+    "tie_word_embeddings": False,
+    "transformers_version": "5.12.1",
+    "video_token_id": 151656,
+    "vision_config": {
+        "deepstack_visual_indexes": [8, 16, 24],
+        "depth": 27,
+        "hidden_act": "gelu_pytorch_tanh",
+        "hidden_size": 1152,
+        "in_channels": 3,
+        "initializer_range": 0.02,
+        "intermediate_size": 4304,
+        "model_type": "qwen3_vl_moe_vision",
+        "num_heads": 16,
+        "num_position_embeddings": 2304,
+        "out_hidden_size": 2048,
+        "patch_size": 16,
+        "spatial_merge_size": 2,
+        "temporal_patch_size": 2,
+    },
+    "vision_end_token_id": 151653,
+    "vision_start_token_id": 151652,
+}
+qwen3_vl_30b_a3b_config = PTConfig(**qwen3_vl_30b_a3b_dict)
+
+
 # {maxtext model name: hf model config}
 HF_MODEL_CONFIGS = {
     "gemma2-2b": gemma2_2b_config,
@@ -1574,17 +1910,21 @@ HF_MODEL_CONFIGS = {
     "qwen3-14b": qwen3_14b_config,
     "qwen3-14b-base": qwen3_14b_config,
     "qwen3-32b": qwen3_32b_config,
+    "qwen3-vl-2b": qwen3_vl_2b_config,
+    "qwen3-vl-4b": qwen3_vl_4b_config,
+    "qwen3-vl-30b-a3b": qwen3_vl_30b_a3b_config,
     "llama3.1-8b": llama31_8b_config,
     "llama3.1-8b-Instruct": llama31_8b_config,
     "llama3.1-70b": llama31_70b_config,
     "llama3.1-405b": llama31_405b_config,
     "qwen3-30b-a3b": qwen3_30b_a3b_thinking_2507_config,
-    "qwen3-30b-a3b-base": qwen3_30b_a3b_thinking_2507_config,
+    "qwen3-30b-a3b-base": qwen3_30b_a3b_base_config,
     "qwen3-235b-a22b": qwen3_235b_a22b_thinking_2507_config,
     "qwen3-480b-a35b": qwen3_coder_480b_a35b_config,
     "deepseek2-16b": deepseek2_16b_config,
     "deepseek3-671b": deepseek3_671b_config,
     "deepseek3.2-671b": deepseek32_671b_config,
+    "deepseek4-284b": deepseek4_284b_config,
     "gpt-oss-20b": gpt_oss_20b_config,
     "gpt-oss-120b": gpt_oss_120b_config,
     "qwen3-omni-30b-a3b": qwen3_omni_30b_a3b_config,
