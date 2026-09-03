@@ -1839,6 +1839,17 @@ class FineTuning(BaseModel):
           "completion-only loss."
       ),
   )
+  sft_enable_thinking: bool = Field(
+      True,
+      description="Conversation-level enable_thinking value used when no per-row SFT mode column is configured.",
+  )
+  sft_enable_thinking_column: str = Field(
+      "",
+      description=(
+          "Optional required Grain SFT column containing one boolean enable_thinking value per conversation. "
+          "When set, it overrides sft_enable_thinking for every row."
+      ),
+  )
   sft_long_example_handling: Literal["truncate", "window"] = Field(
       "truncate",
       description=(

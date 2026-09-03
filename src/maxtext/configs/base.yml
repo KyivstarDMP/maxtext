@@ -802,6 +802,11 @@ sft_train_on_completion_only: false
 #                           {% generation %} blocks via return_assistant_tokens_mask. Requires
 #                           tokenize=true and sft_train_on_completion_only=true.
 sft_chat_template_mode: 'segmented'
+# Conversation-level reasoning mode used by every SFT chat-template render. Set
+# sft_enable_thinking_column to a required per-row boolean feature for mixed-mode
+# Grain data; otherwise the constant below applies to every row.
+sft_enable_thinking: true
+sft_enable_thinking_column: ''
 # How to handle SFT examples longer than max_target_length (grain SFT pipeline):
 #   'truncate' (default) - head-truncate to max_target_length. NOTE: this drops the tail of long
 #                examples, including the turn terminator (e.g. <end_of_turn>), from BOTH inputs and

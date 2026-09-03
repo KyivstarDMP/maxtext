@@ -534,10 +534,24 @@ def dpo_preprocessing_pipeline(
   return dataset
 
 
-def _format_chat_template_grain(element, data_columns, tokenizer_model, chat_template_mode="segmented"):
+def _format_chat_template_grain(
+    element,
+    data_columns,
+    tokenizer_model,
+    chat_template_mode="segmented",
+    sft_enable_thinking=True,
+    sft_enable_thinking_column="",
+):
   """Grain-compatible mapping function to format raw columns into conversational messages."""
   tools_column_name = data_processing_utils.TOOLS_COLUMN if data_processing_utils.TOOLS_COLUMN in data_columns else None
-  primary_columns = [c for c in data_columns if c != data_processing_utils.TOOLS_COLUMN]
+  primary_columns = [
+      column for column in data_columns if column not in (data_processing_utils.TOOLS_COLUMN, sft_enable_thinking_column)
+  ]
+  enable_thinking = _resolve_sft_enable_thinking(
+      element,
+      default=sft_enable_thinking,
+      column_name=sft_enable_thinking_column,
+  )
 
   # Convert raw columns to conversational messages
   if "messages" in primary_columns:
@@ -579,6 +593,7 @@ def _format_chat_template_grain(element, data_columns, tokenizer_model, chat_tem
       element, tokenizer_model=tokenizer_model,
       data_column_name=primary_columns[0],
       tools_column_name=tools_column_name,
+      enable_thinking=enable_thinking,
   )
 
 
@@ -589,6 +604,25 @@ def _tokenize_sft_chunks(element, text_column_name, tokenizer_model):
   return element
 
 
+def _resolve_sft_enable_thinking(element, default, column_name):
+  """Resolve one strict conversation-level thinking-mode boolean."""
+  if type(default) is not bool:  # pylint: disable=unidiomatic-typecheck
+    raise ValueError(f"sft_enable_thinking must be an actual boolean, got {type(default).__name__}.")
+  if not column_name:
+    return default
+  if column_name not in element:
+    raise ValueError(
+        f"Configured sft_enable_thinking_column={column_name!r} is missing from the SFT record. "
+        f"Present columns: {sorted(element.keys())}"
+    )
+  value = element[column_name]
+  if type(value) is not bool:  # pylint: disable=unidiomatic-typecheck
+    raise ValueError(
+        f"SFT thinking-mode column {column_name!r} must contain an actual boolean, got {type(value).__name__}."
+    )
+  return value
+
+
 def _configure_sft_chat_template(config, data_columns, tokenizer_model, tokenize):
   """Load an optional template file and validate the selected Grain SFT mode."""
   chat_template = getattr(config, "chat_template", None)
@@ -597,11 +631,20 @@ def _configure_sft_chat_template(config, data_columns, tokenizer_model, tokenize
     chat_template = instruction_data_processing.load_chat_template_from_file(chat_template_path)
     if chat_template is None:
       raise ValueError(f"Unable to load SFT chat template from chat_template_path={chat_template_path!r}.")
-  data_processing_utils.validate_and_configure_sft_columns(data_columns, tokenizer_model, chat_template)
+  thinking_column = getattr(config, "sft_enable_thinking_column", "")
+  metadata_columns = (thinking_column,) if thinking_column else ()
+  data_processing_utils.validate_and_configure_sft_columns(
+      data_columns,
+      tokenizer_model,
+      chat_template,
+      metadata_columns=metadata_columns,
+  )
 
   chat_template_mode = getattr(config, "sft_chat_template_mode", "segmented")
   if chat_template_mode not in ("segmented", "assistant_mask"):
     raise ValueError("sft_chat_template_mode must be 'segmented' or 'assistant_mask'; " f"got {chat_template_mode!r}.")
+  active_template = getattr(tokenizer_model, "chat_template", None)
+  data_processing_utils.validate_sft_chat_template_capabilities(active_template, chat_template_mode)
   if chat_template_mode == "assistant_mask":
     if not tokenize:
       raise ValueError("sft_chat_template_mode='assistant_mask' requires tokenize=True in the Grain SFT pipeline.")
@@ -609,7 +652,6 @@ def _configure_sft_chat_template(config, data_columns, tokenizer_model, tokenize
       raise ValueError(
           "sft_chat_template_mode='assistant_mask' requires sft_train_on_completion_only=True so context remains masked."
       )
-    active_template = getattr(tokenizer_model, "chat_template", None)
     if not isinstance(active_template, str) or re.search(r"{%[-+]?\s*generation\b", active_template) is None:
       raise ValueError(
           "sft_chat_template_mode='assistant_mask' requires an active chat template containing "
@@ -634,14 +676,29 @@ def sft_preprocessing_pipeline(
   eval (Option B) runs one pass per dataset and needs no id — so this cannot be derived from
   ``config.per_dataset_metrics`` alone.
   """
-  dataset = data_processing_utils.parse_and_keep_features(dataset, config, data_columns, tokenize)
+  thinking_column = getattr(config, "sft_enable_thinking_column", "")
+  if thinking_column and thinking_column not in data_columns:
+    raise ValueError(
+        f"Configured sft_enable_thinking_column={thinking_column!r} must be listed in the active SFT data columns: "
+        f"{data_columns}"
+    )
+  scalar_bool_columns = (thinking_column,) if thinking_column else ()
+  dataset = data_processing_utils.parse_and_keep_features(
+      dataset,
+      config,
+      data_columns,
+      tokenize,
+      scalar_bool_columns=scalar_bool_columns,
+  )
 
   tokenizer_model, pad_id = data_processing_utils.get_tokenizer_and_pad_id(config)
   base_tokenizer_model = tokenizer_model
 
   tokenizer_model = getattr(tokenizer_model, "tokenizer", tokenizer_model)
 
-  primary_columns = [c for c in data_columns if c != data_processing_utils.TOOLS_COLUMN]
+  primary_columns = [
+      column for column in data_columns if column not in (data_processing_utils.TOOLS_COLUMN, thinking_column)
+  ]
   chat_template_mode = _configure_sft_chat_template(config, data_columns, tokenizer_model, tokenize)
 
   dataset = dataset.map(
@@ -650,6 +707,8 @@ def sft_preprocessing_pipeline(
           data_columns=data_columns,
           tokenizer_model=tokenizer_model,
           chat_template_mode=chat_template_mode,
+          sft_enable_thinking=getattr(config, "sft_enable_thinking", True),
+          sft_enable_thinking_column=thinking_column,
       )
   )
 
