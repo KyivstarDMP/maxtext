@@ -17,6 +17,7 @@
 import dataclasses
 import json
 import warnings
+from collections.abc import Mapping
 from threading import current_thread
 from typing import Any, Iterable, TYPE_CHECKING
 
@@ -28,6 +29,7 @@ import grain.python as grain
 import numpy as np
 from grain._src.python.dataset.sources.tfrecord_dataset import _TFRecordReader, _TFRecordDatasetIterator  # pylint: disable=protected-access
 from grain.experimental import FlatMapTransform, TFRecordIterDataset
+from jinja2.exceptions import TemplateError
 from maxtext.input_pipeline.protos import example_pb2
 from maxtext.input_pipeline import tokenizer
 from maxtext.multimodal import processor as mm_processor
@@ -572,6 +574,107 @@ def apply_chat_template(example, tokenizer_model, data_column_name, tools_column
   return example
 
 
+def apply_chat_template_with_assistant_mask(
+    example,
+    tokenizer_model,
+    data_column_name,
+    tools_column_name=None,
+):
+  """Render one canonical SFT token stream and use template-owned loss spans.
+
+  This is the token-native alternative to :func:`apply_chat_template`'s
+  segmented longest-common-prefix path. The tokenizer renders the complete
+  conversation exactly once and returns an ``assistant_masks`` array produced
+  by Jinja ``{% generation %}`` blocks. The aligned token IDs and mask are then
+  converted into the existing MaxText ``token_runs`` / ``is_prompt`` contract
+  without decoding or re-tokenizing.
+
+  The template may use a per-message ``trainable`` boolean to suppress marker
+  ownership for historical assistant turns in dataset-expanded prefixes.
+  MaxText does not interpret that field itself; it consumes only the mask
+  returned by Transformers.
+
+  Args:
+    example: A dictionary containing a complete conversational row.
+    tokenizer_model: A Hugging Face tokenizer with a generation-marked chat
+      template.
+    data_column_name: Column containing the message list.
+    tools_column_name: Optional column containing native tool declarations.
+  Returns:
+    The modified example with token-ID runs in ``data_column_name``, matching
+    ``is_prompt`` flags.
+
+  Raises:
+    ValueError: If the row or tokenizer output violates the canonical
+      token-stream/mask contract.
+  """
+  conversation = example[data_column_name]
+  if isinstance(conversation, str):
+    conversation = json.loads(conversation)
+  if not isinstance(conversation, list) or not conversation:
+    raise ValueError("Canonical assistant-mask SFT requires a non-empty message list.")
+
+  for index, message in enumerate(conversation):
+    if not isinstance(message, Mapping) or "role" not in message:
+      raise ValueError(f"SFT message at index {index} must be a mapping with a role.")
+    role = message["role"]
+    if role in ("system", "developer"):
+      if index != 0:
+        raise ValueError(f"'{role}' message found at index {index}. It must be at index 0.")
+    elif role not in ("user", "assistant", "tool"):
+      raise ValueError(f"Unsupported message role '{role}' at index {index}.")
+
+  tools = example.get(tools_column_name) if tools_column_name else None
+  if isinstance(tools, str):
+    tools = json.loads(tools)
+  tools_kwargs = {"tools": tools} if tools is not None else {}
+
+  try:
+    encoded = tokenizer_model.apply_chat_template(
+        conversation,
+        add_generation_prompt=False,
+        tokenize=True,
+        return_dict=True,
+        return_assistant_tokens_mask=True,
+        enable_thinking=True,
+        preserve_thinking=True,
+        **tools_kwargs,
+    )
+  except (TypeError, ValueError) as error:
+    max_logging.log(f"Unable to apply canonical assistant-mask chat template: {error}")
+    raise
+
+  input_ids = extract_token_ids(encoded)
+  if isinstance(input_ids, np.ndarray):
+    input_ids = input_ids.tolist()
+  if input_ids and isinstance(input_ids[0], (list, tuple, np.ndarray)):
+    if len(input_ids) != 1:
+      raise ValueError(f"Canonical assistant-mask SFT expected one token stream, got batch size {len(input_ids)}.")
+    input_ids = list(input_ids[0])
+
+  if isinstance(encoded, Mapping):
+    assistant_mask = encoded.get("assistant_masks")
+  else:
+    assistant_mask = getattr(encoded, "assistant_masks", None)
+  if assistant_mask is None:
+    raise ValueError(
+        "Tokenizer did not return assistant_masks. The selected chat template must contain "
+        "{% generation %} blocks and the Transformers version must support return_assistant_tokens_mask."
+    )
+  if isinstance(assistant_mask, np.ndarray):
+    assistant_mask = assistant_mask.tolist()
+  if assistant_mask and isinstance(assistant_mask[0], (list, tuple, np.ndarray)):
+    if len(assistant_mask) != 1:
+      raise ValueError(f"Canonical assistant-mask SFT expected one ownership mask, got batch size {len(assistant_mask)}.")
+    assistant_mask = list(assistant_mask[0])
+
+  token_runs, is_prompt = split_sft_token_stream_by_assistant_mask(input_ids, assistant_mask)
+  example[data_column_name] = token_runs
+  example["is_prompt"] = is_prompt
+
+  return example
+
+
 def tokenization(example, hf_tokenizer, truncation, max_length, column_names):
   """Tokenize a HuggingFace dataset"""
   for column_name in column_names:
@@ -582,6 +685,82 @@ def tokenization(example, hf_tokenizer, truncation, max_length, column_names):
     elif isinstance(example[column_name], str):
       example[column_name] = hf_tokenizer(example[column_name], truncation=truncation, max_length=max_length)["input_ids"]
   return example
+
+
+def split_sft_token_stream_by_assistant_mask(input_ids, assistant_mask):
+  """Convert one canonical token stream and binary assistant mask into SFT token runs.
+
+  The returned ``token_runs`` / ``is_prompt`` pair is the existing input
+  contract consumed by :class:`SFTPromptMasking` and
+  :class:`SFTPromptMaskingWindows`. A mask value of 1 means the corresponding
+  token is model-owned and loss-applied, so its run receives
+  ``is_prompt=False``. A value of 0 means masked context and receives
+  ``is_prompt=True``.
+
+  This conversion is token-native by construction: it never decodes or
+  re-tokenizes, and concatenating the returned runs exactly reconstructs the
+  supplied token IDs. Adjacent spans with the same ownership are deliberately
+  coalesced because the downstream masking transforms care about token
+  ownership changes, not individual Jinja generation-block boundaries.
+
+  Args:
+    input_ids: One non-empty, one-dimensional token-ID sequence.
+    assistant_mask: A binary sequence aligned one-to-one with ``input_ids``;
+      1 selects loss and 0 selects masked context.
+
+  Returns:
+    A pair ``(token_runs, is_prompt)`` containing non-empty contiguous token
+    runs and their existing MaxText prompt/completion flags.
+
+  Raises:
+    ValueError: If the stream is empty, lengths differ, a mask value is not an
+      integer/bool 0 or 1, or the mask selects no loss-bearing tokens.
+    TypeError: If a token ID cannot be converted to an integer.
+  """
+  try:
+    token_ids = [int(token_id) for token_id in input_ids]
+  except (TypeError, ValueError) as error:
+    raise TypeError("input_ids must be a one-dimensional sequence of integer token IDs.") from error
+
+  if not token_ids:
+    raise ValueError("input_ids must contain at least one token.")
+
+  mask_values = list(assistant_mask)
+  if len(token_ids) != len(mask_values):
+    raise ValueError(
+        "input_ids and assistant_mask must have identical lengths: "
+        f"input_ids={len(token_ids)}, assistant_mask={len(mask_values)}."
+    )
+
+  normalized_mask = []
+  for index, mask_value in enumerate(mask_values):
+    if isinstance(mask_value, (bool, np.bool_)):
+      normalized_mask.append(int(mask_value))
+    elif isinstance(mask_value, (int, np.integer)) and int(mask_value) in (0, 1):
+      normalized_mask.append(int(mask_value))
+    else:
+      raise ValueError(
+          "assistant_mask must contain only integer/bool 0 or 1 values; " f"got {mask_value!r} at index {index}."
+      )
+
+  if not any(normalized_mask):
+    raise ValueError(
+        "assistant_mask contains no loss-bearing tokens; a completion-only SFT example cannot be context-only."
+    )
+
+  token_runs = []
+  is_prompt = []
+  run_start = 0
+  for index in range(1, len(token_ids)):
+    if normalized_mask[index] == normalized_mask[run_start]:
+      continue
+    token_runs.append(token_ids[run_start:index])
+    is_prompt.append(normalized_mask[run_start] == 0)
+    run_start = index
+  token_runs.append(token_ids[run_start:])
+  is_prompt.append(normalized_mask[run_start] == 0)
+
+  return token_runs, is_prompt
 
 
 @dataclasses.dataclass
@@ -681,6 +860,7 @@ class SFTPromptMaskingWindows(FlatMapTransform):
     return records
 
   def flat_map(self, element):
+    """Split one over-length SFT example into bounded loss-bearing windows."""
     length = self.max_target_length
     segments = element[self.text_column_name]
     is_prompt = element["is_prompt"]

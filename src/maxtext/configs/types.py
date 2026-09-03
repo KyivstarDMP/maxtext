@@ -1339,7 +1339,9 @@ class Tokenizer(BaseModel):
   )
   tokenizer_type: TokenizerType = Field(TokenizerType.SENTENCEPIECE, description="The type of tokenizer.")
   use_chat_template: bool = Field(False, description="Whether to use the chat template for tokenization.")
-  chat_template_path: str = Field("", description="Path to chat template json file.")
+  chat_template_path: str = Field(
+      "", description="Path to a Jinja/text chat template or JSON object containing a chat_template field."
+  )
   chat_template: str = Field(
       "",
       description="Chat template to use with HF tokenizers. It should be a valid Jinja2-formatted template.",
@@ -1516,6 +1518,15 @@ class FineTuning(BaseModel):
   use_sft: bool = Field(False, description="If True, enables Supervised Fine-Tuning.")
   sft_train_on_completion_only: bool = Field(
       False, description="If True, trains only on the completion part of the text."
+  )
+  sft_chat_template_mode: Literal["segmented", "assistant_mask"] = Field(
+      "segmented",
+      description=(
+          "How Grain serializes SFT conversations and discovers loss ownership. 'segmented' preserves the "
+          "legacy per-round chat-template/LCP path. 'assistant_mask' renders one canonical token stream and "
+          "uses {% generation %} ownership returned by the tokenizer; it requires tokenization and "
+          "completion-only loss."
+      ),
   )
   sft_long_example_handling: Literal["truncate", "window"] = Field(
       "truncate",

@@ -231,6 +231,7 @@ def preprocessing_pipeline(
     use_tunix_gradient_accumulation=False,
     num_microbatches=1,
     sft_train_on_completion_only=True,
+    sft_chat_template_mode="segmented",
     grain_worker_count=1,  # only support 0 or 1
     max_segments_per_seq=None,
     num_epoch=1,
@@ -239,6 +240,12 @@ def preprocessing_pipeline(
     formatting_func_kwargs: Optional[dict] = None,
 ):
   """pipeline for preprocessing HF dataset"""
+  if use_sft and sft_chat_template_mode != "segmented":
+    raise ValueError(
+        "sft_chat_template_mode='assistant_mask' is currently supported only by the Grain SFT pipeline; "
+        "use dataset_type=grain or keep the HF pipeline in segmented mode."
+    )
+
   import datasets  # pylint: disable=import-outside-toplevel
 
   assert global_batch_size % global_mesh.size == 0, "Batch size should be divisible by number of global devices."
@@ -280,7 +287,9 @@ def preprocessing_pipeline(
     data_processing_utils.validate_and_configure_sft_columns(data_column_names, tokenizer, chat_template)
 
     # Separate auxiliary "tools" column from primary data columns
-    tools_column_name = data_processing_utils.TOOLS_COLUMN if data_processing_utils.TOOLS_COLUMN in data_column_names else None
+    tools_column_name = (
+        data_processing_utils.TOOLS_COLUMN if data_processing_utils.TOOLS_COLUMN in data_column_names else None
+    )
     if tools_column_name:
       data_column_names = [c for c in data_column_names if c != tools_column_name]
 
@@ -470,6 +479,7 @@ def make_hf_train_iterator(
         use_tunix_gradient_accumulation=config.use_tunix_gradient_accumulation,
         num_microbatches=config.gradient_accumulation_steps,
         sft_train_on_completion_only=config.sft_train_on_completion_only,
+        sft_chat_template_mode=config.sft_chat_template_mode,
         chat_template_path=config.chat_template_path,
         max_segments_per_seq=config.max_segments_per_seq,
         num_epoch=config.num_epoch,
@@ -532,6 +542,7 @@ def make_hf_eval_iterator(
         use_sft=config.use_sft,
         num_microbatches=config.gradient_accumulation_steps,
         sft_train_on_completion_only=config.sft_train_on_completion_only,
+        sft_chat_template_mode=config.sft_chat_template_mode,
         chat_template_path=config.chat_template_path,
         max_segments_per_seq=config.max_segments_per_seq,
         chat_template=config.chat_template,
