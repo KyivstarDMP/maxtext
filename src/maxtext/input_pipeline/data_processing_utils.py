@@ -40,10 +40,7 @@ def validate_sft_chat_template_capabilities(chat_template: str | None, chat_temp
   """
   if not isinstance(chat_template, str):
     return
-  if (
-      REQUIRES_ASSISTANT_MASK_TEMPLATE_CAPABILITY in chat_template
-      and chat_template_mode != "assistant_mask"
-  ):
+  if REQUIRES_ASSISTANT_MASK_TEMPLATE_CAPABILITY in chat_template and chat_template_mode != "assistant_mask":
     raise ValueError(
         "The active SFT chat template declares "
         f"{REQUIRES_ASSISTANT_MASK_TEMPLATE_CAPABILITY!r} and cannot be used with "
@@ -71,7 +68,14 @@ def parse_and_keep_features(dataset, config, data_columns, tokenize, scalar_bool
 
 
 @functools.lru_cache(maxsize=None)
-def _build_tokenizer_cached(tokenizer_path, tokenizer_type, add_bos, add_eos, hf_access_token):
+def _build_tokenizer_cached(
+    tokenizer_path,
+    tokenizer_type,
+    add_bos,
+    add_eos,
+    hf_access_token,
+    tokenizer_revision=None,
+):
   """Build a tokenizer once per distinct configuration, then reuse it.
 
   Each preprocessing pipeline constructs its own tokenizer. That was fine with one train and one
@@ -81,7 +85,14 @@ def _build_tokenizer_cached(tokenizer_path, tokenizer_type, add_bos, add_eos, hf
   hosts x datasets calls in one startup burst and trips the Hub rate limit (429). Caching also
   saves the redundant load time and memory. Args are the plain hashable tokenizer identity.
   """
-  return tokenizer.build_tokenizer(tokenizer_path, tokenizer_type, add_bos, add_eos, hf_access_token)
+  return tokenizer.build_tokenizer(
+      tokenizer_path,
+      tokenizer_type,
+      add_bos,
+      add_eos,
+      hf_access_token,
+      tokenizer_revision,
+  )
 
 
 def get_tokenizer_and_pad_id(config, add_bos: bool | None = None, add_eos: bool | None = None):
@@ -94,6 +105,7 @@ def get_tokenizer_and_pad_id(config, add_bos: bool | None = None, add_eos: bool 
       bos,
       eos,
       config.hf_access_token,
+      getattr(config, "tokenizer_revision", "") or None,
   )
   if tokenizer_model.pad_id is not None:
     pad_id = tokenizer_model.pad_id

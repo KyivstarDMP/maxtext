@@ -591,7 +591,8 @@ def _format_chat_template_grain(
     formatter = input_pipeline_utils.apply_chat_template_with_assistant_mask
 
   return formatter(
-      element, tokenizer_model=tokenizer_model,
+      element,
+      tokenizer_model=tokenizer_model,
       data_column_name=primary_columns[0],
       tools_column_name=tools_column_name,
       pin_leading_context=pin_leading_context,
@@ -640,7 +641,12 @@ def _configure_sft_chat_template(config, data_columns, tokenizer_model, tokenize
   chat_template = getattr(config, "chat_template", None)
   chat_template_path = getattr(config, "chat_template_path", "")
   if not chat_template and chat_template_path:
-    chat_template = instruction_data_processing.load_chat_template_from_file(chat_template_path)
+    chat_template = instruction_data_processing.load_chat_template_from_file(
+        chat_template_path,
+        hf_access_token=getattr(config, "hf_access_token", None),
+        revision=getattr(config, "chat_template_revision", "") or None,
+        expected_sha256=getattr(config, "chat_template_sha256", "") or None,
+    )
     if chat_template is None:
       raise ValueError(f"Unable to load SFT chat template from chat_template_path={chat_template_path!r}.")
   thinking_column = getattr(config, "sft_enable_thinking_column", "")
