@@ -1523,6 +1523,22 @@ class TestAddConfigToSummaryWriter(unittest.TestCase):
       if jax.process_index() == 0:
         self.assertEqual(mock_add.call_count, 2)
 
+  def test_excludes_keys_marked_no_logging(self):
+    sentinel = "not-for-summary"
+    cfg = MagicMock()
+    cfg.get_keys.return_value = {
+        "learning_rate": 0.001,
+        "hf_access_token": sentinel,
+    }
+    mock_writer = MagicMock()
+
+    with unittest.mock.patch("maxtext.utils.max_utils.add_text_to_summary_writer") as mock_add:
+      maxtext_utils.add_config_to_summary_writer(cfg, mock_writer)
+
+    if jax.process_index() == 0:
+      mock_add.assert_called_once_with("learning_rate", "0.001", mock_writer)
+      self.assertNotIn(sentinel, str(mock_add.call_args_list))
+
 
 class TestMaybeDumpJaxpr(unittest.TestCase):
   """Tests for maybe_dump_jaxpr."""
