@@ -122,9 +122,10 @@ Supervised Fine-Tuning in MaxText relies on tokenizing conversational datasets u
 
 ### Supported Dataset Schemas
 
-By default, MaxText SFT expects one of three conversational dataset structures:
+By default, MaxText SFT expects one of four conversational dataset structures:
 
 - `["messages"]`: A single column containing a list of dictionaries with `role` and `content` (recommended).
+- `["messages", "tools"]`: Messages plus native tool declarations passed to the chat template.
 - `["prompt", "completion"]`: Separated prompt and completion columns.
 - `["question", "answer"]`: Question and answer columns (e.g., math datasets).
 
@@ -142,8 +143,47 @@ During data processing, MaxText converts these into a unified `messages` schema 
 To customize the tokenizer's chat formatting (e.g., adding special tokens like `<start_of_turn>`, `<end_of_turn>`, etc.), you can provide a custom chat template using the `chat_template` or `chat_template_path` configs:
 
 - **`chat_template`**: Use this config to specify a custom Jinja2 template string directly.
-- **`chat_template_path`**: Path to a custom Jinja2 template file (e.g., `.jinja`) or a JSON file containing the template.
+- **`chat_template_path`**: Path to a custom Jinja2 template file (e.g., `.jinja`), a JSON file containing the template, or an `hf://<org>/<repo>/<path>` Hub URI.
+- **`tokenizer_revision`**: Optional Hugging Face revision passed when loading `tokenizer_path`.
+- **`chat_template_revision`**: Optional Hugging Face revision used for an `hf://` template path.
+- **`chat_template_sha256`**: Optional SHA-256 check over the exact loaded template bytes.
 - **`use_chat_template=True`**: Enables chat template formatting.
+
+Keep Hub revisions in the separate revision fields rather than embedding them in
+the URI. For reproducible runs, use immutable commit IDs:
+
+```yaml
+tokenizer_type: huggingface
+tokenizer_path: example-org/example-model
+tokenizer_revision: <40_HEX_COMMIT>
+chat_template_path: hf://example-org/example-model/templates/training.jinja
+chat_template_revision: <40_HEX_COMMIT>
+```
+
+### Canonical token ownership for completion-only SFT
+
+The tokenized Grain pipeline also supports an opt-in canonical mode. It renders
+the full conversation once and uses Jinja `{% generation %}` blocks to decide
+which exact tokens receive loss:
+
+```yaml
+dataset_type: grain
+use_sft: true
+tokenize_train_data: true
+sft_train_on_completion_only: true
+sft_chat_template_mode: assistant_mask
+```
+
+The default `segmented` mode remains available for compatible templates.
+`assistant_mask` is Grain-only and requires a generation-marked template. For
+the complete ownership, tools, thinking-mode, and validation contract, see
+[Canonical Gemma 4 SFT rendering](gemma4_sft_canonical_rendering.md) and the
+[Gemma 4 SFT data contract](gemma4_sft_data_contract.md).
+
+For records longer than `max_target_length`, see
+[SFT long-example windowing](sft_long_example_windowing.md). For the difference
+between one canonical training history and online generation prefixes, see
+[Gemma 4 multi-turn SFT and serving frontiers](gemma4_sft_serving_frontiers.md).
 
 ### Advanced: Custom Dataset Formatter (e.g., ShareGPT)
 
