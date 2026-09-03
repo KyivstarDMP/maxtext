@@ -31,6 +31,7 @@ from maxtext.input_pipeline import input_pipeline_utils
 from maxtext.input_pipeline import instruction_data_processing
 from maxtext.input_pipeline import multihost_dataloading
 from maxtext.utils import elastic_utils
+from maxtext.utils import max_logging
 
 
 def _get_pad_id(tokenizer):
@@ -218,7 +219,10 @@ def preprocessing_pipeline(
     max_target_length,
     shuffle,
     data_shuffle_seed,
+    tokenizer_revision="",
     chat_template_path="",
+    chat_template_revision="",
+    chat_template_sha256="",
     add_bos=True,
     add_eos=True,
     packing=True,
@@ -253,7 +257,12 @@ def preprocessing_pipeline(
         "use the constant sft_enable_thinking setting for HF SFT."
     )
   if use_sft and not chat_template and chat_template_path:
-    chat_template = instruction_data_processing.load_chat_template_from_file(chat_template_path)
+    chat_template = instruction_data_processing.load_chat_template_from_file(
+        chat_template_path,
+        hf_access_token=hf_access_token,
+        revision=chat_template_revision or None,
+        expected_sha256=chat_template_sha256 or None,
+    )
     if chat_template is None:
       raise ValueError(f"Unable to load SFT chat template from chat_template_path={chat_template_path!r}.")
   if use_sft:
@@ -282,12 +291,15 @@ def preprocessing_pipeline(
   elif num_epoch > 1:
     dataset = dataset.repeat(num_epoch)
 
+  requested_tokenizer_revision = tokenizer_revision or None
+  max_logging.log(f"tokenizer path={tokenizer_path} revision={requested_tokenizer_revision}")
   tokenizer = transformers.AutoTokenizer.from_pretrained(
       tokenizer_path,
       add_bos_token=add_bos if not use_sft else False,
       add_eos_token=add_eos if not use_sft else False,
       legacy=False,
       token=hf_access_token,
+      revision=requested_tokenizer_revision,
       extra_special_tokens={},
   )
 
@@ -479,6 +491,7 @@ def make_hf_train_iterator(
         data_column_names=config.train_data_columns,
         tokenize=config.tokenize_train_data,
         tokenizer_path=config.tokenizer_path,
+        tokenizer_revision=getattr(config, "tokenizer_revision", "") or None,
         hf_access_token=config.hf_access_token,
         global_batch_size=config.global_batch_size_to_load,
         max_target_length=config.max_target_length,
@@ -497,6 +510,8 @@ def make_hf_train_iterator(
         sft_enable_thinking=config.sft_enable_thinking,
         sft_enable_thinking_column=config.sft_enable_thinking_column,
         chat_template_path=config.chat_template_path,
+        chat_template_revision=getattr(config, "chat_template_revision", "") or None,
+        chat_template_sha256=getattr(config, "chat_template_sha256", "") or None,
         max_segments_per_seq=config.max_segments_per_seq,
         num_epoch=config.num_epoch,
         chat_template=config.chat_template,
@@ -545,6 +560,7 @@ def make_hf_eval_iterator(
         data_column_names=config.eval_data_columns,
         tokenize=config.tokenize_eval_data,
         tokenizer_path=config.tokenizer_path,
+        tokenizer_revision=getattr(config, "tokenizer_revision", "") or None,
         hf_access_token=config.hf_access_token,
         global_batch_size=config.global_batch_size_to_load_eval,
         max_target_length=config.max_target_length,
@@ -562,6 +578,8 @@ def make_hf_eval_iterator(
         sft_enable_thinking=config.sft_enable_thinking,
         sft_enable_thinking_column=config.sft_enable_thinking_column,
         chat_template_path=config.chat_template_path,
+        chat_template_revision=getattr(config, "chat_template_revision", "") or None,
+        chat_template_sha256=getattr(config, "chat_template_sha256", "") or None,
         max_segments_per_seq=config.max_segments_per_seq,
         chat_template=config.chat_template,
         formatting_func_path=config.formatting_func_path,

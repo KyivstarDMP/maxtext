@@ -14,15 +14,95 @@
 
 """Tests for tokenizer"""
 
-import numpy as np
-from maxtext.utils.globals import MAXTEXT_ASSETS_ROOT
-from maxtext.input_pipeline import input_pipeline_utils
-from maxtext.trainers.tokenizer import train_tokenizer
-from maxtext.common.gcloud_stub import is_decoupled
+# pylint: disable=protected-access
 
-import unittest
 import os
+from types import SimpleNamespace
+import unittest
+from unittest import mock
+
+import numpy as np
+from maxtext.common.gcloud_stub import is_decoupled
+from maxtext.input_pipeline import data_processing_utils
+from maxtext.input_pipeline import input_pipeline_utils
+from maxtext.input_pipeline import tokenizer
+from maxtext.trainers.tokenizer import train_tokenizer
+from maxtext.utils.globals import MAXTEXT_ASSETS_ROOT
+
 from tests.utils.test_helpers import ensure_tokenizer_downloaded
+
+TEST_REVISION = "01234567" * 5
+
+
+class PinnedTokenizerRevisionTest(unittest.TestCase):
+  """Tests revision plumbing without network access."""
+
+  def test_hf_tokenizer_passes_revision(self):
+    loaded_tokenizer = mock.MagicMock(
+        pad_token_id=0,
+        unk_token_id=1,
+        bos_token_id=2,
+        eos_token_id=3,
+    )
+    with mock.patch.object(
+        tokenizer.transformers.AutoTokenizer,
+        "from_pretrained",
+        return_value=loaded_tokenizer,
+    ) as mock_load:
+      tokenizer.HFTokenizer(
+          "example-org/example-model",
+          add_bos=False,
+          add_eos=True,
+          hf_access_token="test-token",
+          tokenizer_revision=TEST_REVISION,
+      )
+
+    mock_load.assert_called_once_with(
+        "example-org/example-model",
+        add_bos_token=False,
+        add_eos_token=True,
+        token="test-token",
+        revision=TEST_REVISION,
+    )
+
+  def test_hf_tokenizer_normalizes_empty_revision(self):
+    loaded_tokenizer = mock.MagicMock(
+        pad_token_id=0,
+        unk_token_id=1,
+        bos_token_id=2,
+        eos_token_id=3,
+    )
+    with mock.patch.object(
+        tokenizer.transformers.AutoTokenizer,
+        "from_pretrained",
+        return_value=loaded_tokenizer,
+    ) as mock_load:
+      tokenizer.HFTokenizer("example-org/example-model", False, False, None, "")
+
+    self.assertIsNone(mock_load.call_args.kwargs["revision"])
+
+  def test_tokenizer_cache_key_includes_revision(self):
+    config = SimpleNamespace(
+        tokenizer_path="example-org/example-model",
+        tokenizer_type="huggingface",
+        add_bos=False,
+        add_eos=False,
+        hf_access_token="test-token",
+        tokenizer_revision="a" * 40,
+    )
+    built = SimpleNamespace(pad_id=0, unk_id=1)
+    data_processing_utils._build_tokenizer_cached.cache_clear()
+    self.addCleanup(data_processing_utils._build_tokenizer_cached.cache_clear)
+
+    with mock.patch.object(tokenizer, "build_tokenizer", return_value=built) as mock_build:
+      data_processing_utils.get_tokenizer_and_pad_id(config)
+      data_processing_utils.get_tokenizer_and_pad_id(config)
+      config.tokenizer_revision = "b" * 40
+      data_processing_utils.get_tokenizer_and_pad_id(config)
+
+    self.assertEqual(mock_build.call_count, 2)
+    self.assertEqual(mock_build.call_args_list[0].args[-1], "a" * 40)
+    self.assertEqual(mock_build.call_args_list[1].args[-1], "b" * 40)
 
 
 @unittest.skipIf(is_decoupled(), "Bypassed in offline decoupled runs (no GCS/internet)")

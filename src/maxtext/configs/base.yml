@@ -687,11 +687,17 @@ num_vocab_tiling: 1
 # Tokenizer
 vocab_size: 32_000 # powers of 2 for sharding
 tokenizer_path: ""
+# Optional Hub revision (commit, tag, or branch) passed to Hugging Face tokenizers.
+tokenizer_revision: ""
 # grain and tfds pipeline supports tokenizer_type: sentencepiece, huggingface, tiktoken
 # hf pipeline only supports huggingface type, and will ignore tokenizer_type flag
 tokenizer_type: "sentencepiece" # Currently supporting: "tiktoken", "sentencepiece", "huggingface"
 use_chat_template: false
 chat_template_path: "" # path to a Jinja/text template or JSON object containing "chat_template"
+# Optional Hub revision for an hf:// chat_template_path. Keep the revision out of the URI.
+chat_template_revision: ""
+# Optional SHA-256 for the exact loaded chat-template bytes.
+chat_template_sha256: ""
 chat_template: "" # Chat template to use with HF tokenizers. It should be a valid Jinja2-formatted template.
 tokenize_train_data: true  # false if the dataset is pre-tokenized
 tokenize_eval_data: true  # false if the dataset is pre-tokenized

@@ -638,7 +638,12 @@ def configure_tokenizer_chat_template(model_tokenizer: Any, trainer_config: Any)
           load_chat_template_from_file,
       )
 
-      model_tokenizer.chat_template = load_chat_template_from_file(trainer_config.chat_template_path)
+      model_tokenizer.chat_template = load_chat_template_from_file(
+          trainer_config.chat_template_path,
+          hf_access_token=getattr(trainer_config, "hf_access_token", None),
+          revision=getattr(trainer_config, "chat_template_revision", "") or None,
+          expected_sha256=getattr(trainer_config, "chat_template_sha256", "") or None,
+      )
     else:
       raise ValueError(
           f"Tokenizer {getattr(trainer_config, 'tokenizer_path', None)!r} has no chat_template "
@@ -676,9 +681,12 @@ def _rl_train_impl(argv: Sequence[str], kwargs: dict):
   # adapter (used to synthesize segment_ids that mask pad positions from
   # attention — without this the trainer attends to pad tokens and produces
   # corrupted log-probs).
+  requested_tokenizer_revision = getattr(trainer_config, "tokenizer_revision", "") or None
+  max_logging.log(f"tokenizer path={trainer_config.tokenizer_path} revision={requested_tokenizer_revision}")
   model_tokenizer = AutoTokenizer.from_pretrained(
       trainer_config.tokenizer_path,
       token=trainer_config.hf_access_token or None,
+      revision=requested_tokenizer_revision,
   )
   configure_tokenizer_chat_template(model_tokenizer, trainer_config)
 

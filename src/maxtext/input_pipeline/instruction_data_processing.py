@@ -14,10 +14,14 @@
 
 """Preprocessing for instruction dataset."""
 
-import json
+import hashlib
 import importlib
+import json
 import os
 import re
+
+from huggingface_hub import hf_hub_download
+from huggingface_hub.utils import parse_hf_uri
 
 from maxtext.utils import max_logging
 
@@ -44,30 +48,70 @@ def load_data_template_from_file(template_path):
   return None
 
 
-def load_chat_template_from_file(template_path):
-  """Loads a chat template from a file."""
+def load_chat_template_from_file(
+    template_path,
+    hf_access_token=None,
+    revision=None,
+    expected_sha256=None,
+):
+  """Load a local or revision-qualified Hub chat template.
+
+  Hub templates use ``hf://<org>/<repo>/<path>``. Revisions must be supplied
+  separately so branch names containing slashes cannot be misparsed as file
+  paths. An optional SHA-256 check applies to the exact bytes read from either
+  source.
+  """
   if not template_path:
     return None
 
-  current_dir = os.path.dirname(os.path.abspath(__file__))
-  repo_root = os.path.abspath(os.path.join(current_dir, "..", ".."))
-  template_full_path = os.path.join(repo_root, template_path)
+  requested_revision = revision or None
+  if template_path.startswith("hf://"):
+    parsed = parse_hf_uri(template_path)
+    if parsed.type != "model":
+      raise ValueError(f"chat_template_path must reference a model repository, got type={parsed.type!r}.")
+    if parsed.revision is not None:
+      raise ValueError("Do not embed a revision in chat_template_path; set chat_template_revision separately.")
+    if not parsed.path_in_repo:
+      raise ValueError("chat_template_path must include a file path inside the Hub repository.")
+    if "%" in parsed.id or "%" in parsed.path_in_repo:
+      raise ValueError("Percent-encoded Hub identifiers and paths are not supported in chat_template_path.")
+    template_full_path = hf_hub_download(
+        repo_id=parsed.id,
+        filename=parsed.path_in_repo,
+        revision=requested_revision,
+        token=hf_access_token or None,
+    )
+    asset_path = parsed.path_in_repo
+  else:
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    repo_root = os.path.abspath(os.path.join(current_dir, "..", ".."))
+    template_full_path = os.path.join(repo_root, template_path)
+    asset_path = template_path
 
   if not os.path.isfile(template_full_path):
     return None
 
-  if template_full_path.endswith((".jinja", ".j2", ".txt")):
-    with open(template_full_path, "r", encoding="utf-8") as f:
-      return f.read()
+  with open(template_full_path, "rb") as template_file:
+    template_bytes = template_file.read()
+  template_sha256 = hashlib.sha256(template_bytes).hexdigest()
+  if expected_sha256 and template_sha256 != expected_sha256:
+    raise ValueError(
+        "Chat template SHA-256 mismatch: "
+        f"expected={expected_sha256}, actual={template_sha256}, path={template_path!r}, "
+        f"revision={requested_revision!r}."
+    )
+  max_logging.log(f"chat_template sha256={template_sha256} path={template_path} revision={requested_revision}")
 
-  if template_full_path.endswith(".json"):
-    with open(template_full_path, "r", encoding="utf-8") as f:
-      try:
-        template_config = json.load(f)
-        if isinstance(template_config, dict) and "chat_template" in template_config:
-          return template_config["chat_template"]
-      except json.JSONDecodeError:
-        return None
+  if asset_path.endswith((".jinja", ".j2", ".txt")):
+    return template_bytes.decode("utf-8")
+
+  if asset_path.endswith(".json"):
+    try:
+      template_config = json.loads(template_bytes.decode("utf-8"))
+      if isinstance(template_config, dict) and "chat_template" in template_config:
+        return template_config["chat_template"]
+    except (UnicodeDecodeError, json.JSONDecodeError):
+      return None
 
   return None
 

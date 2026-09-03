@@ -53,6 +53,7 @@ MESSAGES = [
 ]
 INPUT_IDS = [1, 2, 101, 102, 3, 4, 201, 202]
 ASSISTANT_MASK = [0, 0, 1, 1, 0, 0, 1, 1]
+TEST_REVISION = "01234567" * 5
 
 
 class _AssistantMaskTokenizer:
@@ -93,6 +94,9 @@ def _config(**overrides):
   values = {
       "chat_template": "",
       "chat_template_path": "",
+      "chat_template_revision": "",
+      "chat_template_sha256": "",
+      "hf_access_token": None,
       "sft_chat_template_mode": "segmented",
       "sft_train_on_completion_only": True,
       "sft_enable_thinking": True,
@@ -171,15 +175,27 @@ def test_grain_loads_generation_marked_template_from_configured_path(monkeypatch
       "{# maxtext-template-capability: requires-assistant-mask #}"
       "{% generation %}{{ messages[-1]['content'] }}{% endgeneration %}"
   )
+  loader_calls = []
+
+  def _load_template(path, **kwargs):
+    loader_calls.append((path, kwargs))
+    return template if path == "hf://example-org/example-model/training-template.jinja" else None
+
   monkeypatch.setattr(
       grain_data_processing.instruction_data_processing,
       "load_chat_template_from_file",
-      lambda path: template if path == "/tmp/training-template.jinja" else None,
+      _load_template,
   )
   tokenizer = SimpleNamespace(chat_template="inference-template")
 
   mode = grain_data_processing._configure_sft_chat_template(
-      _config(chat_template_path="/tmp/training-template.jinja", sft_chat_template_mode="assistant_mask"),
+      _config(
+          chat_template_path="hf://example-org/example-model/training-template.jinja",
+          chat_template_revision=TEST_REVISION,
+          chat_template_sha256="a" * 64,
+          hf_access_token="test-token",
+          sft_chat_template_mode="assistant_mask",
+      ),
       ["messages"],
       tokenizer,
       True,
@@ -188,6 +204,16 @@ def test_grain_loads_generation_marked_template_from_configured_path(monkeypatch
   assert mode == "assistant_mask"
   assert tokenizer.chat_template == template
   assert data_processing_utils.REQUIRES_ASSISTANT_MASK_TEMPLATE_CAPABILITY in tokenizer.chat_template
+  assert loader_calls == [
+      (
+          "hf://example-org/example-model/training-template.jinja",
+          {
+              "hf_access_token": "test-token",
+              "revision": TEST_REVISION,
+              "expected_sha256": "a" * 64,
+          },
+      )
+  ]
 
 
 def test_default_mode_keeps_tokenizer_template():
@@ -259,7 +285,7 @@ def test_missing_template_path_fails_before_iteration(monkeypatch):
   monkeypatch.setattr(
       grain_data_processing.instruction_data_processing,
       "load_chat_template_from_file",
-      lambda path: None,
+      lambda path, **kwargs: None,
   )
 
   with pytest.raises(ValueError, match="Unable to load SFT chat template"):
@@ -269,6 +295,66 @@ def test_missing_template_path_fails_before_iteration(monkeypatch):
         SimpleNamespace(chat_template="inference-template"),
         True,
     )
+
+
+def test_hf_sft_passes_pinned_template_and_tokenizer_options(monkeypatch):
+  loader_calls = []
+  tokenizer_calls = []
+
+  def _load_template(path, **kwargs):
+    loader_calls.append((path, kwargs))
+    return "{{ messages[0]['content'] }}"
+
+  def _load_tokenizer(path, **kwargs):
+    tokenizer_calls.append((path, kwargs))
+    raise RuntimeError("stop after tokenizer load")
+
+  monkeypatch.setattr(
+      hf_data_processing.instruction_data_processing,
+      "load_chat_template_from_file",
+      _load_template,
+  )
+  monkeypatch.setattr(
+      hf_data_processing.transformers.AutoTokenizer,
+      "from_pretrained",
+      _load_tokenizer,
+  )
+
+  with pytest.raises(RuntimeError, match="stop after tokenizer load"):
+    hf_data_processing.preprocessing_pipeline(
+        dataloading_host_index=0,
+        dataloading_host_count=1,
+        global_mesh=SimpleNamespace(size=1),
+        dataset=object(),
+        config=SimpleNamespace(elastic_enabled=False),
+        data_column_names=["messages"],
+        tokenize=True,
+        tokenizer_path="example-org/example-model",
+        tokenizer_revision=TEST_REVISION,
+        hf_access_token="test-token",
+        global_batch_size=1,
+        max_target_length=8,
+        shuffle=False,
+        data_shuffle_seed=0,
+        use_sft=True,
+        chat_template_path="hf://example-org/example-model/training-template.jinja",
+        chat_template_revision=TEST_REVISION,
+        chat_template_sha256="a" * 64,
+    )
+
+  assert loader_calls == [
+      (
+          "hf://example-org/example-model/training-template.jinja",
+          {
+              "hf_access_token": "test-token",
+              "revision": TEST_REVISION,
+              "expected_sha256": "a" * 64,
+          },
+      )
+  ]
+  assert tokenizer_calls[0][0] == "example-org/example-model"
+  assert tokenizer_calls[0][1]["revision"] == TEST_REVISION
+  assert tokenizer_calls[0][1]["token"] == "test-token"
 
 
 def test_hf_sft_pipeline_rejects_assistant_mask_mode():

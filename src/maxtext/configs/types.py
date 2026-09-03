@@ -1337,11 +1337,14 @@ class Tokenizer(BaseModel):
       None,
       description="Path to the tokenizer model file.",
   )
+  tokenizer_revision: str = Field("", description="Optional Hugging Face revision passed when loading a Hub tokenizer.")
   tokenizer_type: TokenizerType = Field(TokenizerType.SENTENCEPIECE, description="The type of tokenizer.")
   use_chat_template: bool = Field(False, description="Whether to use the chat template for tokenization.")
   chat_template_path: str = Field(
       "", description="Path to a Jinja/text chat template or JSON object containing a chat_template field."
   )
+  chat_template_revision: str = Field("", description="Optional Hugging Face revision for an hf:// chat_template_path.")
+  chat_template_sha256: str = Field("", description="Optional SHA-256 expected for the exact loaded chat-template bytes.")
   chat_template: str = Field(
       "",
       description="Chat template to use with HF tokenizers. It should be a valid Jinja2-formatted template.",
