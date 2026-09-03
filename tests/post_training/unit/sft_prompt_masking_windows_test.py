@@ -115,6 +115,36 @@ def test_multi_turn_each_turn_terminator_in_loss():
   assert covered.count(EOT) == 2
 
 
+def test_tool_result_prompt_is_masked_context_for_following_assistant_window():
+  """A tool-result prompt immediately preceding an assistant completion remains visible but masked."""
+  length = 16
+  tool_result = [71, 72]
+  final_completion = [211, 212, 213, 214, 215, EOT]
+  segments = [
+      [1, 2, 3, 4, 5],  # system + user prompt
+      [201, 202, 203, EOT],  # assistant tool call (loss)
+      tool_result,  # rendered tool result + assistant prefix (masked)
+      final_completion,  # assistant response conditioned on the result (loss)
+  ]
+  windows = SFTPromptMaskingWindows(
+      "text",
+      completion_only=True,
+      max_target_length=length,
+      unk_id=PAD,
+      overlap=2,
+      context_cap=10,
+  )
+  recs = windows.flat_map({"text": segments, "is_prompt": [True, False, True, False]})
+
+  final_records = [record for record in recs if final_completion[0] in _loss_tokens(record)]
+  assert final_records
+  for record in final_records:
+    inputs = [int(token) for token in record["inputs"]]
+    targets = [int(token) for token in record["targets"]]
+    tool_start = next(i for i in range(len(inputs) - len(tool_result) + 1) if inputs[i : i + 2] == tool_result)
+    assert targets[tool_start : tool_start + len(tool_result)] == [PAD] * len(tool_result)
+
+
 def test_fan_out_cap_is_respected():
   """max_fan_out bounds the number of emitted records (runaway guard)."""
   length = 12

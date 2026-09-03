@@ -424,6 +424,167 @@ def _get_completion_in_chat_template(tokenizer_model, round_msgs, tools=None):
   return tokenizer_model.decode(completion_tokens, skip_special_tokens=False)
 
 
+def _get_tool_results_and_completion_deltas(  # pylint: disable=too-many-locals
+    tokenizer_model, round_msgs, assistant_message, tools=None
+):
+  """Render trailing tool results and the assistant response as adjacent token deltas.
+
+  ``round_msgs`` must be the live round state and end in one or more tool
+  messages. The chat template render immediately before those tool messages is
+  required to be an exact token prefix of the render including the tools and
+  the next assistant generation prompt. Returning only the suffix preserves a
+  single canonical token stream without replaying the preceding tool call.
+  When a template uses the response opener as the assistant call turn's
+  model-emitted stop/end-of-message token, that shared opener stays in the
+  loss-applied call completion. Only the newly rendered tool-result suffix is
+  returned as masked context.
+
+  Args:
+    tokenizer_model: The tokenizer instance.
+    round_msgs: Live messages for the current round, ending in role=tool.
+    assistant_message: The assistant message that follows the trailing tools.
+    tools: Optional tool declarations passed to the chat template.
+
+  Returns:
+    A pair containing the decoded masked tool-result/assistant-prefix delta and
+    the decoded loss-applied assistant-completion delta.
+
+  Raises:
+    ValueError: If no trailing tool messages exist, the template is not
+      prefix-stable at the tool-result boundary, or the tool result is absent
+      from the rendered context.
+  """
+  first_tool_idx = len(round_msgs)
+  while first_tool_idx > 0 and round_msgs[first_tool_idx - 1]["role"] == "tool":
+    first_tool_idx -= 1
+
+  trailing_tool_count = len(round_msgs) - first_tool_idx
+  if trailing_tool_count == 0:
+    raise ValueError("Tool-result prompt extraction requires round_msgs to end with role='tool'.")
+  if first_tool_idx == 0:
+    raise ValueError("Tool-result prompt extraction requires context before the trailing tool message(s).")
+
+  tokenizer_name = getattr(tokenizer_model, "name_or_path", type(tokenizer_model).__name__)
+  roles = [message.get("role", "<missing>") for message in round_msgs]
+  tools_kwargs = {"tools": tools} if tools is not None else {}
+  baseline_tokens = tokenizer_model.apply_chat_template(
+      round_msgs[:first_tool_idx],
+      add_generation_prompt=False,
+      tokenize=True,
+      enable_thinking=True,
+      **tools_kwargs,
+  )
+  superset_tokens = tokenizer_model.apply_chat_template(
+      round_msgs,
+      add_generation_prompt=True,
+      tokenize=True,
+      enable_thinking=True,
+      **tools_kwargs,
+  )
+  baseline_ids = extract_token_ids(baseline_tokens)
+  superset_ids = extract_token_ids(superset_tokens)
+
+  common_len = 0
+  for baseline_id, superset_id in zip(baseline_ids, superset_ids):
+    if baseline_id != superset_id:
+      break
+    common_len += 1
+
+  if common_len != len(baseline_ids):
+    window_radius = 16
+    start = max(0, common_len - window_radius)
+    baseline_end = min(len(baseline_ids), common_len + window_radius)
+    superset_end = min(len(superset_ids), common_len + window_radius)
+    baseline_window = baseline_ids[start:baseline_end]
+    superset_window = superset_ids[start:superset_end]
+    raise ValueError(
+        "Chat template tool-result prompt mismatch: the baseline render is not an exact token prefix "
+        "of the render containing the trailing tool result(s).\n"
+        f"Tokenizer: {tokenizer_name}\n"
+        f"Roles: {roles}\n"
+        f"Trailing tool messages: {trailing_tool_count}\n"
+        f"Baseline tokens: {len(baseline_ids)}; superset tokens: {len(superset_ids)}; "
+        f"divergence offset: {common_len}\n"
+        f"Baseline divergence window [{start}:{baseline_end}]: {baseline_window} "
+        f"('{tokenizer_model.decode(baseline_window, skip_special_tokens=False)}')\n"
+        f"Superset divergence window [{start}:{superset_end}]: {superset_window} "
+        f"('{tokenizer_model.decode(superset_window, skip_special_tokens=False)}')"
+    )
+
+  # Some templates emit speculative generation-prompt tokens which are not present when the
+  # concrete assistant message has no corresponding content. Some templates add
+  # an opening thinking-channel token after a tool result, but omits it from a full assistant
+  # render with no reasoning field. Keep only the generation-prompt prefix shared by the real
+  # assistant render so the decoded delta can be re-tokenized without adding redundant tokens.
+  tool_context_tokens = tokenizer_model.apply_chat_template(
+      round_msgs,
+      add_generation_prompt=False,
+      tokenize=True,
+      enable_thinking=True,
+      **tools_kwargs,
+  )
+  assistant_tokens = tokenizer_model.apply_chat_template(
+      round_msgs + [assistant_message],
+      add_generation_prompt=False,
+      tokenize=True,
+      enable_thinking=True,
+      **tools_kwargs,
+  )
+  tool_context_ids = extract_token_ids(tool_context_tokens)
+  assistant_ids = extract_token_ids(assistant_tokens)
+
+  if baseline_ids != tool_context_ids[: len(baseline_ids)]:
+    raise ValueError(
+        "Chat template tool-result context mismatch: adding the trailing tool message(s) changes tokens "
+        "inside the preceding conversation. "
+        f"Tokenizer: {tokenizer_name}; baseline tokens: {len(baseline_ids)}; "
+        f"tool-context tokens: {len(tool_context_ids)}."
+    )
+  if len(tool_context_ids) == len(baseline_ids):
+    raise ValueError(
+        "Chat template emitted no tool-result context tokens. The role=tool message shape may be "
+        "incompatible with this tokenizer template.\n"
+        f"Tokenizer: {tokenizer_name}\n"
+        f"Roles: {roles}\n"
+        f"Trailing tool messages: {trailing_tool_count}\n"
+        f"Baseline tokens: {len(baseline_ids)}; tool-context tokens: {len(tool_context_ids)}."
+    )
+
+  assistant_common_len = 0
+  for prompt_id, assistant_id in zip(superset_ids, assistant_ids):
+    if prompt_id != assistant_id:
+      break
+    assistant_common_len += 1
+
+  if (
+      tool_context_ids != superset_ids[: len(tool_context_ids)]
+      or tool_context_ids != assistant_ids[: len(tool_context_ids)]
+  ):
+    raise ValueError(
+        "Chat template tool-result context mismatch: rendering the following assistant changes tokens "
+        "inside the tool-result context.\n"
+        f"Tokenizer: {tokenizer_name}\n"
+        f"Roles: {roles}\n"
+        f"Trailing tool messages: {trailing_tool_count}\n"
+        f"Baseline tokens: {len(baseline_ids)}; tool-context tokens: {len(tool_context_ids)}; "
+        f"generation-prompt tokens: {len(superset_ids)}; assistant tokens: {len(assistant_ids)}; "
+        f"assistant divergence offset: {assistant_common_len}"
+    )
+  if assistant_common_len < len(tool_context_ids):
+    raise ValueError(
+        "Chat template assistant generation prompt diverges before the complete tool-result context. "
+        f"Tokenizer: {tokenizer_name}; tool-context tokens: {len(tool_context_ids)}; "
+        f"assistant divergence offset: {assistant_common_len}."
+    )
+
+  delta_ids = superset_ids[len(baseline_ids) : assistant_common_len]
+  completion_ids = assistant_ids[assistant_common_len:]
+  return (
+      tokenizer_model.decode(delta_ids, skip_special_tokens=False),
+      tokenizer_model.decode(completion_ids, skip_special_tokens=False),
+  )
+
+
 def apply_chat_template(example, tokenizer_model, data_column_name, tools_column_name=None):
   """Formats conversational data by applying the tokenizer's chat template
   and identifying prompt/completion segments for SFT masking.
@@ -473,8 +634,22 @@ def apply_chat_template(example, tokenizer_model, data_column_name, tools_column
       elif message["role"] == "assistant":
         if not round_msgs:
           raise ValueError(f"Assistant message at index {idx} with no preceding context.")
-        round_msgs.append(message)
-        messages.append(_get_completion_in_chat_template(tokenizer_model, round_msgs, tools=tools))
+        if round_msgs[-1]["role"] == "tool":
+          # Tool results condition this assistant response, so preserve their tokenizer-rendered
+          # delta as prompt context. Marking it as a prompt keeps the result visible to attention
+          # while excluding it from completion-only loss. Response openers remain in
+          # the preceding loss-applied call completion because they are model-emitted stop/EOM
+          # tokens; the resumed render reuses that token before appending the masked result body.
+          tool_results_delta, completion = _get_tool_results_and_completion_deltas(
+              tokenizer_model, round_msgs, message, tools=tools
+          )
+          messages.append(tool_results_delta)
+          is_prompt.append(True)
+          round_msgs.append(message)
+        else:
+          round_msgs.append(message)
+          completion = _get_completion_in_chat_template(tokenizer_model, round_msgs, tools=tools)
+        messages.append(completion)
         is_prompt.append(False)
         # Clear round only when the next message starts a new user turn or conversation ends
         # This preserves context for consecutive assistant/tool messages
