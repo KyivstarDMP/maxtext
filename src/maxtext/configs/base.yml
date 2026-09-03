@@ -867,6 +867,10 @@ olmo_apply_ngram_filter: true # mask instances with repetitive n-grams (OLMo-cor
 # Training loop
 steps: 150_001 # If set to -1 then will inherit value from learning_rate_schedule_steps
 log_period: 100 # The frequency of Tensorboard flush, gcs metrics writing, and managed profiler metrics updating.
+log_text_period: 0 # Log decoded training text samples every N steps. 0 disables text logging.
+log_text_num_samples: 1 # Number of batch rows to decode when text logging is active.
+log_text_num_docs: 1 # Max documents per packed sample. 0 logs no docs; -1 logs all.
+log_text_num_tokens: 64 # First/last N tokens per doc. 0 logs counts only; -1 logs the full document.
 
 jax_distributed_initialization_timeout: 300 # This is the default timeout in https://github.com/jax-ml/jax/blob/main/jax/_src/distributed.py
 # Note there are two separate initializations - the jax coordination service (aka jax.distributed.initialize) and the backend (e.g. PjRT), the timeout above refers

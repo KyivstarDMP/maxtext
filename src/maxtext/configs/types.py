@@ -1763,6 +1763,18 @@ class TrainingLoop(BaseModel):
       description="Total number of training steps. -1 defaults to learning_rate_schedule_steps.",
   )
   log_period: int = Field(100, description="Frequency (in steps) to log metrics and flush Tensorboard.")
+  log_text_period: int = Field(0, ge=0, description="Log decoded training text samples every N steps; 0 disables it.")
+  log_text_num_samples: int = Field(1, ge=1, description="Number of batch rows to decode when text logging is active.")
+  log_text_num_docs: int = Field(
+      1,
+      ge=-1,
+      description="Maximum packed documents to log per row; 0 logs none and -1 logs all.",
+  )
+  log_text_num_tokens: int = Field(
+      64,
+      ge=-1,
+      description="Show the first and last N tokens per document; 0 logs counts only and -1 logs the full document.",
+  )
   eval_start_step: int = Field(
       0,
       ge=0,
