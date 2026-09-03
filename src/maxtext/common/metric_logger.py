@@ -583,6 +583,113 @@ class MetricLogger:
     )
     self.cumulative_eval_metrics["scalar"]["eval/z_loss"] += float(scalar.get("evaluation/z_loss", 0.0))
 
+  def _get_tokenizer(self):
+    """Lazily build and cache the tokenizer used to decode text samples."""
+    if not hasattr(self, "_text_tokenizer"):
+      from maxtext.input_pipeline import data_processing_utils  # pylint: disable=import-outside-toplevel
+
+      self._text_tokenizer, _ = data_processing_utils.get_tokenizer_and_pad_id(self.config)
+    return self._text_tokenizer
+
+  @staticmethod
+  def _format_token_view(tokens, num_tokens):
+    """Format token IDs, optionally retaining only the head and tail."""
+    total = len(tokens)
+    if num_tokens < 0 or total <= 2 * num_tokens:
+      return f"[{', '.join(str(token) for token in tokens)}]", str(total)
+    if num_tokens == 0:
+      return "[]", f"{total}, hidden"
+    parts = [str(token) for token in tokens[:num_tokens]]
+    parts.extend(["...", *(str(token) for token in tokens[-num_tokens:])])
+    return f"[{', '.join(parts)}]", f"{total}, first {num_tokens} + last {num_tokens}"
+
+  @staticmethod
+  def _decode_trimmed(tokenizer, tokens, num_tokens):
+    """Decode tokens, optionally retaining only the head and tail."""
+    if num_tokens < 0 or len(tokens) <= 2 * num_tokens:
+      return tokenizer.decode(tokens)
+    if num_tokens == 0:
+      return ""
+    return f"{tokenizer.decode(tokens[:num_tokens])} ... {tokenizer.decode(tokens[-num_tokens:])}"
+
+  def maybe_log_text_samples(self, batch, step):
+    """Decode selected training rows to console and TensorBoard without interrupting training."""
+    if self.config.log_text_period <= 0:
+      return
+    if step != 0 and step % self.config.log_text_period != 0:
+      return
+    if jax.process_index() != 0:
+      return
+
+    max_logging.log(f"[TextSample] Logging text samples at step {step} (period={self.config.log_text_period})...")
+
+    try:
+      tokenizer = self._get_tokenizer()
+      num_tokens = self.config.log_text_num_tokens
+
+      def _to_numpy(array):
+        try:
+          return np.asarray(array)
+        except RuntimeError:
+          # A multi-host jax.Array is not fully addressable. Text logging needs only one local row,
+          # so use the first addressable device shard instead of gathering the global batch.
+          return np.asarray(array.addressable_shards[0].data)
+
+      inputs = _to_numpy(batch["inputs"])
+      targets = _to_numpy(batch["targets"])
+      inputs_segmentation = _to_numpy(batch["inputs_segmentation"])
+      targets_segmentation = _to_numpy(batch["targets_segmentation"])
+      num_samples = min(self.config.log_text_num_samples, inputs.shape[0])
+      tensorboard_parts = []
+
+      for sample_index in range(num_samples):
+        input_segment_ids = {int(segment_id) for segment_id in inputs_segmentation[sample_index] if segment_id > 0}
+        target_segment_ids = {int(segment_id) for segment_id in targets_segmentation[sample_index] if segment_id > 0}
+        segment_ids = sorted(input_segment_ids | target_segment_ids)
+        total_documents = len(segment_ids)
+        if self.config.log_text_num_docs >= 0:
+          segment_ids = segment_ids[: self.config.log_text_num_docs]
+        is_packed = total_documents > 1
+
+        for document_index, segment_id in enumerate(segment_ids):
+          input_tokens = inputs[sample_index][inputs_segmentation[sample_index] == segment_id].tolist()
+          target_tokens = targets[sample_index][targets_segmentation[sample_index] == segment_id].tolist()
+          if is_packed:
+            label = f"Step {step} | sample {sample_index} | doc {document_index + 1}/{total_documents}"
+            heading = f"### Sample {sample_index} | Doc {document_index + 1}/{total_documents}"
+          else:
+            label = f"Step {step} | sample {sample_index}"
+            heading = f"### Sample {sample_index}"
+
+          input_token_view, input_token_description = self._format_token_view(input_tokens, num_tokens)
+          target_token_view, target_token_description = self._format_token_view(target_tokens, num_tokens)
+          input_text = self._decode_trimmed(tokenizer, input_tokens, num_tokens) if input_tokens else ""
+          target_text = self._decode_trimmed(tokenizer, target_tokens, num_tokens) if target_tokens else ""
+
+          max_logging.log(f"[TextSample] {label}")
+          max_logging.log(f"  input tokens ({input_token_description}): {input_token_view}")
+          max_logging.log(f"  input text: {input_text}")
+          max_logging.log(f"  target tokens ({target_token_description}): {target_token_view}")
+          max_logging.log(f"  target text: {target_text}")
+
+          tensorboard_parts.extend(
+              [
+                  heading,
+                  f"**Input tokens** ({input_token_description}): `{input_token_view}`  ",
+                  f"**Input text**: {input_text}  ",
+                  f"**Target tokens** ({target_token_description}): `{target_token_view}`  ",
+                  f"**Target text**: {target_text}  ",
+                  "",
+              ]
+          )
+
+      if self.config.enable_tensorboard and self.writer is not None and tensorboard_parts:
+        self.writer.add_text("text_samples", "\n".join(tensorboard_parts), step)
+    except Exception as error:  # pylint: disable=broad-exception-caught
+      # Observability must not terminate an expensive training job. The warning remains visible in
+      # the same console stream (and any experiment tracker that captures stdout/stderr).
+      max_logging.log(f"[TextSample] WARNING: Failed to log text samples at step {step}: {error}")
+
   def record_train_metrics(self, metrics, step, step_time):
     """Records training metrics for the current step."""
     metrics["scalar"].update({"perf/step_time_seconds": step_time})
