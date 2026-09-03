@@ -21,7 +21,7 @@ import numpy as np
 
 from maxtext.common.metric_logger import MetricLogger, MetadataKey
 
-# pylint: disable=missing-function-docstring
+# pylint: disable=missing-function-docstring,protected-access
 
 
 class MetricLoggerAbortTest(unittest.TestCase):
@@ -38,6 +38,7 @@ class MetricLoggerAbortTest(unittest.TestCase):
         managed_mldiagnostics=True,
         enable_wandb=False,
     )
+    logger.enable_wandb = False
     return logger
 
   def _metrics(self, loss):
@@ -105,17 +106,15 @@ class MetricLoggerWandbTest(unittest.TestCase):
 
   def test_write_metrics_to_wandb_flattens_scalars_and_scalars(self):
     logger = MetricLogger.__new__(MetricLogger)  # skip __init__
+    logger.wandb_run = mock.MagicMock()
     metrics = {
         "scalar": {"learning/loss": 1.5},
         "scalars": {"perf": {"step_time": 0.25, "tflops_per_device": 100.0}},
     }
 
-    fake_wandb = mock.MagicMock()
-    # wandb is lazily imported inside write_metrics_to_wandb, so inject a fake module.
-    with mock.patch.dict("sys.modules", {"wandb": fake_wandb}):
-      logger.write_metrics_to_wandb(metrics, step=7)
+    logger.write_metrics_to_wandb(metrics, step=7)
 
-    fake_wandb.log.assert_called_once_with(
+    logger.wandb_run.log.assert_called_once_with(
         {
             "learning/loss": 1.5,
             "perf/step_time": 0.25,
@@ -123,6 +122,118 @@ class MetricLoggerWandbTest(unittest.TestCase):
         },
         step=7,
     )
+
+  def test_write_metrics_to_wandb_forwards_explicit_commit(self):
+    logger = MetricLogger.__new__(MetricLogger)
+    logger.wandb_run = mock.MagicMock()
+
+    logger.write_metrics_to_wandb({"scalar": {"eval/loss": 1.25}}, step=9, commit=False)
+
+    logger.wandb_run.log.assert_called_once_with({"eval/loss": 1.25}, step=9, commit=False)
+
+  def test_running_eval_snapshot_is_not_written_to_wandb(self):
+    logger = MetricLogger.__new__(MetricLogger)
+    logger.config = SimpleNamespace(
+        enable_tensorboard=False,
+        metrics_file="",
+        gcs_metrics=False,
+        managed_mldiagnostics=False,
+    )
+    logger.enable_wandb = True
+
+    with (
+        mock.patch.object(logger, "log_metrics"),
+        mock.patch.object(logger, "write_metrics_to_wandb") as write_wandb,
+    ):
+      logger.write_metrics({"scalar": {"eval/avg_loss": 1.0}}, step=0, metric_type="running_eval")
+
+    write_wandb.assert_not_called()
+
+  def test_buffered_train_metrics_commit_the_wandb_step(self):
+    logger = MetricLogger.__new__(MetricLogger)
+    metrics = {"scalar": {"learning/loss": 1.0}}
+
+    with mock.patch.object(logger, "write_metrics") as write_metrics:
+      logger._flush_one_buffered_entry(("train", 11, metrics, None))
+
+    write_metrics.assert_called_once_with(metrics, 11, wandb_commit=True)
+
+  def test_final_eval_metrics_accumulate_at_the_matching_train_step(self):
+    logger = MetricLogger.__new__(MetricLogger)
+    logger._pending_eval_step_count = 2
+    logger.cumulative_eval_metrics = {
+        "scalar": {
+            "eval/total_loss": 6.0,
+            "eval/total_weights": 3.0,
+            "eval/moe_lb_loss": 0.0,
+            "eval/indexer_loss": 0.0,
+            "eval/mtp_loss": 0.0,
+            "eval/mtp_acceptance_rate_percent": 0.0,
+            "eval/z_loss": 0.0,
+        }
+    }
+    logger.config = SimpleNamespace(target_eval_loss=0.0)
+
+    with mock.patch.object(logger, "write_metrics") as write_metrics:
+      logger._finalize_eval_metrics(train_step=11)
+
+    write_metrics.assert_called_once_with(
+        logger.cumulative_eval_metrics,
+        11,
+        metric_type="eval",
+        wandb_commit=False,
+    )
+    self.assertEqual(logger._pending_eval_step_count, 0)
+
+  def test_pending_per_dataset_eval_accumulates_without_committing(self):
+    logger = MetricLogger.__new__(MetricLogger)
+    logger.enable_wandb = True
+    logger._pending_per_dataset_eval_wandb = (
+        {"per_dataset_eval_loss/example": 0.5},
+        11,
+    )
+
+    with mock.patch.object(logger, "write_metrics_to_wandb") as write_wandb:
+      logger._flush_pending_per_dataset_eval_wandb()
+
+    write_wandb.assert_called_once_with(
+        {"scalar": {"per_dataset_eval_loss/example": 0.5}, "scalars": {}},
+        11,
+        commit=False,
+    )
+    self.assertIsNone(logger._pending_per_dataset_eval_wandb)
+
+  @mock.patch("jax.process_index", return_value=0)
+  def test_init_stores_and_finishes_primary_process_run(self, _):
+    config = SimpleNamespace(
+        tensorboard_dir="/tmp/tensorboard",
+        run_name="run-name",
+        enable_tensorboard=False,
+        gcs_metrics=False,
+        managed_mldiagnostics=False,
+        enable_wandb=True,
+        wandb_project_name="project-name",
+        wandb_run_name="",
+    )
+    fake_wandb = mock.MagicMock()
+    fake_run = fake_wandb.init.return_value
+
+    with (
+        mock.patch.dict("sys.modules", {"wandb": fake_wandb}),
+        mock.patch(
+            "maxtext.common.metric_logger.max_utils.initialize_summary_writer",
+            return_value=None,
+        ),
+        mock.patch.object(MetricLogger, "get_performance_metric_queue", return_value=None),
+        mock.patch("maxtext.common.metric_logger.max_utils.close_summary_writer") as close_writer,
+    ):
+      logger = MetricLogger(config, learning_rate_schedule=lambda step: step)
+      logger.flush_metrics_and_cleanup()
+
+    fake_wandb.init.assert_called_once_with(project="project-name", name=None, resume="allow")
+    close_writer.assert_called_once_with(None)
+    fake_run.finish.assert_called_once_with()
+    self.assertIsNone(logger.wandb_run)
 
 
 class MetricLoggerMetadataTest(unittest.TestCase):
@@ -134,9 +245,18 @@ class MetricLoggerMetadataTest(unittest.TestCase):
     logger.metadata = {}
 
     with (
-        mock.patch("maxtext.utils.max_utils.calculate_num_params_from_pytree", return_value=1e9),
-        mock.patch("maxtext.utils.maxtext_utils.calculate_tflops_training_per_device", return_value=(100.0, 0, 0)),
-        mock.patch("maxtext.utils.maxtext_utils.calculate_tokens_training_per_device", return_value=1000.0),
+        mock.patch(
+            "maxtext.utils.max_utils.calculate_num_params_from_pytree",
+            return_value=1e9,
+        ),
+        mock.patch(
+            "maxtext.utils.maxtext_utils.calculate_tflops_training_per_device",
+            return_value=(100.0, 0, 0),
+        ),
+        mock.patch(
+            "maxtext.utils.maxtext_utils.calculate_tokens_training_per_device",
+            return_value=1000.0,
+        ),
         mock.patch("maxtext.utils.max_logging.log"),
     ):
       logger.write_setup_info_to_tensorboard({})
@@ -169,8 +289,14 @@ class MetricLoggerLogMetricsTest(unittest.TestCase):
     with (
         mock.patch.object(logger, "_is_profiler_boundary_step", return_value=False),
         mock.patch("maxtext.common.metric_logger.max_logging.log") as mock_log,
-        mock.patch("maxtext.common.metric_logger.elastic_utils.elastic_enabled", return_value=True),
-        mock.patch("maxtext.common.metric_logger.elastic_utils.live_slice_indices", return_value=[0, 1, 2]),
+        mock.patch(
+            "maxtext.common.metric_logger.elastic_utils.elastic_enabled",
+            return_value=True,
+        ),
+        mock.patch(
+            "maxtext.common.metric_logger.elastic_utils.live_slice_indices",
+            return_value=[0, 1, 2],
+        ),
     ):
       logger.log_metrics(metrics, step=1, metric_type="train")
 
@@ -200,7 +326,10 @@ class MetricLoggerLogMetricsTest(unittest.TestCase):
     with (
         mock.patch.object(logger, "_is_profiler_boundary_step", return_value=False),
         mock.patch("maxtext.common.metric_logger.max_logging.log") as mock_log,
-        mock.patch("maxtext.common.metric_logger.elastic_utils.elastic_enabled", return_value=False),
+        mock.patch(
+            "maxtext.common.metric_logger.elastic_utils.elastic_enabled",
+            return_value=False,
+        ),
         mock.patch("maxtext.common.metric_logger.elastic_utils.live_slice_indices") as mock_live_slices,
     ):
       logger.log_metrics(metrics, step=1, metric_type="train")

@@ -104,22 +104,24 @@ class MetricLogger:
     # Running [xent_sum, token_count, correct] per dataset, summed across the current log_period
     # window; flushed as one token-weighted point per window by _expand_per_dataset_train.
     self._per_dataset_accum = None
-    # self.buffered_metrics is a polymorphic deferred-write queue. Entries are one of:
+    # self.buffered_metrics is a mixed-type deferred-write queue. Entries are one of:
     #   ("train", train_step, metrics, step_time_delta)
     #   ("eval", eval_step, metrics, step_time_delta)
     self.buffered_metrics = []
     # Number of eval steps accumulated since the last reset_eval_metrics(). Used by
     # buffer_and_write_metrics to detect the eval→train transition and trigger finalization.
     self._pending_eval_step_count = 0
+    self.enable_wandb = bool(self.config.enable_wandb and jax.process_index() == 0)
+    self.wandb_run = None
     if self.config.managed_mldiagnostics:
       ManagedMLDiagnostics(config)  # Initialize the MLRun instance.
 
-    if self.config.enable_wandb and jax.process_index() == 0:
+    if self.enable_wandb:
       import wandb  # pylint: disable=import-outside-toplevel # pytype: disable=import-error # lazy import: wandb is an optional dependency
 
-      wandb.init(
+      self.wandb_run = wandb.init(
           project=config.wandb_project_name,
-          name=config.wandb_run_name,
+          name=config.wandb_run_name or None,
           resume="allow",
       )  # Initialize wandb logger.
 
@@ -128,8 +130,8 @@ class MetricLogger:
     self.cumulative_eval_metrics = {"scalar": defaultdict(float)}
     self._pending_eval_step_count = 0
 
-  def write_metrics(self, metrics, step, metric_type="train"):
-    """Entry point for all metrics writing. metric_type is one of 'train', 'eval', 'running_eval'."""
+  def write_metrics(self, metrics, step, metric_type="train", wandb_commit=None):
+    """Write metrics to configured sinks; ``wandb_commit`` controls same-step W&B aggregation."""
     if metrics:
       if metric_type == "train" and "per_dataset" in metrics:
         self._expand_per_dataset_train(metrics, step)
@@ -147,8 +149,11 @@ class MetricLogger:
       if self.config.managed_mldiagnostics:
         self.write_metrics_to_managed_mldiagnostics(metrics, step)
 
-      if self.config.enable_wandb and jax.process_index() == 0:
-        self.write_metrics_to_wandb(metrics, step)
+      # running_eval uses an eval-local counter, not the monotonically increasing train step.
+      # Its console snapshot is intentionally excluded from W&B; the finalized eval aggregate is
+      # logged at the matching train step instead.
+      if self.enable_wandb and metric_type != "running_eval":
+        self.write_metrics_to_wandb(metrics, step, commit=wandb_commit)
 
       if metric_type == "train":
         self._maybe_abort_after_write_metrics(metrics)
@@ -236,28 +241,27 @@ class MetricLogger:
       self.write_metrics_locally(metrics, step)
     if self.config.gcs_metrics and jax.process_index() == 0:
       self.write_metrics_for_gcs(metrics, step, "eval")
-    # W&B logs via a separate hook (docker wandb-support.patch) that requires monotonically increasing
-    # steps. This method runs BEFORE the train step's buffered flush (train.py), so emitting to W&B here
-    # at `step` would make W&B drop the still-buffered train point at step-1. Defer the W&B emission to
-    # the next train buffer_and_write_metrics (mirrors _finalize_eval_metrics); TB/local/GCS above are
-    # order-independent so they stay here. See docs/012.
+    # This method runs before the matching train step's buffered flush. Defer W&B emission until the
+    # previous train point is flushed, then accumulate these scalars at the current train step with
+    # commit=False; the train metrics commit the combined W&B history row. TB/local/GCS are
+    # order-independent, so they stay here. See docs/012.
     if scalar:
       self._pending_per_dataset_eval_wandb = (dict(scalar), step)
 
   def _flush_pending_per_dataset_eval_wandb(self):
     """Emit any deferred per-dataset eval scalars to W&B at their eval step.
 
-    Called from buffer_and_write_metrics (train) AFTER the previous train step has been flushed, so the
-    eval step is >= the last W&B step and nothing is dropped. No-op unless the wandb hook is active
-    (self.enable_wandb / self.write_metrics_to_wandb are added by the wandb-support patch).
+    Called from buffer_and_write_metrics (train) after the previous train step has been flushed, so the
+    eval step is >= the last W&B step and nothing is dropped. The write stays uncommitted so the matching
+    train metrics can be merged into the same W&B history row.
     """
     pending = getattr(self, "_pending_per_dataset_eval_wandb", None)
     if pending is None:
       return
     scalar, eval_step = pending
     self._pending_per_dataset_eval_wandb = None
-    if getattr(self, "enable_wandb", False):
-      self.write_metrics_to_wandb({"scalar": scalar, "scalars": {}}, eval_step)
+    if self.enable_wandb:
+      self.write_metrics_to_wandb({"scalar": scalar, "scalars": {}}, eval_step, commit=False)
 
   def log_metrics(self, metrics, step, metric_type):
     """Logs metrics via max_logging."""
@@ -456,17 +460,18 @@ class MetricLogger:
         mapped_metric_name = _METRICS_TO_MANAGED.get(metric_name, metric_name)
         mldiag.metrics.record(mapped_metric_name, value, step=int(step))
 
-  def write_metrics_to_wandb(self, metrics, step):
+  def write_metrics_to_wandb(self, metrics, step, commit=None):
     """Write metrics to weights and biases (wandb)."""
-    import wandb  # pylint: disable=import-outside-toplevel # pytype: disable=import-error # lazy import: wandb is an optional dependency
-
     flat_metrics = {}
     for key, val in metrics.get("scalar", {}).items():
       flat_metrics[key] = float(val)
     for key, val in metrics.get("scalars", {}).items():
       for subkey, subval in val.items():
         flat_metrics[f"{key}/{subkey}"] = float(subval)
-    wandb.log(flat_metrics, step=step)
+    log_kwargs = {"step": step}
+    if commit is not None:
+      log_kwargs["commit"] = commit
+    self.wandb_run.log(flat_metrics, **log_kwargs)
 
   def write_setup_info_to_tensorboard(self, params):
     """Writes setup information like train config params, num model params, and XLA flags to TensorBoard."""
@@ -534,7 +539,9 @@ class MetricLogger:
     kind = entry[0]
     if kind == "train":
       _, step, metrics, _ = entry
-      self.write_metrics(metrics, step)
+      # Any finalized eval/per-dataset eval metrics for this step were written with commit=False.
+      # Training is the final producer for the step and commits the combined W&B history row.
+      self.write_metrics(metrics, step, wandb_commit=True)
     elif kind == "eval":
       _, eval_step, raw_metrics, step_time_delta = entry
       # _accumulate_eval_metrics calls float() that materialize the metrics, deferred to here
@@ -596,7 +603,12 @@ class MetricLogger:
     cumulative["eval/avg_mtp_acceptance_rate_percent"] = cumulative["eval/mtp_acceptance_rate_percent"] / eval_step_count
     cumulative["eval/avg_z_loss"] = cumulative["eval/z_loss"] / eval_step_count
 
-    self.write_metrics(self.cumulative_eval_metrics, train_step, metric_type="eval")
+    self.write_metrics(
+        self.cumulative_eval_metrics,
+        train_step,
+        metric_type="eval",
+        wandb_commit=False,
+    )
     self._pending_eval_step_count = 0
     if self.config.target_eval_loss and eval_loss <= self.config.target_eval_loss:
       raise exceptions.StopTraining(f"Target loss {self.config.target_eval_loss=} is achieved.")
@@ -608,10 +620,16 @@ class MetricLogger:
     logger instance should not be used to add or write more metrics as the
     underlying writer objects (e.g., TensorBoard SummaryWriter) will be closed.
     """
-    for entry in self.buffered_metrics:
-      self._flush_one_buffered_entry(entry)
-    self.buffered_metrics = []
-    # Safety net for the rare case where eval fires on the final step and no train flush follows.
-    self._flush_pending_per_dataset_eval_wandb()
-
-    max_utils.close_summary_writer(self.writer)
+    try:
+      for entry in self.buffered_metrics:
+        self._flush_one_buffered_entry(entry)
+      self.buffered_metrics = []
+      # Safety net for the rare case where eval fires on the final step and no train flush follows.
+      self._flush_pending_per_dataset_eval_wandb()
+    finally:
+      try:
+        max_utils.close_summary_writer(self.writer)
+      finally:
+        if self.wandb_run is not None:
+          self.wandb_run.finish()
+          self.wandb_run = None
