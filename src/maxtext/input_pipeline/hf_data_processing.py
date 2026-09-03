@@ -232,6 +232,8 @@ def preprocessing_pipeline(
     num_microbatches=1,
     sft_train_on_completion_only=True,
     sft_chat_template_mode="segmented",
+    sft_enable_thinking=True,
+    sft_enable_thinking_column="",
     grain_worker_count=1,  # only support 0 or 1
     max_segments_per_seq=None,
     num_epoch=1,
@@ -245,6 +247,17 @@ def preprocessing_pipeline(
         "sft_chat_template_mode='assistant_mask' is currently supported only by the Grain SFT pipeline; "
         "use dataset_type=grain or keep the HF pipeline in segmented mode."
     )
+  if use_sft and sft_enable_thinking_column:
+    raise ValueError(
+        "sft_enable_thinking_column is currently supported only by the Grain SFT pipeline; "
+        "use the constant sft_enable_thinking setting for HF SFT."
+    )
+  if use_sft and not chat_template and chat_template_path:
+    chat_template = instruction_data_processing.load_chat_template_from_file(chat_template_path)
+    if chat_template is None:
+      raise ValueError(f"Unable to load SFT chat template from chat_template_path={chat_template_path!r}.")
+  if use_sft:
+    data_processing_utils.validate_sft_chat_template_capabilities(chat_template, sft_chat_template_mode)
 
   import datasets  # pylint: disable=import-outside-toplevel
 
@@ -281,10 +294,10 @@ def preprocessing_pipeline(
   dataset = dataset.select_columns(data_column_names)
 
   if use_sft:
-    if not chat_template:
-      chat_template = instruction_data_processing.load_chat_template_from_file(chat_template_path)
-
     data_processing_utils.validate_and_configure_sft_columns(data_column_names, tokenizer, chat_template)
+    data_processing_utils.validate_sft_chat_template_capabilities(
+        getattr(tokenizer, "chat_template", None), sft_chat_template_mode
+    )
 
     # Separate auxiliary "tools" column from primary data columns
     tools_column_name = (
@@ -331,6 +344,7 @@ def preprocessing_pipeline(
             "tokenizer_model": tokenizer,
             "data_column_name": data_column_names[0],
             "tools_column_name": tools_column_name,
+            "enable_thinking": sft_enable_thinking,
         },
     )
     if tools_column_name:
@@ -480,6 +494,8 @@ def make_hf_train_iterator(
         num_microbatches=config.gradient_accumulation_steps,
         sft_train_on_completion_only=config.sft_train_on_completion_only,
         sft_chat_template_mode=config.sft_chat_template_mode,
+        sft_enable_thinking=config.sft_enable_thinking,
+        sft_enable_thinking_column=config.sft_enable_thinking_column,
         chat_template_path=config.chat_template_path,
         max_segments_per_seq=config.max_segments_per_seq,
         num_epoch=config.num_epoch,
@@ -543,6 +559,8 @@ def make_hf_eval_iterator(
         num_microbatches=config.gradient_accumulation_steps,
         sft_train_on_completion_only=config.sft_train_on_completion_only,
         sft_chat_template_mode=config.sft_chat_template_mode,
+        sft_enable_thinking=config.sft_enable_thinking,
+        sft_enable_thinking_column=config.sft_enable_thinking_column,
         chat_template_path=config.chat_template_path,
         max_segments_per_seq=config.max_segments_per_seq,
         chat_template=config.chat_template,

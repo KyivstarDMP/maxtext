@@ -216,7 +216,7 @@ def extract_token_ids(tokens):
     raise ValueError(f"Can't extract token_ids from type {type(tokens)}")
 
 
-def verify_chat_template_generation_prompt_logic(tokenizer_model):
+def verify_chat_template_generation_prompt_logic(tokenizer_model, enable_thinking=True):
   """Verifies the tokenizer's chat template for correct SFT loss masking.
 
   This function ensures that the tokens added by `add_generation_prompt=True`
@@ -246,17 +246,23 @@ def verify_chat_template_generation_prompt_logic(tokenizer_model):
   dummy_msgs = [{"role": "system", "content": "System message"}, {"role": "user", "content": "Test message"}]
 
   try:
-    prompt_wo_gen_tokens = tokenizer_model.apply_chat_template(dummy_msgs, add_generation_prompt=False, tokenize=True, enable_thinking=True)
+    prompt_wo_gen_tokens = tokenizer_model.apply_chat_template(
+        dummy_msgs, add_generation_prompt=False, tokenize=True, enable_thinking=enable_thinking
+    )
   except TemplateError:
     max_logging.info(
         "Tokenizer failed to apply chat template with 'system' role. "
         "Falling back to 'user' role only for chat template verification."
     )
     dummy_msgs.pop(0)
-    prompt_wo_gen_tokens = tokenizer_model.apply_chat_template(dummy_msgs, add_generation_prompt=False, tokenize=True, enable_thinking=True)
+    prompt_wo_gen_tokens = tokenizer_model.apply_chat_template(
+        dummy_msgs, add_generation_prompt=False, tokenize=True, enable_thinking=enable_thinking
+    )
   prompt_wo_gen_ids = extract_token_ids(prompt_wo_gen_tokens)
 
-  prompt_w_gen_tokens = tokenizer_model.apply_chat_template(dummy_msgs, add_generation_prompt=True, tokenize=True, enable_thinking=True)
+  prompt_w_gen_tokens = tokenizer_model.apply_chat_template(
+      dummy_msgs, add_generation_prompt=True, tokenize=True, enable_thinking=enable_thinking
+  )
   prompt_w_gen_ids = extract_token_ids(prompt_w_gen_tokens)
 
   if prompt_w_gen_ids[: len(prompt_wo_gen_ids)] != prompt_wo_gen_ids:
@@ -265,7 +271,10 @@ def verify_chat_template_generation_prompt_logic(tokenizer_model):
   assistant_prefix = prompt_w_gen_ids[len(prompt_wo_gen_ids) :]
   full_turn_tokens = extract_token_ids(
       tokenizer_model.apply_chat_template(
-          dummy_msgs + [{"role": "assistant", "content": "Dummy response"}], add_generation_prompt=False, tokenize=True, enable_thinking=True
+          dummy_msgs + [{"role": "assistant", "content": "Dummy response"}],
+          add_generation_prompt=False,
+          tokenize=True,
+          enable_thinking=enable_thinking,
       )
   )
   full_turn_ids = extract_token_ids(full_turn_tokens)
@@ -283,7 +292,7 @@ def verify_chat_template_generation_prompt_logic(tokenizer_model):
     )
 
 
-def _get_completion_in_chat_template(tokenizer_model, round_msgs, tools=None):
+def _get_completion_in_chat_template(tokenizer_model, round_msgs, tools=None, enable_thinking=True):
   """
   Calculates the completion part of a conversation turn when formatted with a chat template.
 
@@ -307,9 +316,13 @@ def _get_completion_in_chat_template(tokenizer_model, round_msgs, tools=None):
     A string representing the completion formatted by the chat template.
   """
   tools_kwargs = {"tools": tools} if tools is not None else {}
-  prompt_completion_tokens = tokenizer_model.apply_chat_template(round_msgs, add_generation_prompt=False, tokenize=True, enable_thinking=True, **tools_kwargs)
+  prompt_completion_tokens = tokenizer_model.apply_chat_template(
+      round_msgs, add_generation_prompt=False, tokenize=True, enable_thinking=enable_thinking, **tools_kwargs
+  )
   # include generation_prompt as part of the prompt tokens
-  prompt_tokens = tokenizer_model.apply_chat_template(round_msgs[:-1], add_generation_prompt=True, tokenize=True, enable_thinking=True, **tools_kwargs)
+  prompt_tokens = tokenizer_model.apply_chat_template(
+      round_msgs[:-1], add_generation_prompt=True, tokenize=True, enable_thinking=enable_thinking, **tools_kwargs
+  )
 
   prompt_completion_ids = extract_token_ids(prompt_completion_tokens)
   prompt_ids = extract_token_ids(prompt_tokens)
@@ -335,7 +348,7 @@ def _get_completion_in_chat_template(tokenizer_model, round_msgs, tools=None):
 
 
 def _get_tool_results_and_completion_deltas(  # pylint: disable=too-many-locals
-    tokenizer_model, round_msgs, assistant_message, tools=None
+    tokenizer_model, round_msgs, assistant_message, tools=None, enable_thinking=True
 ):
   """Render trailing tool results and the assistant response as adjacent token deltas.
 
@@ -381,14 +394,14 @@ def _get_tool_results_and_completion_deltas(  # pylint: disable=too-many-locals
       round_msgs[:first_tool_idx],
       add_generation_prompt=False,
       tokenize=True,
-      enable_thinking=True,
+      enable_thinking=enable_thinking,
       **tools_kwargs,
   )
   superset_tokens = tokenizer_model.apply_chat_template(
       round_msgs,
       add_generation_prompt=True,
       tokenize=True,
-      enable_thinking=True,
+      enable_thinking=enable_thinking,
       **tools_kwargs,
   )
   baseline_ids = extract_token_ids(baseline_tokens)
@@ -430,14 +443,14 @@ def _get_tool_results_and_completion_deltas(  # pylint: disable=too-many-locals
       round_msgs,
       add_generation_prompt=False,
       tokenize=True,
-      enable_thinking=True,
+      enable_thinking=enable_thinking,
       **tools_kwargs,
   )
   assistant_tokens = tokenizer_model.apply_chat_template(
       round_msgs + [assistant_message],
       add_generation_prompt=False,
       tokenize=True,
-      enable_thinking=True,
+      enable_thinking=enable_thinking,
       **tools_kwargs,
   )
   tool_context_ids = extract_token_ids(tool_context_tokens)
@@ -495,7 +508,7 @@ def _get_tool_results_and_completion_deltas(  # pylint: disable=too-many-locals
   )
 
 
-def apply_chat_template(example, tokenizer_model, data_column_name, tools_column_name=None):
+def apply_chat_template(example, tokenizer_model, data_column_name, tools_column_name=None, enable_thinking=True):
   """Formats conversational data by applying the tokenizer's chat template
   and identifying prompt/completion segments for SFT masking.
 
@@ -535,7 +548,11 @@ def apply_chat_template(example, tokenizer_model, data_column_name, tools_column
       elif message["role"] == "user":
         round_msgs.append(message)
         prompt_in_chat_template = tokenizer_model.apply_chat_template(
-            round_msgs, add_generation_prompt=True, tokenize=False, enable_thinking=True, **tools_kwargs
+            round_msgs,
+            add_generation_prompt=True,
+            tokenize=False,
+            enable_thinking=enable_thinking,
+            **tools_kwargs,
         )
         messages.append(prompt_in_chat_template)
         is_prompt.append(True)
@@ -551,14 +568,23 @@ def apply_chat_template(example, tokenizer_model, data_column_name, tools_column
           # the preceding loss-applied call completion because they are model-emitted stop/EOM
           # tokens; the resumed render reuses that token before appending the masked result body.
           tool_results_delta, completion = _get_tool_results_and_completion_deltas(
-              tokenizer_model, round_msgs, message, tools=tools
+              tokenizer_model,
+              round_msgs,
+              message,
+              tools=tools,
+              enable_thinking=enable_thinking,
           )
           messages.append(tool_results_delta)
           is_prompt.append(True)
           round_msgs.append(message)
         else:
           round_msgs.append(message)
-          completion = _get_completion_in_chat_template(tokenizer_model, round_msgs, tools=tools)
+          completion = _get_completion_in_chat_template(
+              tokenizer_model,
+              round_msgs,
+              tools=tools,
+              enable_thinking=enable_thinking,
+          )
         messages.append(completion)
         is_prompt.append(False)
         # Clear round only when the next message starts a new user turn or conversation ends
@@ -579,6 +605,7 @@ def apply_chat_template_with_assistant_mask(
     tokenizer_model,
     data_column_name,
     tools_column_name=None,
+    enable_thinking=True,
 ):
   """Render one canonical SFT token stream and use template-owned loss spans.
 
@@ -636,8 +663,8 @@ def apply_chat_template_with_assistant_mask(
         tokenize=True,
         return_dict=True,
         return_assistant_tokens_mask=True,
-        enable_thinking=True,
-        preserve_thinking=True,
+        enable_thinking=enable_thinking,
+        preserve_thinking=enable_thinking,
         **tools_kwargs,
     )
   except (TypeError, ValueError) as error:
@@ -1203,9 +1230,10 @@ class ParseFeatures(grain.MapTransform):
 class NormalizeFeatures(grain.MapTransform):
   """Normalize text feature keys."""
 
-  def __init__(self, column_names, tokenize):
+  def __init__(self, column_names, tokenize, scalar_bool_columns=()):
     self.column_names = column_names
     self.tokenize = tokenize
+    self.scalar_bool_columns = frozenset(scalar_bool_columns)
 
   # Columns that may legitimately be absent from a record (e.g. datasets
   # without function-calling data). Missing optional columns are skipped
@@ -1220,7 +1248,16 @@ class NormalizeFeatures(grain.MapTransform):
         if col in self.OPTIONAL_COLUMNS:
           continue  # e.g. a dataset that has no `tools` column
         raise KeyError(f"Required column '{col}' missing from record. Present columns: {sorted(element.keys())}")
-      out[col] = element[col][0].decode() if self.tokenize else element[col]
+      if col in self.scalar_bool_columns:
+        value = element[col]
+        if not isinstance(value, (list, tuple, np.ndarray)) or len(value) != 1:
+          raise ValueError(f"Boolean metadata column '{col}' must contain exactly one scalar 0/1 value.")
+        scalar = value[0]
+        if not isinstance(scalar, (int, np.integer, bool, np.bool_)) or int(scalar) not in (0, 1):
+          raise ValueError(f"Boolean metadata column '{col}' must contain exactly one scalar 0/1 value.")
+        out[col] = bool(int(scalar))
+      else:
+        out[col] = element[col][0].decode() if self.tokenize else element[col]
     if "dataset_id" in element:
       out["dataset_id"] = element["dataset_id"]
     return out
@@ -1236,9 +1273,10 @@ class KeepFeatures(grain.MapTransform):
   contains string/bytes data (raw text).
   """
 
-  def __init__(self, feature_names: list[str], tokenize: bool = True):
+  def __init__(self, feature_names: list[str], tokenize: bool = True, scalar_bool_columns=()):
     self.feature_names = feature_names
     self.tokenize = tokenize
+    self.scalar_bool_columns = frozenset(scalar_bool_columns)
 
   # See ParseFeatures.OPTIONAL_COLUMNS — absent optional columns are skipped, not an error.
   OPTIONAL_COLUMNS = frozenset({"tools"})
@@ -1253,6 +1291,13 @@ class KeepFeatures(grain.MapTransform):
       )
     filtered = {k: v for k, v in element.items() if k in self.feature_names}
     for col, val in filtered.items():
+      if col in self.scalar_bool_columns:
+        if type(val) is bool:  # pylint: disable=unidiomatic-typecheck
+          continue
+        if isinstance(val, np.bool_):
+          filtered[col] = bool(val)
+          continue
+        raise ValueError(f"Boolean metadata column '{col}' must contain an actual boolean, got {type(val).__name__}.")
       if self.tokenize:
         if isinstance(val, np.ndarray) and np.issubdtype(val.dtype, np.integer):
           raise ValueError(

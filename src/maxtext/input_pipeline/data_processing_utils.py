@@ -26,15 +26,47 @@ from maxtext.utils import elastic_utils
 
 
 TOOLS_COLUMN = "tools"
+REQUIRES_ASSISTANT_MASK_TEMPLATE_CAPABILITY = "maxtext-template-capability: requires-assistant-mask"
 
 
-def parse_and_keep_features(dataset, config, data_columns, tokenize):
+def validate_sft_chat_template_capabilities(chat_template: str | None, chat_template_mode: str) -> None:
+  """Reject SFT modes that violate capabilities declared by a chat template.
+
+  Capability markers travel with the template source, including when the file
+  is copied or renamed. They are deliberately separate from Jinja
+  ``{% generation %}`` blocks: generation blocks may be harmless in segmented
+  rendering, whereas this marker declares that segmented rendering changes the
+  template's intended training semantics.
+  """
+  if not isinstance(chat_template, str):
+    return
+  if (
+      REQUIRES_ASSISTANT_MASK_TEMPLATE_CAPABILITY in chat_template
+      and chat_template_mode != "assistant_mask"
+  ):
+    raise ValueError(
+        "The active SFT chat template declares "
+        f"{REQUIRES_ASSISTANT_MASK_TEMPLATE_CAPABILITY!r} and cannot be used with "
+        f"sft_chat_template_mode={chat_template_mode!r}. Set "
+        "sft_chat_template_mode='assistant_mask' and use the Grain SFT pipeline."
+    )
+
+
+def parse_and_keep_features(dataset, config, data_columns, tokenize, scalar_bool_columns=()):
   """Parse arrayrecord features or keep specified columns for other formats."""
   if config.grain_file_type in ("arrayrecord", "tfrecord"):
     dataset = dataset.map(input_pipeline_utils.ParseFeatures(data_columns, tokenize))
-    dataset = dataset.map(input_pipeline_utils.NormalizeFeatures(data_columns, tokenize))
+    dataset = dataset.map(
+        input_pipeline_utils.NormalizeFeatures(data_columns, tokenize, scalar_bool_columns=scalar_bool_columns)
+    )
   else:
-    dataset = dataset.map(input_pipeline_utils.KeepFeatures(feature_names=data_columns, tokenize=tokenize))
+    dataset = dataset.map(
+        input_pipeline_utils.KeepFeatures(
+            feature_names=data_columns,
+            tokenize=tokenize,
+            scalar_bool_columns=scalar_bool_columns,
+        )
+    )
   return dataset
 
 
@@ -70,15 +102,18 @@ def get_tokenizer_and_pad_id(config):
   return tokenizer_model, pad_id
 
 
-def validate_and_configure_sft_columns(data_columns, tokenizer_model, chat_template=None):
+def validate_and_configure_sft_columns(data_columns, tokenizer_model, chat_template=None, metadata_columns=()):
   """Validates SFT data columns and configures the tokenizer chat template."""
   if chat_template and hasattr(tokenizer_model, "chat_template"):
     tokenizer_model.chat_template = chat_template
 
+  metadata_columns = set(metadata_columns)
+  conversational_columns = [column for column in data_columns if column not in metadata_columns]
   supported_columns = [["prompt", "completion"], ["messages"], ["messages", TOOLS_COLUMN], ["question", "answer"]]
-  assert any(
-      set(data_columns) == set(supported) for supported in supported_columns
-  ), f"Dataset column names mismatch. Expected columns to match one of {supported_columns}, but got {data_columns}"
+  assert any(set(conversational_columns) == set(supported) for supported in supported_columns), (
+      f"Dataset column names mismatch after removing SFT metadata columns {sorted(metadata_columns)}. "
+      f"Expected columns to match one of {supported_columns}, but got {data_columns}"
+  )
 
 
 def get_local_batch_size(config):

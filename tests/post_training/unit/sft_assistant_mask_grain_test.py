@@ -20,8 +20,10 @@ import copy
 import json
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 
+from maxtext.input_pipeline import data_processing_utils
 from maxtext.input_pipeline import grain_data_processing
 from maxtext.input_pipeline import hf_data_processing
 from maxtext.input_pipeline import input_pipeline_utils
@@ -59,15 +61,19 @@ class _AssistantMaskTokenizer:
   name_or_path = "synthetic-assistant-mask-tokenizer"
   chat_template = "{% generation %}assistant{% endgeneration %}"
 
+  def __init__(self):
+    self.calls = []
+
   def apply_chat_template(self, messages, **kwargs):
     assert messages == MESSAGES
+    self.calls.append(copy.deepcopy(kwargs))
     assert kwargs == {
         "add_generation_prompt": False,
         "tokenize": True,
         "return_dict": True,
         "return_assistant_tokens_mask": True,
-        "enable_thinking": True,
-        "preserve_thinking": True,
+        "enable_thinking": kwargs["enable_thinking"],
+        "preserve_thinking": kwargs["enable_thinking"],
         "tools": TOOLS,
     }
     return {"input_ids": list(INPUT_IDS), "assistant_masks": list(ASSISTANT_MASK)}
@@ -79,6 +85,8 @@ def _config(**overrides):
       "chat_template_path": "",
       "sft_chat_template_mode": "segmented",
       "sft_train_on_completion_only": True,
+      "sft_enable_thinking": True,
+      "sft_enable_thinking_column": "",
   }
   values.update(overrides)
   return SimpleNamespace(**values)
@@ -94,6 +102,22 @@ def test_grain_formatter_emits_one_token_stream_with_template_owned_runs():
 
   assert [token for run in formatted["messages"] for token in run] == INPUT_IDS
   assert formatted["is_prompt"] == [True, False, True, False]
+
+
+def test_interleaved_rows_pass_their_own_thinking_mode():
+  tokenizer = _AssistantMaskTokenizer()
+
+  for mode in (False, True, False):
+    grain_data_processing._format_chat_template_grain(
+        {"messages": copy.deepcopy(MESSAGES), "tools": copy.deepcopy(TOOLS), "enable_thinking": mode},
+        data_columns=["messages", "tools", "enable_thinking"],
+        tokenizer_model=tokenizer,
+        chat_template_mode="assistant_mask",
+        sft_enable_thinking_column="enable_thinking",
+    )
+
+  assert [call["enable_thinking"] for call in tokenizer.calls] == [False, True, False]
+  assert [call["preserve_thinking"] for call in tokenizer.calls] == [False, True, False]
 
 
 def test_grain_formatter_defaults_to_segmented_mode(monkeypatch):
@@ -121,7 +145,10 @@ def test_grain_formatter_defaults_to_segmented_mode(monkeypatch):
 
 
 def test_grain_loads_generation_marked_template_from_configured_path(monkeypatch):
-  template = "{% generation %}{{ messages[-1]['content'] }}{% endgeneration %}"
+  template = (
+      "{# maxtext-template-capability: requires-assistant-mask #}"
+      "{% generation %}{{ messages[-1]['content'] }}{% endgeneration %}"
+  )
   monkeypatch.setattr(
       grain_data_processing.instruction_data_processing,
       "load_chat_template_from_file",
@@ -138,6 +165,7 @@ def test_grain_loads_generation_marked_template_from_configured_path(monkeypatch
 
   assert mode == "assistant_mask"
   assert tokenizer.chat_template == template
+  assert data_processing_utils.REQUIRES_ASSISTANT_MASK_TEMPLATE_CAPABILITY in tokenizer.chat_template
 
 
 def test_default_mode_keeps_tokenizer_template():
@@ -147,6 +175,37 @@ def test_default_mode_keeps_tokenizer_template():
 
   assert mode == "segmented"
   assert tokenizer.chat_template == "inference-template"
+
+
+def test_segmented_grain_rejects_template_that_requires_assistant_mask():
+  marker = data_processing_utils.REQUIRES_ASSISTANT_MASK_TEMPLATE_CAPABILITY
+  tokenizer = SimpleNamespace(chat_template="inference-template")
+
+  with pytest.raises(ValueError, match="requires-assistant-mask") as error:
+    grain_data_processing._configure_sft_chat_template(
+        _config(chat_template=f"{{# {marker} #}}"),
+        ["messages"],
+        tokenizer,
+        True,
+    )
+
+  assert "sft_chat_template_mode='assistant_mask'" in str(error.value)
+  assert "Grain SFT pipeline" in str(error.value)
+
+
+def test_generation_blocks_alone_do_not_disable_segmented_rendering():
+  template = "{% generation %}assistant{% endgeneration %}"
+  tokenizer = SimpleNamespace(chat_template="inference-template")
+
+  mode = grain_data_processing._configure_sft_chat_template(
+      _config(chat_template=template),
+      ["messages"],
+      tokenizer,
+      True,
+  )
+
+  assert mode == "segmented"
+  assert tokenizer.chat_template == template
 
 
 @pytest.mark.parametrize(
@@ -209,3 +268,116 @@ def test_hf_sft_pipeline_rejects_assistant_mask_mode():
         use_sft=True,
         sft_chat_template_mode="assistant_mask",
     )
+
+
+def test_hf_sft_pipeline_rejects_template_that_requires_assistant_mask():
+  marker = data_processing_utils.REQUIRES_ASSISTANT_MASK_TEMPLATE_CAPABILITY
+
+  with pytest.raises(ValueError, match="requires-assistant-mask") as error:
+    hf_data_processing.preprocessing_pipeline(
+        dataloading_host_index=0,
+        dataloading_host_count=1,
+        global_mesh=None,
+        dataset=None,
+        config=None,
+        data_column_names=["messages"],
+        tokenize=True,
+        tokenizer_path="unused",
+        hf_access_token=None,
+        global_batch_size=1,
+        max_target_length=8,
+        shuffle=False,
+        data_shuffle_seed=0,
+        use_sft=True,
+        chat_template=f"{{# {marker} #}}",
+    )
+
+  assert "sft_chat_template_mode='assistant_mask'" in str(error.value)
+
+
+def test_hf_sft_pipeline_rejects_per_row_thinking_mode_column():
+  with pytest.raises(ValueError, match="supported only by the Grain SFT pipeline"):
+    hf_data_processing.preprocessing_pipeline(
+        dataloading_host_index=0,
+        dataloading_host_count=1,
+        global_mesh=None,
+        dataset=None,
+        config=None,
+        data_column_names=["messages", "enable_thinking"],
+        tokenize=True,
+        tokenizer_path="unused",
+        hf_access_token=None,
+        global_batch_size=1,
+        max_target_length=8,
+        shuffle=False,
+        data_shuffle_seed=0,
+        use_sft=True,
+        sft_enable_thinking_column="enable_thinking",
+    )
+
+
+@pytest.mark.parametrize(("value", "expected"), [([0], False), ([1], True), (np.asarray([1]), True)])
+def test_arrayrecord_thinking_mode_scalar_normalizes_to_bool(value, expected):
+  normalized = input_pipeline_utils.NormalizeFeatures(
+      ["messages", "enable_thinking"], tokenize=True, scalar_bool_columns=("enable_thinking",)
+  ).map({"messages": [b"[]"], "enable_thinking": value})
+
+  assert normalized == {"messages": "[]", "enable_thinking": expected}
+  assert normalized["enable_thinking"].__class__ is bool
+
+
+@pytest.mark.parametrize("value", [[], [0, 1], [2], [b"1"], 1])
+def test_arrayrecord_thinking_mode_rejects_non_scalar_or_non_boolean_values(value):
+  with pytest.raises(ValueError, match="exactly one scalar 0/1"):
+    input_pipeline_utils.NormalizeFeatures(
+        ["enable_thinking"], tokenize=True, scalar_bool_columns=("enable_thinking",)
+    ).map({"enable_thinking": value})
+
+
+@pytest.mark.parametrize("value", [False, True, np.bool_(True)])
+def test_parquet_thinking_mode_normalizes_boolean_values(value):
+  normalized = input_pipeline_utils.KeepFeatures(
+      feature_names=["messages", "enable_thinking"],
+      tokenize=True,
+      scalar_bool_columns=("enable_thinking",),
+  ).map({"messages": "[]", "enable_thinking": value})
+
+  assert normalized["enable_thinking"].__class__ is bool
+
+
+@pytest.mark.parametrize("value", [0, 1, "false", None, [False]])
+def test_parquet_thinking_mode_rejects_non_boolean_values(value):
+  with pytest.raises(ValueError, match="must contain an actual boolean"):
+    input_pipeline_utils.KeepFeatures(
+        feature_names=["messages", "enable_thinking"],
+        tokenize=True,
+        scalar_bool_columns=("enable_thinking",),
+    ).map({"messages": "[]", "enable_thinking": value})
+
+
+@pytest.mark.parametrize("value", [0, 1, "false", None, np.bool_(True)])
+def test_grain_mode_resolver_requires_actual_python_bool(value):
+  with pytest.raises(ValueError, match="must contain an actual boolean"):
+    grain_data_processing._resolve_sft_enable_thinking(
+        {"enable_thinking": value}, default=True, column_name="enable_thinking"
+    )
+
+
+def test_grain_mode_resolver_rejects_missing_column():
+  with pytest.raises(ValueError, match="is missing from the SFT record"):
+    grain_data_processing._resolve_sft_enable_thinking(
+        {"messages": MESSAGES}, default=True, column_name="enable_thinking"
+    )
+
+
+def test_sft_column_validation_ignores_only_configured_mode_metadata():
+  tokenizer = SimpleNamespace(chat_template="inference-template")
+
+  mode = grain_data_processing._configure_sft_chat_template(
+      _config(sft_enable_thinking_column="enable_thinking"),
+      ["messages", "tools", "enable_thinking"],
+      tokenizer,
+      True,
+  )
+
+  assert mode == "segmented"

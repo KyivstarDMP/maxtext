@@ -41,10 +41,13 @@ class _PrefixStableToolTokenizer:
 
   name_or_path = "prefix-stable-tool-tokenizer"
 
+  def __init__(self):
+    self.enable_thinking_calls = []
+
   def _render(self, messages, add_generation_prompt, tools, enable_thinking):
     """Render a deterministic chat stream for delta and masking assertions."""
     assert tools == TOOLS
-    assert enable_thinking is True
+    self.enable_thinking_calls.append(enable_thinking)
 
     rendered = "<B>"
     for idx, message in enumerate(messages):
@@ -151,13 +154,14 @@ def _standard_round(tool_messages=None):
   ]
 
 
-def _format(messages, tokenizer=None):
+def _format(messages, tokenizer=None, enable_thinking=True):
   tokenizer = tokenizer or _PrefixStableToolTokenizer()
   return tokenizer, apply_chat_template(
       {"messages": copy.deepcopy(messages), "tools": copy.deepcopy(TOOLS)},
       tokenizer,
       "messages",
       "tools",
+      enable_thinking=enable_thinking,
   )
 
 
@@ -194,6 +198,13 @@ def test_tool_result_is_emitted_once_as_masked_context_and_stream_is_token_exact
   assert SENTINEL not in loss_text
   assert "<CALL><R>" in loss_text  # The model-emitted call-turn stop/EOM token is a loss target.
   assert "The lookup succeeded." in loss_text
+
+
+def test_segmented_tool_round_passes_one_thinking_value_to_every_internal_render():
+  tokenizer, _ = _format(_standard_round(), enable_thinking=False)
+
+  assert tokenizer.enable_thinking_calls
+  assert set(tokenizer.enable_thinking_calls) == {False}
 
 
 def test_consecutive_tool_results_are_emitted_once_and_in_order():
