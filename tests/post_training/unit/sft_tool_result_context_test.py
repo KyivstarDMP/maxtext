@@ -18,7 +18,12 @@ import copy
 
 import pytest
 
-from maxtext.input_pipeline.input_pipeline_utils import SFTPromptMasking, apply_chat_template
+from maxtext.input_pipeline import grain_data_processing
+from maxtext.input_pipeline.input_pipeline_utils import (
+    SFT_PINNED_CONTEXT_IDS_KEY,
+    SFTPromptMasking,
+    apply_chat_template,
+)
 
 
 pytestmark = [pytest.mark.post_training, pytest.mark.cpu_only]
@@ -50,11 +55,19 @@ class _PrefixStableToolTokenizer:
     self.enable_thinking_calls.append(enable_thinking)
 
     rendered = "<B>"
-    for idx, message in enumerate(messages):
+    loop_messages = messages
+    if tools or (messages and messages[0]["role"] in ("system", "developer")):
+      rendered += "<D>"
+      if messages and messages[0]["role"] in ("system", "developer"):
+        rendered += messages[0]["content"]
+        loop_messages = messages[1:]
+      if tools:
+        rendered += "<TOOLS>"
+      rendered += "</D>"
+
+    for idx, message in enumerate(loop_messages):
       role = message["role"]
-      if role in ("system", "developer"):
-        rendered += f"<S>{message['content']}</S>"
-      elif role == "user":
+      if role == "user":
         rendered += f"<U>{message['content']}</U>"
       elif role == "assistant":
         rendered += "<A>"
@@ -63,7 +76,7 @@ class _PrefixStableToolTokenizer:
           # Both target tokenizer families end a terminal call-only render with
           # their function-response opener. When tools follow, the first tool
           # message emits that same opener at the identical stream position.
-          if idx == len(messages) - 1:
+          if idx == len(loop_messages) - 1:
             rendered += "<R>"
         else:
           rendered += f"{message.get('content', '')}</A>"
@@ -134,6 +147,43 @@ class _ToolIgnoringTokenizer(_PrefixStableToolTokenizer):
     return rendered
 
 
+class _NonPrefixStableLeadingTokenizer(_PrefixStableToolTokenizer):
+  name_or_path = "non-prefix-stable-leading-tokenizer"
+
+  def _render(self, messages, add_generation_prompt, tools, enable_thinking):
+    rendered = super()._render(messages, add_generation_prompt, tools, enable_thinking)
+    if len(messages) == 1 and messages[0]["role"] == "developer":
+      rendered = rendered.replace("<D>", "<CHANGED_LEADING>", 1)
+    return rendered
+
+
+class _RoundTripDriftLeadingTokenizer(_PrefixStableToolTokenizer):
+  """Keep template tokenization stable but alter later segment encoding."""
+
+  name_or_path = "round-trip-drift-leading-tokenizer"
+
+  @staticmethod
+  def _raw_encode(text):
+    return [ord(char) + 1 for char in text]
+
+  def apply_chat_template(
+      self,
+      messages,
+      *,
+      add_generation_prompt,
+      tokenize,
+      enable_thinking,
+      tools=None,
+  ):
+    rendered = self._render(messages, add_generation_prompt, tools, enable_thinking)
+    return self._raw_encode(rendered) if tokenize else rendered
+
+  def encode(self, text):  # pylint: disable=arguments-differ
+    if "<U>" in text:
+      text = text.replace("<D>", "<ROUND_TRIP_CHANGED>", 1)
+    return self._raw_encode(text)
+
+
 def _tool_call():
   return {
       "role": "assistant",
@@ -161,6 +211,18 @@ def _format(messages, tokenizer=None, enable_thinking=True):
       tokenizer,
       "messages",
       "tools",
+      enable_thinking=enable_thinking,
+  )
+
+
+def _format_with_pin(messages, tokenizer=None, enable_thinking=True):
+  tokenizer = tokenizer or _PrefixStableToolTokenizer()
+  return tokenizer, apply_chat_template(
+      {"messages": copy.deepcopy(messages), "tools": copy.deepcopy(TOOLS)},
+      tokenizer,
+      "messages",
+      "tools",
+      pin_leading_context=True,
       enable_thinking=enable_thinking,
   )
 
@@ -205,6 +267,83 @@ def test_segmented_tool_round_passes_one_thinking_value_to_every_internal_render
 
   assert tokenizer.enable_thinking_calls
   assert set(tokenizer.enable_thinking_calls) == {False}
+
+
+def test_leading_developer_is_not_replayed_and_pin_is_exact():
+  messages = [
+      {"role": "developer", "content": "Follow the declared tools."},
+      {"role": "user", "content": "First question."},
+      {"role": "assistant", "content": "First answer."},
+      {"role": "user", "content": "Second question."},
+      {"role": "assistant", "content": "Second answer."},
+  ]
+  tokenizer, formatted = _format_with_pin(messages)
+  segment_ids = _tokenized_segments(tokenizer, formatted)
+  assembled_text = tokenizer.decode([token for segment in segment_ids for token in segment])
+  pinned_text = tokenizer.decode(formatted[SFT_PINNED_CONTEXT_IDS_KEY])
+
+  assert formatted["is_prompt"] == [True, False, True, False]
+  assert pinned_text == "<B><D>Follow the declared tools.<TOOLS></D>"
+  assert formatted["messages"][0].startswith(pinned_text)
+  assert assembled_text.count("Follow the declared tools.") == 1
+  assert formatted["messages"][0].count("<TOOLS>") == 1
+  assert formatted["messages"][2].count("<TOOLS>") == 1
+
+
+def test_tools_only_conversation_pins_generated_developer_block():
+  messages = [
+      {"role": "user", "content": "Use a tool."},
+      {"role": "assistant", "content": "Done."},
+  ]
+  tokenizer, formatted = _format_with_pin(messages)
+
+  assert tokenizer.decode(formatted[SFT_PINNED_CONTEXT_IDS_KEY]) == "<B><D><TOOLS></D>"
+
+
+def test_pinned_context_prefix_mismatch_has_bounded_diagnostics():
+  messages = [
+      {"role": "developer", "content": "Instructions must not be dumped in full."},
+      {"role": "user", "content": "Use a tool."},
+      {"role": "assistant", "content": "Done."},
+  ]
+  with pytest.raises(ValueError) as exc_info:
+    _format_with_pin(messages, _NonPrefixStableLeadingTokenizer())
+
+  message = str(exc_info.value)
+  assert "pinned-context mismatch" in message
+  assert "Tokenizer: non-prefix-stable-leading-tokenizer" in message
+  assert "revision: unknown" in message
+  assert "divergence offset:" in message
+  assert len(message) < 1500
+
+
+def test_pinned_context_decode_encode_mismatch_fails_before_windowing():
+  messages = [
+      {"role": "developer", "content": "Instructions must remain token-exact."},
+      {"role": "user", "content": "Use a tool."},
+      {"role": "assistant", "content": "Done."},
+  ]
+  tokenizer, formatted = _format_with_pin(messages, _RoundTripDriftLeadingTokenizer())
+
+  with pytest.raises(ValueError) as exc_info:
+    grain_data_processing._tokenize_sft_chunks(formatted, "messages", tokenizer)  # pylint: disable=protected-access
+
+  message = str(exc_info.value)
+  assert "pinned-context mismatch" in message
+  assert "decode/encode boundary" in message
+  assert "Tokenizer: round-trip-drift-leading-tokenizer" in message
+  assert "Instructions must remain" not in message
+  assert len(message) < 1500
+
+
+def test_developer_message_after_index_zero_is_rejected():
+  messages = [
+      {"role": "user", "content": "First question."},
+      {"role": "developer", "content": "Too late."},
+      {"role": "assistant", "content": "Answer."},
+  ]
+  with pytest.raises(ValueError, match="'developer' message found at index 1"):
+    _format(messages)
 
 
 def test_consecutive_tool_results_are_emitted_once_and_in_order():

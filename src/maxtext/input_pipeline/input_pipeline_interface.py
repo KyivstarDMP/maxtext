@@ -62,6 +62,16 @@ def create_process_specific_iterator(config: pyconfig.HyperParameters, mesh, pro
 def create_data_iterator(config: pyconfig.HyperParameters, mesh):
   """Create train and eval data iterators given configs and mesh."""
 
+  if (
+      config.dataset_type == "hf"
+      and getattr(config, "use_sft", False)
+      and getattr(config, "sft_long_example_handling", "truncate") == "window"
+  ):
+    raise ValueError(
+        "sft_long_example_handling='window' is currently implemented only for the Grain SFT pipeline; "
+        "dataset_type='hf' would otherwise silently use head-truncating SFTPromptMasking."
+    )
+
   # Return synthetic dataset if selected
   if config.dataset_type == "synthetic":
     eval_iterator = SyntheticDataIterator(config, mesh) if config.eval_interval > 0 else None

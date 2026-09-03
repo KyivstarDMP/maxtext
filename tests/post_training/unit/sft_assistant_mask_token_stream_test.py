@@ -17,7 +17,9 @@
 import pytest
 
 from maxtext.input_pipeline.input_pipeline_utils import (
+    SFT_PINNED_CONTEXT_IDS_KEY,
     SFTPromptMasking,
+    SFTPromptMaskingWindows,
     split_sft_token_stream_by_assistant_mask,
 )
 
@@ -29,6 +31,12 @@ PAD = 0
 def _loss_tokens(records):
   """Return the non-masked targets in training order."""
   return [int(token) for record in records for token in record["targets"] if token != PAD]
+
+
+def _count_subsequence(tokens, subsequence):
+  return sum(
+      tokens[index : index + len(subsequence)] == subsequence for index in range(len(tokens) - len(subsequence) + 1)
+  )
 
 
 def test_splitter_preserves_canonical_ids_and_coalesces_equal_mask_runs():
@@ -77,3 +85,53 @@ def test_short_canonical_stream_reaches_existing_masking_contract_token_exact():
   assert _loss_tokens([record]) == [
       token_id for token_id, is_assistant in zip(input_ids, assistant_mask, strict=True) if is_assistant
   ]
+
+
+def test_long_canonical_stream_preserves_pin_and_loss_tiling_through_windows():
+  pinned = [1, 2, 3]
+  leading_context = pinned + list(range(10, 26))
+  tool_call = [101, 102, 50]
+  tool_result = list(range(201, 209))
+  first_answer = list(range(301, 325)) + [106]
+  later_user = list(range(401, 407))
+  second_answer = list(range(501, 511)) + [106]
+  input_ids = leading_context + tool_call + tool_result + first_answer + later_user + second_answer
+  assistant_mask = (
+      [0] * len(leading_context)
+      + [1] * len(tool_call)
+      + [0] * len(tool_result)
+      + [1] * len(first_answer)
+      + [0] * len(later_user)
+      + [1] * len(second_answer)
+  )
+  expected_loss = [token_id for token_id, is_assistant in zip(input_ids, assistant_mask, strict=True) if is_assistant]
+  token_runs, is_prompt = split_sft_token_stream_by_assistant_mask(input_ids, assistant_mask)
+  element = {"text": token_runs, "is_prompt": is_prompt, SFT_PINNED_CONTEXT_IDS_KEY: pinned}
+
+  pinned_records = SFTPromptMaskingWindows(
+      "text",
+      completion_only=True,
+      max_target_length=20,
+      unk_id=PAD,
+      overlap=2,
+      pin_leading_context=True,
+  ).flat_map(element)
+  unpinned_records = SFTPromptMaskingWindows(
+      "text",
+      completion_only=True,
+      max_target_length=20,
+      unk_id=PAD,
+      overlap=2,
+      pin_leading_context=False,
+  ).flat_map(element)
+
+  assert len(pinned_records) > 1
+  assert all(len(record["inputs"]) <= 20 for record in pinned_records)
+  assert _loss_tokens(pinned_records) == expected_loss
+  assert _loss_tokens(unpinned_records) == expected_loss
+  for record in pinned_records:
+    inputs = record["inputs"].tolist()
+    targets = record["targets"].tolist()
+    assert inputs[: len(pinned)] == pinned
+    assert targets[: len(pinned)] == [PAD] * len(pinned)
+    assert _count_subsequence(inputs, pinned) == 1

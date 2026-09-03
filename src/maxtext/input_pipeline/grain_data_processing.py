@@ -378,6 +378,7 @@ def _format_chat_template_grain(
     element,
     data_columns,
     tokenizer_model,
+    pin_leading_context=False,
     chat_template_mode="segmented",
     sft_enable_thinking=True,
     sft_enable_thinking_column="",
@@ -433,6 +434,7 @@ def _format_chat_template_grain(
       element, tokenizer_model=tokenizer_model,
       data_column_name=primary_columns[0],
       tools_column_name=tools_column_name,
+      pin_leading_context=pin_leading_context,
       enable_thinking=enable_thinking,
   )
 
@@ -440,7 +442,17 @@ def _format_chat_template_grain(
 def _tokenize_sft_chunks(element, text_column_name, tokenizer_model):
   """Tokenize each chunk individually without truncating."""
   text_chunks = element[text_column_name]
-  element[text_column_name] = [tokenizer_model.encode(chunk) for chunk in text_chunks]
+  tokenized_chunks = [tokenizer_model.encode(chunk) for chunk in text_chunks]
+  pinned_ids = element.get(input_pipeline_utils.SFT_PINNED_CONTEXT_IDS_KEY, [])
+  if pinned_ids and tokenized_chunks:
+    input_pipeline_utils.validate_pinned_context_prefix(
+        tokenizer_model,
+        pinned_ids,
+        tokenized_chunks[0],
+        roles=["formatted-first-prompt"],
+        boundary_name="decode/encode",
+    )
+  element[text_column_name] = tokenized_chunks
   return element
 
 
@@ -540,12 +552,21 @@ def sft_preprocessing_pipeline(
       column for column in data_columns if column not in (data_processing_utils.TOOLS_COLUMN, thinking_column)
   ]
   chat_template_mode = _configure_sft_chat_template(config, data_columns, tokenizer_model, tokenize)
+  long_handling = getattr(config, "sft_long_example_handling", "truncate")
+  pin_leading_context = getattr(config, "sft_window_pin_leading_context", False)
+  if pin_leading_context and long_handling != "window":
+    raise ValueError(
+        "sft_window_pin_leading_context=True requires sft_long_example_handling='window' in the Grain SFT pipeline."
+    )
+  if pin_leading_context and not tokenize:
+    raise ValueError("sft_window_pin_leading_context=True requires tokenize=True in the Grain SFT pipeline.")
 
   dataset = dataset.map(
       functools.partial(
           _format_chat_template_grain,
           data_columns=data_columns,
           tokenizer_model=tokenizer_model,
+          pin_leading_context=pin_leading_context,
           chat_template_mode=chat_template_mode,
           sft_enable_thinking=getattr(config, "sft_enable_thinking", True),
           sft_enable_thinking_column=thinking_column,
@@ -561,7 +582,6 @@ def sft_preprocessing_pipeline(
         )
     )
 
-  long_handling = getattr(config, "sft_long_example_handling", "truncate")
   if long_handling == "window":
     assert (
         config.sft_train_on_completion_only
@@ -576,6 +596,9 @@ def sft_preprocessing_pipeline(
         overlap=config.sft_window_overlap,
         context_cap=config.sft_window_context_cap,
         max_fan_out=config.sft_window_max_fan_out,
+        pin_leading_context=pin_leading_context,
+        pinned_context_overflow=getattr(config, "sft_window_pinned_context_overflow", "error"),
+        pinned_context_warn_fraction=getattr(config, "sft_window_pinned_context_warn_fraction", 0.5),
     )
     # grain applies a FlatMapTransform via IterDataset.apply() in newer releases and via the
     # FlatMapIterDataset constructor in older ones (<=0.2.12). Support both so this works

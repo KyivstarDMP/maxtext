@@ -1559,13 +1559,35 @@ class FineTuning(BaseModel):
   sft_window_context_cap: int = Field(
       -1,
       description=(
-          "For 'window': max tokens of conversation-prefix context pinned (masked) in front of "
+          "For 'window': max tokens of bounded conversation-prefix context (masked) in front of "
           "each window. -1 = auto (max_target_length // 2)."
       ),
   )
   sft_window_max_fan_out: int = Field(
       32,
       description="For 'window': hard cap on records emitted per example (runaway guard).",
+  )
+  sft_window_pin_leading_context: bool = Field(
+      False,
+      description=(
+          "For Grain 'window' handling: preserve the canonical leading system/developer/native-tools "
+          "block when the ordinary context tail would left-cut it. The block remains masked."
+      ),
+  )
+  sft_window_pinned_context_overflow: Literal["error"] = Field(
+      "error",
+      description=(
+          "Behavior when the complete pinned leading block is at least as long as the effective context cap. "
+          "Only 'error' is supported so protected instructions are never silently left/right-truncated or "
+          "dropped. Shorten/split the pin, increase the context budget, or explicitly drop/quarantine the row "
+          "with accounting during preflight."
+      ),
+  )
+  sft_window_pinned_context_warn_fraction: float = Field(
+      0.5,
+      gt=0.0,
+      lt=1.0,
+      description=("Warn when a pinned leading block consumes more than this fraction of the effective context cap."),
   )
   per_dataset_metrics: bool = Field(
       False,
