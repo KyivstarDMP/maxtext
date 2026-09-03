@@ -65,18 +65,28 @@ class _AssistantMaskTokenizer:
     self.calls = []
 
   def apply_chat_template(self, messages, **kwargs):
-    assert messages == MESSAGES
     self.calls.append(copy.deepcopy(kwargs))
-    assert kwargs == {
-        "add_generation_prompt": False,
-        "tokenize": True,
-        "return_dict": True,
-        "return_assistant_tokens_mask": True,
-        "enable_thinking": kwargs["enable_thinking"],
-        "preserve_thinking": kwargs["enable_thinking"],
-        "tools": TOOLS,
-    }
-    return {"input_ids": list(INPUT_IDS), "assistant_masks": list(ASSISTANT_MASK)}
+    roles = [message["role"] for message in messages]
+    assert kwargs.get("tools") == TOOLS
+    if kwargs.get("return_assistant_tokens_mask"):
+      assert messages == MESSAGES
+      assert kwargs["add_generation_prompt"] is False
+      assert kwargs["tokenize"] is True
+      assert kwargs["return_dict"] is True
+      assert kwargs["preserve_thinking"] is kwargs["enable_thinking"]
+      return {"input_ids": list(INPUT_IDS), "assistant_masks": list(ASSISTANT_MASK)}
+    if roles == ["developer"]:
+      assert kwargs["add_generation_prompt"] is False
+      return [1]
+    if roles == ["developer", "user"]:
+      assert kwargs["add_generation_prompt"] is True
+      return [1, 2]
+    raise AssertionError(f"Unexpected render roles: {roles}")
+
+  @staticmethod
+  def decode(token_ids, skip_special_tokens=False):
+    del skip_special_tokens
+    return " ".join(str(token_id) for token_id in token_ids)
 
 
 def _config(**overrides):
@@ -102,6 +112,18 @@ def test_grain_formatter_emits_one_token_stream_with_template_owned_runs():
 
   assert [token for run in formatted["messages"] for token in run] == INPUT_IDS
   assert formatted["is_prompt"] == [True, False, True, False]
+
+
+def test_assistant_mask_formatter_emits_exact_leading_pin():
+  formatted = grain_data_processing._format_chat_template_grain(
+      {"messages": copy.deepcopy(MESSAGES), "tools": copy.deepcopy(TOOLS)},
+      data_columns=["messages", "tools"],
+      tokenizer_model=_AssistantMaskTokenizer(),
+      pin_leading_context=True,
+      chat_template_mode="assistant_mask",
+  )
+
+  assert formatted[input_pipeline_utils.SFT_PINNED_CONTEXT_IDS_KEY] == [1]
 
 
 def test_interleaved_rows_pass_their_own_thinking_mode():

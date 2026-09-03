@@ -40,6 +40,7 @@ from maxtext.utils import max_logging
 
 Features = dict[str, Any]
 INPUT_TOKENS_KEY = "input_ids"
+SFT_PINNED_CONTEXT_IDS_KEY = "sft_pinned_context_ids"
 
 ########## Functions used by TFDS pipeline
 
@@ -587,7 +588,130 @@ def _get_tool_results_and_completion_deltas(  # pylint: disable=too-many-locals
   )
 
 
-def apply_chat_template(example, tokenizer_model, data_column_name, tools_column_name=None, enable_thinking=True):
+def validate_pinned_context_prefix(tokenizer_model, pinned_ids, prompt_ids, roles, boundary_name):
+  """Require a pinned leading block to be an exact token prefix of a real prompt render."""
+  common_len = 0
+  for pinned_id, prompt_id in zip(pinned_ids, prompt_ids):
+    if pinned_id != prompt_id:
+      break
+    common_len += 1
+
+  if common_len == len(pinned_ids):
+    return
+
+  tokenizer_name = getattr(tokenizer_model, "name_or_path", type(tokenizer_model).__name__)
+  tokenizer_revision = getattr(tokenizer_model, "_commit_hash", None)
+  if tokenizer_revision is None:
+    tokenizer_revision = getattr(tokenizer_model, "init_kwargs", {}).get("_commit_hash", "unknown")
+  window_radius = 16
+  start = max(0, common_len - window_radius)
+  pinned_end = min(len(pinned_ids), common_len + window_radius)
+  prompt_end = min(len(prompt_ids), common_len + window_radius)
+  pinned_window = pinned_ids[start:pinned_end]
+  prompt_window = prompt_ids[start:prompt_end]
+  raise ValueError(
+      "Chat template pinned-context mismatch: the canonical leading system/developer/tools block "
+      f"is not an exact token prefix at the {boundary_name} boundary.\n"
+      f"Tokenizer: {tokenizer_name}; revision: {tokenizer_revision}\n"
+      f"Roles: {roles}\n"
+      f"Pinned tokens: {len(pinned_ids)}; prompt tokens: {len(prompt_ids)}; divergence offset: {common_len}\n"
+      f"Pinned divergence window [{start}:{pinned_end}]: {pinned_window} "
+      f"('{tokenizer_model.decode(pinned_window, skip_special_tokens=False)}')\n"
+      f"Prompt divergence window [{start}:{prompt_end}]: {prompt_window} "
+      f"('{tokenizer_model.decode(prompt_window, skip_special_tokens=False)}')"
+  )
+
+
+def _get_pinned_context_ids(tokenizer_model, leading_message, first_prompt_messages, tools=None, enable_thinking=True):
+  """Render only the canonical leading system/developer/native-tools block as token IDs.
+
+  A tools-only conversation still has a tokenizer-generated leading developer
+  block. Use an empty synthetic developer message only for rendering that
+  block; it is not inserted into the source conversation. When neither an
+  explicit leading message nor tools exist, retain only a tokenizer-generated
+  leading block that is an exact prefix of the real first-user prompt. If the
+  synthetic block is not a prefix, fall back to an exact BOS-only prefix.
+  """
+  tools_kwargs = {"tools": tools} if tools is not None else {}
+  prompt_ids = extract_token_ids(
+      tokenizer_model.apply_chat_template(
+          first_prompt_messages,
+          add_generation_prompt=True,
+          tokenize=True,
+          enable_thinking=enable_thinking,
+          **tools_kwargs,
+      )
+  )
+
+  if leading_message is not None or tools:
+    pinned_messages = [leading_message or {"role": "developer", "content": ""}]
+    pinned_ids = extract_token_ids(
+        tokenizer_model.apply_chat_template(
+            pinned_messages,
+            add_generation_prompt=False,
+            tokenize=True,
+            enable_thinking=enable_thinking,
+            **tools_kwargs,
+        )
+    )
+  else:
+    synthetic_ids = []
+    try:
+      synthetic_ids = extract_token_ids(
+          tokenizer_model.apply_chat_template(
+              [{"role": "developer", "content": ""}],
+              add_generation_prompt=False,
+              tokenize=True,
+              enable_thinking=enable_thinking,
+          )
+      )
+    except TemplateError:
+      # Some templates reject developer/system messages. BOS remains a safe
+      # candidate if and only if the real first-user render begins with it.
+      pass
+
+    if synthetic_ids and synthetic_ids == prompt_ids[: len(synthetic_ids)]:
+      pinned_ids = synthetic_ids
+    else:
+      bos_token_id = getattr(tokenizer_model, "bos_token_id", None)
+      bos_ids = [int(bos_token_id)] if bos_token_id is not None else []
+      if bos_ids and bos_ids == prompt_ids[: len(bos_ids)]:
+        pinned_ids = bos_ids
+      else:
+        tokenizer_name = getattr(tokenizer_model, "name_or_path", type(tokenizer_model).__name__)
+        tokenizer_revision = getattr(tokenizer_model, "_commit_hash", None)
+        if tokenizer_revision is None:
+          tokenizer_revision = getattr(tokenizer_model, "init_kwargs", {}).get("_commit_hash", "unknown")
+        raise ValueError(
+            "Unable to derive a safe generated leading-context pin: neither the complete synthetic "
+            "developer block nor BOS is an exact token prefix of the real first-user prompt. "
+            f"Tokenizer: {tokenizer_name}; revision: {tokenizer_revision}; enable_thinking={enable_thinking}; "
+            f"synthetic tokens: {len(synthetic_ids)}; BOS token: {bos_token_id}; prompt tokens: {len(prompt_ids)}; "
+            f"prompt prefix IDs: {prompt_ids[:16]}"
+        )
+
+  # Do not recover a mismatch by taking len(pinned_ids) tokens from prompt_ids or by
+  # pinning the complete first prompt. Without tokenizer-provided message spans, the
+  # former can cut into the user message or omit part of a context-dependent leading
+  # block, while the latter would replay the first user's task in later windows.
+  validate_pinned_context_prefix(
+      tokenizer_model,
+      pinned_ids,
+      prompt_ids,
+      [message.get("role", "<missing>") for message in first_prompt_messages],
+      "chat-template",
+  )
+  return pinned_ids
+
+
+def apply_chat_template(
+    example,
+    tokenizer_model,
+    data_column_name,
+    tools_column_name=None,
+    pin_leading_context=False,
+    enable_thinking=True,
+):
   """Formats conversational data by applying the tokenizer's chat template
   and identifying prompt/completion segments for SFT masking.
 
@@ -598,6 +722,9 @@ def apply_chat_template(example, tokenizer_model, data_column_name, tools_column
       which contains the specific chat template.
     data_column_name: The name of the column in the `example` dictionary
       that contains the list of messages.
+    tools_column_name: Optional column containing native tool declarations.
+    pin_leading_context: Whether to emit the tokenized canonical leading
+      system/developer/tools block for long-example windowing.
 
   Returns:
     The modified `example` dictionary.
@@ -611,6 +738,9 @@ def apply_chat_template(example, tokenizer_model, data_column_name, tools_column
   messages = []
   is_prompt = []
   round_msgs = []
+  leading_message = None
+  pinned_context_ids = []
+  pinned_context_rendered = False
   conversation = example[data_column_name]
   if isinstance(conversation, str):
     conversation = json.loads(conversation)
@@ -620,12 +750,22 @@ def apply_chat_template(example, tokenizer_model, data_column_name, tools_column
   tools_kwargs = {"tools": tools} if tools is not None else {}
   try:
     for idx, message in enumerate(conversation):
-      if message["role"] == "system":
+      if message["role"] in ("system", "developer"):
         if idx != 0:
-          raise ValueError(f"System message found at index {idx}. System messages must be at index 0.")
+          raise ValueError(f"'{message['role']}' message found at index {idx}. It must be at index 0.")
+        leading_message = message
         round_msgs.append(message)
       elif message["role"] == "user":
         round_msgs.append(message)
+        if pin_leading_context and not pinned_context_rendered:
+          pinned_context_ids = _get_pinned_context_ids(
+              tokenizer_model,
+              leading_message,
+              round_msgs,
+              tools=tools,
+              enable_thinking=enable_thinking,
+          )
+          pinned_context_rendered = True
         prompt_in_chat_template = tokenizer_model.apply_chat_template(
             round_msgs,
             add_generation_prompt=True,
@@ -671,11 +811,15 @@ def apply_chat_template(example, tokenizer_model, data_column_name, tools_column
         next_idx = idx + 1
         if next_idx >= len(conversation) or conversation[next_idx]["role"] == "user":
           round_msgs.clear()
+      else:
+        raise ValueError(f"Unsupported message role '{message['role']}' at index {idx}.")
   except ValueError as e:
     max_logging.log(f"Unable to apply chat template: {e}")
     raise e
   example["is_prompt"] = is_prompt
   example[data_column_name] = messages
+  if pin_leading_context:
+    example[SFT_PINNED_CONTEXT_IDS_KEY] = pinned_context_ids
   return example
 
 
@@ -684,6 +828,7 @@ def apply_chat_template_with_assistant_mask(
     tokenizer_model,
     data_column_name,
     tools_column_name=None,
+    pin_leading_context=False,
     enable_thinking=True,
 ):
   """Render one canonical SFT token stream and use template-owned loss spans.
@@ -706,9 +851,11 @@ def apply_chat_template_with_assistant_mask(
       template.
     data_column_name: Column containing the message list.
     tools_column_name: Optional column containing native tool declarations.
+    pin_leading_context: Whether to emit the canonical leading
+      system/developer/native-tools token prefix for long-example windowing.
   Returns:
     The modified example with token-ID runs in ``data_column_name``, matching
-    ``is_prompt`` flags.
+    ``is_prompt`` flags, and optionally ``sft_pinned_context_ids``.
 
   Raises:
     ValueError: If the row or tokenizer output violates the canonical
@@ -720,6 +867,8 @@ def apply_chat_template_with_assistant_mask(
   if not isinstance(conversation, list) or not conversation:
     raise ValueError("Canonical assistant-mask SFT requires a non-empty message list.")
 
+  leading_message = None
+  first_user_index = None
   for index, message in enumerate(conversation):
     if not isinstance(message, Mapping) or "role" not in message:
       raise ValueError(f"SFT message at index {index} must be a mapping with a role.")
@@ -727,6 +876,9 @@ def apply_chat_template_with_assistant_mask(
     if role in ("system", "developer"):
       if index != 0:
         raise ValueError(f"'{role}' message found at index {index}. It must be at index 0.")
+      leading_message = message
+    elif role == "user" and first_user_index is None:
+      first_user_index = index
     elif role not in ("user", "assistant", "tool"):
       raise ValueError(f"Unsupported message role '{role}' at index {index}.")
 
@@ -777,6 +929,26 @@ def apply_chat_template_with_assistant_mask(
   token_runs, is_prompt = split_sft_token_stream_by_assistant_mask(input_ids, assistant_mask)
   example[data_column_name] = token_runs
   example["is_prompt"] = is_prompt
+
+  if pin_leading_context:
+    if first_user_index is None:
+      raise ValueError("SFT leading-context pinning requires at least one user message.")
+    first_prompt_messages = conversation[: first_user_index + 1]
+    pinned_context_ids = _get_pinned_context_ids(
+        tokenizer_model,
+        leading_message,
+        first_prompt_messages,
+        tools=tools,
+        enable_thinking=enable_thinking,
+    )
+    validate_pinned_context_prefix(
+        tokenizer_model,
+        pinned_context_ids,
+        [token_id for token_run in token_runs for token_id in token_run],
+        [message.get("role", "<missing>") for message in conversation],
+        "canonical-full-conversation",
+    )
+    example[SFT_PINNED_CONTEXT_IDS_KEY] = pinned_context_ids
 
   return example
 
@@ -904,6 +1076,30 @@ class SFTPromptMasking(grain.MapTransform):
     return out
 
 
+@dataclasses.dataclass(frozen=True)
+class SFTWindowGeometry:
+  """Effective bounded geometry shared by SFT windowing and preflight checks."""
+
+  overlap_cap: int
+  min_loss_room: int
+  context_cap: int
+
+
+def get_sft_window_geometry(max_target_length, overlap=256, context_cap=-1):
+  """Return the exact clamped overlap, minimum loss room, and context cap used by SFT windows."""
+  if max_target_length <= 0:
+    raise ValueError(f"max_target_length must be positive, got {max_target_length}.")
+  overlap_cap = max(0, min(overlap, max_target_length // 8))
+  min_loss_room = max(1, max_target_length // 8)
+  requested_cap = context_cap if (context_cap and context_cap > 0) else max_target_length // 2
+  effective_context_cap = max(1, min(requested_cap, max_target_length - overlap_cap - min_loss_room))
+  return SFTWindowGeometry(
+      overlap_cap=overlap_cap,
+      min_loss_room=min_loss_room,
+      context_cap=effective_context_cap,
+  )
+
+
 @dataclasses.dataclass
 class SFTPromptMaskingWindows(FlatMapTransform):
   """Construct SFT inputs/targets for completion-only training, splitting examples longer than
@@ -916,11 +1112,13 @@ class SFTPromptMaskingWindows(FlatMapTransform):
   the stop token never enters the loss and the model is trained on a stop-less completion prefix.
 
   This transform instead emits, per completion segment of an over-length example, a sequence of
-  windows. Each window is ``[ conversation-prefix-so-far (front-capped, masked) ] +
-  [ small completion overlap (masked) ] + [ a slice of new completion tokens (loss) ]``. The loss
-  slices tile the completion with NO overlap, so every completion token — including the terminator
-  in the final window — contributes to the loss exactly once. Examples that already fit yield a
-  single record byte-identical to :class:`SFTPromptMasking`.
+  windows. Each window is ``[ bounded conversation-prefix context (masked) ] +
+  [ small completion overlap (masked) ] + [ a slice of new completion tokens (loss) ]``. By default,
+  bounded context is the newest prefix tail. With leading-context pinning enabled, a real left cut
+  instead keeps the canonical system/developer/native-tools block plus the newest tail that fits.
+  The loss slices tile the completion with NO overlap, so every completion token — including the
+  terminator in the final window — contributes to the loss exactly once. Examples that already fit
+  yield a single record byte-identical to :class:`SFTPromptMasking`.
 
   Only completion-only SFT is supported (the context/overlap tokens are masked with ``unk_id``).
   """
@@ -936,6 +1134,9 @@ class SFTPromptMaskingWindows(FlatMapTransform):
       overlap=256,
       context_cap=-1,
       max_fan_out=32,
+      pin_leading_context=False,
+      pinned_context_overflow="error",
+      pinned_context_warn_fraction=0.5,
   ):
     self.text_column_name = text_column_name
     self.completion_only = completion_only
@@ -944,6 +1145,20 @@ class SFTPromptMaskingWindows(FlatMapTransform):
     self.overlap = overlap
     self.context_cap = context_cap
     self.max_fan_out = max_fan_out
+    self.pin_leading_context = pin_leading_context
+    if pinned_context_overflow != "error":
+      raise ValueError(
+          "Only sft_window_pinned_context_overflow='error' is supported; " f"got {pinned_context_overflow!r}."
+      )
+    if not 0.0 < pinned_context_warn_fraction < 1.0:
+      raise ValueError(
+          "sft_window_pinned_context_warn_fraction must be between 0 and 1; " f"got {pinned_context_warn_fraction}."
+      )
+    self.pinned_context_overflow = pinned_context_overflow
+    self.pinned_context_warn_fraction = pinned_context_warn_fraction
+    # Grain workers own separate transform instances. This counter only rate-limits
+    # warning logs within one instance; it is not a globally aggregatable row metric.
+    self.pinned_context_warning_count = 0
 
   def _single_record(self, segments, is_prompt):
     """Fast path identical to SFTPromptMasking.map for examples that fit in max_target_length."""
@@ -975,15 +1190,14 @@ class SFTPromptMaskingWindows(FlatMapTransform):
     if total <= length:
       return self._stamp_ds([self._single_record(segments, is_prompt)], element)
 
-    # Clamp window geometry so every window always leaves room for >=1 loss token:
-    #   ctx (<= cap) + overlap (<= overlap_cap) + min_room <= length.
-    overlap_cap = max(0, min(self.overlap, length // 8))
-    min_room = max(1, length // 8)
-    auto_cap = self.context_cap if (self.context_cap and self.context_cap > 0) else length // 2
-    cap = max(1, min(auto_cap, length - overlap_cap - min_room))
+    geometry = get_sft_window_geometry(length, self.overlap, self.context_cap)
+    overlap_cap = geometry.overlap_cap
+    cap = geometry.context_cap
+    pinned = list(element.get(SFT_PINNED_CONTEXT_IDS_KEY, [])) if self.pin_leading_context else []
 
     records = []
     prefix = []  # all tokens of preceding segments, replayed (masked) as grounding context
+    warned_for_element = False
     for seg, is_p in zip(segments, is_prompt):
       seg = list(seg)
       if self.completion_only and is_p:
@@ -992,7 +1206,40 @@ class SFTPromptMaskingWindows(FlatMapTransform):
       comp = seg
       if not comp:
         continue
-      ctx = prefix[-cap:] if len(prefix) > cap else list(prefix)
+      if len(prefix) <= cap or not pinned:
+        ctx = list(prefix) if len(prefix) <= cap else prefix[-cap:]
+      else:
+        if prefix[: len(pinned)] != pinned:
+          raise ValueError(
+              "SFT pinned leading context is not an exact token prefix of the accumulated conversation. "
+              f"Pinned tokens: {len(pinned)}; accumulated prefix tokens: {len(prefix)}."
+          )
+        if len(pinned) >= cap:
+          # Overflow is intentionally fail-loud. Left-truncating can remove BOS,
+          # opening delimiters, or the start of developer instructions; right-
+          # truncating can cut tool schemas or their closing delimiters. Silently
+          # dropping the example is also a dataset-policy decision, not a safe
+          # transform default. Preflight and explicitly shorten/split the pin,
+          # increase the context budget, or drop/quarantine the row with accounting.
+          raise ValueError(
+              "SFT pinned leading context leaves no recent-conversation tail budget. "
+              f"Pinned tokens: {len(pinned)}; effective context cap: {cap}; "
+              f"max_target_length: {length}; overlap cap: {overlap_cap}."
+          )
+        if not warned_for_element and len(pinned) > cap * self.pinned_context_warn_fraction:
+          self.pinned_context_warning_count += 1
+          warned_for_element = True
+          warning_count = self.pinned_context_warning_count
+          if warning_count <= 3 or warning_count & (warning_count - 1) == 0:
+            max_logging.warning(
+                "SFT pinned leading context consumes more than the configured warning fraction of the "
+                f"effective context cap: pinned_tokens={len(pinned)}, effective_context_cap={cap}, "
+                f"remaining_tail_budget={cap - len(pinned)}, warning_fraction="
+                f"{self.pinned_context_warn_fraction}, warning_rows_seen_by_worker={warning_count}."
+            )
+        tail_budget = cap - len(pinned)
+        tail_start = max(len(pinned), len(prefix) - tail_budget)
+        ctx = pinned + prefix[tail_start:]
       i, n = 0, len(comp)
       while i < n:
         if len(records) >= self.max_fan_out:
