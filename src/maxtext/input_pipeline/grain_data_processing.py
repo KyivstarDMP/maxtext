@@ -33,6 +33,7 @@ from maxtext.input_pipeline import data_processing_utils
 from maxtext.input_pipeline import input_pipeline_utils
 from maxtext.input_pipeline import grain_tokenizer
 from maxtext.input_pipeline import dpo_utils
+from maxtext.input_pipeline import instruction_data_processing
 from maxtext.input_pipeline import multihost_dataloading
 from maxtext.input_pipeline._mmap_datasource import MMapDatasetConfig, get_mmap_dataset, get_mmap_npy_dataset
 from maxtext.utils import gcs_utils
@@ -533,7 +534,7 @@ def dpo_preprocessing_pipeline(
   return dataset
 
 
-def _format_chat_template_grain(element, data_columns, tokenizer_model):
+def _format_chat_template_grain(element, data_columns, tokenizer_model, chat_template_mode="segmented"):
   """Grain-compatible mapping function to format raw columns into conversational messages."""
   tools_column_name = data_processing_utils.TOOLS_COLUMN if data_processing_utils.TOOLS_COLUMN in data_columns else None
   primary_columns = [c for c in data_columns if c != data_processing_utils.TOOLS_COLUMN]
@@ -551,16 +552,31 @@ def _format_chat_template_grain(element, data_columns, tokenizer_model):
     # Fallback if it's already a single string
     messages = element[primary_columns[0]]
 
-  assert all(
-      hasattr(m, "__contains__") and "role" in m and "content" in m for m in messages
-  ), f"SFT requires a conversational format. Expected dicts with 'role' and 'content', but got: {messages}"
+  if chat_template_mode == "assistant_mask":
+    valid_messages = all(
+        hasattr(message, "__contains__")
+        and "role" in message
+        and ("content" in message or (message["role"] == "assistant" and message.get("tool_calls")))
+        for message in messages
+    )
+  else:
+    valid_messages = all(
+        hasattr(message, "__contains__") and "role" in message and "content" in message for message in messages
+    )
+  assert valid_messages, (
+      "SFT requires conversational message mappings with role/content; assistant-mask mode also "
+      f"accepts assistant tool-call messages with omitted content. Got: {messages}"
+  )
 
   # Assign the standardized messages back to the primary column
   element[primary_columns[0]] = messages
 
-  return input_pipeline_utils.apply_chat_template(
-      element,
-      tokenizer_model=tokenizer_model,
+  formatter = input_pipeline_utils.apply_chat_template
+  if chat_template_mode == "assistant_mask":
+    formatter = input_pipeline_utils.apply_chat_template_with_assistant_mask
+
+  return formatter(
+      element, tokenizer_model=tokenizer_model,
       data_column_name=primary_columns[0],
       tools_column_name=tools_column_name,
   )
@@ -571,6 +587,35 @@ def _tokenize_sft_chunks(element, text_column_name, tokenizer_model):
   text_chunks = element[text_column_name]
   element[text_column_name] = [tokenizer_model.encode(chunk) for chunk in text_chunks]
   return element
+
+
+def _configure_sft_chat_template(config, data_columns, tokenizer_model, tokenize):
+  """Load an optional template file and validate the selected Grain SFT mode."""
+  chat_template = getattr(config, "chat_template", None)
+  chat_template_path = getattr(config, "chat_template_path", "")
+  if not chat_template and chat_template_path:
+    chat_template = instruction_data_processing.load_chat_template_from_file(chat_template_path)
+    if chat_template is None:
+      raise ValueError(f"Unable to load SFT chat template from chat_template_path={chat_template_path!r}.")
+  data_processing_utils.validate_and_configure_sft_columns(data_columns, tokenizer_model, chat_template)
+
+  chat_template_mode = getattr(config, "sft_chat_template_mode", "segmented")
+  if chat_template_mode not in ("segmented", "assistant_mask"):
+    raise ValueError("sft_chat_template_mode must be 'segmented' or 'assistant_mask'; " f"got {chat_template_mode!r}.")
+  if chat_template_mode == "assistant_mask":
+    if not tokenize:
+      raise ValueError("sft_chat_template_mode='assistant_mask' requires tokenize=True in the Grain SFT pipeline.")
+    if not config.sft_train_on_completion_only:
+      raise ValueError(
+          "sft_chat_template_mode='assistant_mask' requires sft_train_on_completion_only=True so context remains masked."
+      )
+    active_template = getattr(tokenizer_model, "chat_template", None)
+    if not isinstance(active_template, str) or re.search(r"{%[-+]?\s*generation\b", active_template) is None:
+      raise ValueError(
+          "sft_chat_template_mode='assistant_mask' requires an active chat template containing "
+          "{% generation %} blocks. Configure chat_template or chat_template_path."
+      )
+  return chat_template_mode
 
 
 def sft_preprocessing_pipeline(
@@ -596,21 +641,19 @@ def sft_preprocessing_pipeline(
 
   tokenizer_model = getattr(tokenizer_model, "tokenizer", tokenizer_model)
 
-  data_processing_utils.validate_and_configure_sft_columns(
-      data_columns, tokenizer_model, getattr(config, "chat_template", None)
-  )
-
   primary_columns = [c for c in data_columns if c != data_processing_utils.TOOLS_COLUMN]
+  chat_template_mode = _configure_sft_chat_template(config, data_columns, tokenizer_model, tokenize)
 
   dataset = dataset.map(
       functools.partial(
           _format_chat_template_grain,
           data_columns=data_columns,
           tokenizer_model=tokenizer_model,
+          chat_template_mode=chat_template_mode,
       )
   )
 
-  if tokenize:
+  if tokenize and chat_template_mode == "segmented":
     dataset = dataset.map(
         functools.partial(
             _tokenize_sft_chunks,
