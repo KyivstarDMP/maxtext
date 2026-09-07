@@ -87,7 +87,7 @@ class _AssistantMaskTokenizer:
   @staticmethod
   def decode(token_ids, skip_special_tokens=False):
     del skip_special_tokens
-    return " ".join(str(token_id) for token_id in token_ids)
+    return " ".join("result" if token_id == 3 else str(token_id) for token_id in token_ids)
 
 
 def _config(**overrides):
@@ -489,3 +489,81 @@ def test_sft_column_validation_ignores_only_configured_mode_metadata():
   )
 
   assert mode == "segmented"
+
+
+# Use real Jinja generation blocks and HF mask construction for body ownership.
+def _body_check_tokenizer(template):
+  from tokenizers import Tokenizer, decoders, models, pre_tokenizers  # pylint: disable=import-outside-toplevel
+  from transformers import PreTrainedTokenizerFast  # pylint: disable=import-outside-toplevel
+
+  vocabulary = {char: index for index, char in enumerate(["[UNK]"] + [chr(i) for i in range(128)])}
+  backend = Tokenizer(models.WordLevel(vocabulary, unk_token="[UNK]"))
+  backend.pre_tokenizer = pre_tokenizers.Split("", behavior="isolated")
+  backend.decoder = decoders.Fuse()
+  return PreTrainedTokenizerFast(tokenizer_object=backend, unk_token="[UNK]", chat_template=template)
+
+
+@pytest.mark.parametrize(
+    "case,template,valid",
+    [
+        (
+            "dropped",
+            "prompt{% generation %}call{% endgeneration %}delimiters{% generation %}answer{% endgeneration %}",
+            False,
+        ),
+        ("historical_prefix", "user call result history{% generation %}answer{% endgeneration %}", True),
+        ("quoted_user_before_call", "{{ messages[1]['content'] }}{% generation %}call answer{% endgeneration %}", True),
+        (
+            "quoted_user_after_call",
+            "{% generation %}call{% endgeneration %}{{ messages[1]['content'] }}{% generation %}answer{% endgeneration %}",
+            True,
+        ),
+        ("split_runs", "res{% generation %}call{% endgeneration %}ult{% generation %}answer{% endgeneration %}", False),
+        ("loss_only", "prompt{% generation %}call result answer{% endgeneration %}", False),
+        ("masked_and_loss_copy", "result{% generation %}call result answer{% endgeneration %}", True),
+    ],
+)
+def test_generation_marked_templates_enforce_body_presence_with_documented_limits(case, template, valid):
+  messages = copy.deepcopy(MESSAGES)
+  if case.startswith("quoted_user"):
+    messages[1]["content"] = "The user quotes result here."
+  if case == "historical_prefix":
+    messages[2]["trainable"] = False
+  tokenizer = _body_check_tokenizer(template)
+  encoded = tokenizer.apply_chat_template(
+      messages,
+      tools=TOOLS,
+      tokenize=True,
+      add_generation_prompt=False,
+      return_dict=True,
+      return_assistant_tokens_mask=True,
+  )
+  if not valid:
+    with pytest.raises(ValueError, match="dropped or altered a tool result body"):
+      input_pipeline_utils.apply_chat_template_with_assistant_mask(
+          {"messages": messages, "tools": TOOLS},
+          tokenizer,
+          "messages",
+          "tools",
+      )
+    return
+  formatted = input_pipeline_utils.apply_chat_template_with_assistant_mask(
+      {"messages": messages, "tools": TOOLS},
+      tokenizer,
+      "messages",
+      "tools",
+  )
+  assert [token for run in formatted["messages"] for token in run] == encoded["input_ids"]
+  assert [int(not prompt) for run, prompt in zip(formatted["messages"], formatted["is_prompt"]) for _ in run] == encoded[
+      "assistant_masks"
+  ]
+
+
+def test_rows_without_tools_do_not_decode_for_body_validation():
+  tokenizer = _body_check_tokenizer("prompt{% generation %}answer{% endgeneration %}")
+  tokenizer.decode = lambda *args, **kwargs: pytest.fail("No tool messages: no body-check decoding")
+  input_pipeline_utils.apply_chat_template_with_assistant_mask(
+      {"messages": [{"role": "user", "content": "prompt"}, {"role": "assistant", "content": "answer"}]},
+      tokenizer,
+      "messages",
+  )

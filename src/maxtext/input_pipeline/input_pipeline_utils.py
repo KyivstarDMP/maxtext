@@ -16,6 +16,7 @@
 
 import dataclasses
 import json
+import os
 import warnings
 from collections.abc import Mapping
 from threading import current_thread
@@ -41,6 +42,7 @@ Features = dict[str, Any]
 INPUT_TOKENS_KEY = "input_ids"
 SFT_PINNED_CONTEXT_IDS_KEY = "sft_pinned_context_ids"
 SFT_SEGMENT_IDS_KEY = "sft_segment_ids"
+_TOOL_BODY_WARNING_PIDS = set()
 
 ########## Functions used by TFDS pipeline
 
@@ -349,6 +351,54 @@ def _get_completion_in_chat_template(tokenizer_model, round_msgs, tools=None, en
   return completion_tokens
 
 
+def validate_tool_result_bodies(tokenizer_model, tool_messages, masked_run_texts, *, mode, roles):
+  """Require ordered string-body presence within masked runs, without joining runs.
+
+  This is a textual presence check, not proof of result-region attribution:
+  quoted copies in other masked text can satisfy it. Structured bodies are not
+  covered. Each matched occurrence is consumed before the next body is sought.
+  """
+  run_index = 0
+  offset = 0
+  for result_index, message in enumerate(tool_messages):
+    body = message.get("content")
+    if not isinstance(body, str):
+      worker_pid = os.getpid()
+      if worker_pid not in _TOOL_BODY_WARNING_PIDS:
+        _TOOL_BODY_WARNING_PIDS.add(worker_pid)
+        warnings.warn(
+            "Skipping non-string tool result bodies in the masked-context presence check; "
+            "structured body preservation is not validated.",
+            UserWarning,
+            stacklevel=2,
+        )
+      continue
+    body = body.strip()
+    if not body:
+      continue
+    alternatives = {body, json.dumps(body)[1:-1]}
+    while run_index < len(masked_run_texts):
+      run = masked_run_texts[run_index]
+      matches = [
+          (position, position + len(candidate))
+          for candidate in alternatives
+          if (position := run.find(candidate, offset)) >= 0
+      ]
+      if matches:
+        _, offset = min(matches)
+        break
+      run_index += 1
+      offset = 0
+    else:
+      tokenizer_name = str(getattr(tokenizer_model, "name_or_path", type(tokenizer_model).__name__))[:200]
+      raise ValueError(
+          "Chat template dropped or altered a tool result body in masked context. "
+          f"Tokenizer: {tokenizer_name}; mode: {mode}; roles: {roles[:32]}; "
+          f"message count: {len(roles)}; result index/count: {result_index + 1}/{len(tool_messages)}; "
+          f"body length: {len(body)}."
+      )
+
+
 def _render_suffix_ids(
     tokenizer_model,
     baseline_msgs,
@@ -523,6 +573,13 @@ def _get_tool_results_and_completion_deltas(  # pylint: disable=too-many-locals
 
   delta_ids = superset_ids[len(baseline_ids) : assistant_common_len]
   completion_ids = assistant_ids[assistant_common_len:]
+  validate_tool_result_bodies(
+      tokenizer_model,
+      round_msgs[first_tool_idx:],
+      [tokenizer_model.decode(delta_ids, skip_special_tokens=False)],
+      mode="segmented",
+      roles=roles,
+  )
   return delta_ids, completion_ids
 
 
@@ -719,6 +776,13 @@ def apply_chat_template(
               enable_thinking=enable_thinking,
               boundary_name="tool-result context",
           )
+          validate_tool_result_bodies(
+              tokenizer_model,
+              round_msgs[emitted_len:],
+              [tokenizer_model.decode(pending_ids, skip_special_tokens=False)],
+              mode="segmented",
+              roles=[item.get("role") for item in round_msgs],
+          )
           append_segment(pending_ids, True)
           _, user_ids = _render_suffix_ids(
               tokenizer_model,
@@ -818,7 +882,8 @@ def apply_chat_template_with_assistant_mask(
   conversation exactly once and returns an ``assistant_masks`` array produced
   by Jinja ``{% generation %}`` blocks. The aligned token IDs and mask are then
   converted into the existing MaxText ``token_runs`` / ``is_prompt`` contract
-  without decoding or re-tokenizing.
+  without re-tokenizing. Rows containing tools decode masked runs for the
+  ordered body-presence check; this never changes token IDs or ownership.
 
   The template may use a per-message ``trainable`` boolean to suppress marker
   ownership for historical assistant turns in dataset-expanded prefixes.
@@ -907,6 +972,15 @@ def apply_chat_template_with_assistant_mask(
     assistant_mask = list(assistant_mask[0])
 
   token_runs, is_prompt = split_sft_token_stream_by_assistant_mask(input_ids, assistant_mask)
+  tool_messages = [message for message in conversation if message["role"] == "tool"]
+  if tool_messages:
+    validate_tool_result_bodies(
+        tokenizer_model,
+        tool_messages,
+        [tokenizer_model.decode(run, skip_special_tokens=False) for run, prompt in zip(token_runs, is_prompt) if prompt],
+        mode="assistant_mask",
+        roles=[message["role"] for message in conversation],
+    )
   example[data_column_name] = token_runs
   example["is_prompt"] = is_prompt
 
