@@ -542,6 +542,7 @@ def _format_chat_template_grain(
     chat_template_mode="segmented",
     sft_enable_thinking=True,
     sft_enable_thinking_column="",
+    return_segment_ids=True,
 ):
   """Grain-compatible mapping function to format raw columns into conversational messages."""
   tools_column_name = data_processing_utils.TOOLS_COLUMN if data_processing_utils.TOOLS_COLUMN in data_columns else None
@@ -590,6 +591,7 @@ def _format_chat_template_grain(
   if chat_template_mode == "assistant_mask":
     formatter = input_pipeline_utils.apply_chat_template_with_assistant_mask
 
+  formatter_kwargs = {} if chat_template_mode == "assistant_mask" else {"return_segment_ids": return_segment_ids}
   return formatter(
       element,
       tokenizer_model=tokenizer_model,
@@ -597,13 +599,19 @@ def _format_chat_template_grain(
       tools_column_name=tools_column_name,
       pin_leading_context=pin_leading_context,
       enable_thinking=enable_thinking,
+      **formatter_kwargs,
   )
 
 
 def _tokenize_sft_chunks(element, text_column_name, tokenizer_model):
   """Tokenize each chunk individually without truncating."""
   text_chunks = element[text_column_name]
-  tokenized_chunks = [tokenizer_model.encode(chunk) for chunk in text_chunks]
+  if input_pipeline_utils.SFT_SEGMENT_IDS_KEY in element:
+    tokenized_chunks = input_pipeline_utils.validate_sft_segment_ids(
+        element.pop(input_pipeline_utils.SFT_SEGMENT_IDS_KEY), element["is_prompt"], text_chunks
+    )
+  else:
+    tokenized_chunks = [tokenizer_model.encode(chunk) for chunk in text_chunks]
   pinned_ids = element.get(input_pipeline_utils.SFT_PINNED_CONTEXT_IDS_KEY, [])
   if pinned_ids and tokenized_chunks:
     input_pipeline_utils.validate_pinned_context_prefix(
@@ -736,6 +744,7 @@ def sft_preprocessing_pipeline(
           chat_template_mode=chat_template_mode,
           sft_enable_thinking=getattr(config, "sft_enable_thinking", True),
           sft_enable_thinking_column=thinking_column,
+          return_segment_ids=tokenize,
       )
   )
 

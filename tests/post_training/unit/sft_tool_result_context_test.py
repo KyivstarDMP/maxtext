@@ -14,11 +14,14 @@
 
 """Regression tests for retaining role=tool results as masked SFT context."""
 
+# pylint: disable=protected-access
+
 import copy
 
 import pytest
 
 from maxtext.input_pipeline import grain_data_processing
+from maxtext.input_pipeline import input_pipeline_utils
 from maxtext.input_pipeline.input_pipeline_utils import (
     SFT_PINNED_CONTEXT_IDS_KEY,
     SFTPromptMasking,
@@ -228,7 +231,7 @@ def _format_with_pin(messages, tokenizer=None, enable_thinking=True):
 
 
 def _tokenized_segments(tokenizer, formatted):
-  return [tokenizer.encode(segment) for segment in formatted["messages"]]
+  return grain_data_processing._tokenize_sft_chunks(copy.deepcopy(formatted), "messages", tokenizer)["messages"]
 
 
 def test_tool_result_is_emitted_once_as_masked_context_and_stream_is_token_exact():
@@ -317,13 +320,20 @@ def test_pinned_context_prefix_mismatch_has_bounded_diagnostics():
   assert len(message) < 1500
 
 
-def test_pinned_context_decode_encode_mismatch_fails_before_windowing():
+def test_pinned_context_uses_original_ids_despite_decode_encode_drift():
   messages = [
       {"role": "developer", "content": "Instructions must remain token-exact."},
       {"role": "user", "content": "Use a tool."},
       {"role": "assistant", "content": "Done."},
   ]
   tokenizer, formatted = _format_with_pin(messages, _RoundTripDriftLeadingTokenizer())
+
+  tokenized = grain_data_processing._tokenize_sft_chunks(copy.deepcopy(formatted), "messages", tokenizer)
+  assert tokenized["messages"][0][: len(formatted[SFT_PINNED_CONTEXT_IDS_KEY])] == formatted[SFT_PINNED_CONTEXT_IDS_KEY]
+  assert input_pipeline_utils.SFT_SEGMENT_IDS_KEY not in tokenized
+
+  # Legacy callers without the side column retain the fallback pin guard.
+  formatted.pop(input_pipeline_utils.SFT_SEGMENT_IDS_KEY)
 
   with pytest.raises(ValueError) as exc_info:
     grain_data_processing._tokenize_sft_chunks(formatted, "messages", tokenizer)  # pylint: disable=protected-access
@@ -432,7 +442,7 @@ def test_noncanonical_generation_prompt_suffix_is_not_added_to_assembled_stream(
   )
 
 
-def test_tool_to_user_adjacency_does_not_emit_a_second_tool_segment():
+def test_tool_to_user_adjacency_preserves_the_complete_stream_and_ownership():
   messages = [
       {"role": "system", "content": "Follow the tool result."},
       {"role": "user", "content": "Look it up."},
@@ -446,9 +456,22 @@ def test_tool_to_user_adjacency_does_not_emit_a_second_tool_segment():
       [token_id for segment in _tokenized_segments(tokenizer, formatted) for token_id in segment]
   )
 
-  assert formatted["is_prompt"] == [True, False, True, False]
+  assert formatted["is_prompt"] == [True, False, True, True, False]
   assert assembled_text.count(SENTINEL) == 1
   assert sum(SENTINEL in segment for segment in formatted["messages"]) == 1
+  assert assembled_text == tokenizer.decode(
+      tokenizer.apply_chat_template(
+          messages,
+          tools=TOOLS,
+          add_generation_prompt=False,
+          tokenize=True,
+          enable_thinking=True,
+      )
+  )
+  masked = SFTPromptMasking("messages", completion_only=True, max_target_length=4096, unk_id=0).map(
+      {"messages": _tokenized_segments(tokenizer, formatted), "is_prompt": formatted["is_prompt"]}
+  )
+  assert tokenizer.decode(masked["targets"][masked["targets"] != 0]) == "<CALL><R>The lookup succeeded.</A>"
 
 
 def test_prefix_mismatch_error_has_bounded_structural_diagnostics():
@@ -478,3 +501,130 @@ def test_template_that_ignores_tool_message_fails_instead_of_silently_dropping_i
 
   assert "Tokenizer: tool-ignoring-tokenizer" in str(exc_info.value)
   assert SENTINEL not in str(exc_info.value)
+
+
+class _DummyPrefixTokenizer(_PrefixStableToolTokenizer):
+  """Model word-initial whitespace added by standalone encoding."""
+
+  def encode(self, text):  # pylint: disable=arguments-differ
+    return super().encode((" " if text and text[0].isalpha() else "") + text)
+
+
+def test_original_segment_ids_bypass_dummy_prefix_encoding():
+  messages = _standard_round()
+  tokenizer, formatted = _format(messages, _DummyPrefixTokenizer())
+  assert tokenizer.encode(formatted["messages"][2]) != formatted[input_pipeline_utils.SFT_SEGMENT_IDS_KEY][2]
+  assembled = [i for segment in _tokenized_segments(tokenizer, formatted) for i in segment]
+  assert assembled == tokenizer.apply_chat_template(
+      messages,
+      tools=TOOLS,
+      add_generation_prompt=False,
+      tokenize=True,
+      enable_thinking=True,
+  )
+
+
+@pytest.mark.parametrize(
+    "bad_ids", [[], [[1]], [[1], [], [2], [3]], [[1], [True], [2], [3]], [[1], [1.5], [2], [3]], [[1], [-1], [2], [3]]]
+)
+def test_invalid_segment_side_column_is_rejected(bad_ids):
+  tokenizer, formatted = _format(_standard_round())
+  formatted[input_pipeline_utils.SFT_SEGMENT_IDS_KEY] = bad_ids
+  with pytest.raises(ValueError, match="sft_segment_ids"):
+    grain_data_processing._tokenize_sft_chunks(formatted, "messages", tokenizer)
+
+
+def test_carried_ids_still_validate_the_leading_pin():
+  tokenizer, formatted = _format_with_pin(_standard_round())
+  formatted[input_pipeline_utils.SFT_SEGMENT_IDS_KEY][0][0] += 1
+  with pytest.raises(ValueError, match="pinned-context mismatch"):
+    grain_data_processing._tokenize_sft_chunks(formatted, "messages", tokenizer)
+
+
+def test_hf_batched_map_carries_unequal_segment_counts_without_encoding():
+  import datasets  # pylint: disable=import-outside-toplevel
+
+  tok, first = _format(_standard_round())
+  _, second = _format([{"role": "user", "content": "Question"}, {"role": "assistant", "content": "Answer"}])
+  key = input_pipeline_utils.SFT_SEGMENT_IDS_KEY
+  rows = [{k: row[k] for k in ("messages", "is_prompt", key)} for row in (first, second)]
+
+  def never_encode(*args, **kwargs):
+    raise AssertionError("HF must consume the original IDs")
+
+  dataset = (
+      datasets.Dataset.from_list(rows)
+      .map(
+          input_pipeline_utils.tokenization,
+          batched=True,
+          batch_size=2,
+          fn_kwargs={"hf_tokenizer": never_encode, "truncation": False, "max_length": 4096, "column_names": ["messages"]},
+      )
+      .remove_columns([key])
+  )
+  assert dataset[0]["messages"] == first[key]
+  assert dataset[1]["messages"] == second[key]
+  assert key not in dataset.column_names
+  assert len(dataset[0]["messages"]) != len(dataset[1]["messages"])
+  assert tok.decode(dataset[0]["messages"][2]).startswith(SENTINEL)
+
+
+def test_string_only_formatter_does_not_expose_side_column():
+  tok = _PrefixStableToolTokenizer()
+  result = apply_chat_template(
+      {"messages": _standard_round(), "tools": TOOLS},
+      tok,
+      "messages",
+      "tools",
+      return_segment_ids=False,
+  )
+  assert input_pipeline_utils.SFT_SEGMENT_IDS_KEY not in result
+  assert all(isinstance(chunk, str) for chunk in result["messages"])
+
+
+def test_interrupted_tool_round_then_second_call_is_token_exact():
+  messages = _standard_round()[:-1] + [
+      {"role": "user", "content": "Check again."},
+      _tool_call(),
+      {"role": "tool", "content": "SECOND_RESULT", "name": "lookup"},
+      {"role": "assistant", "content": "Both checked."},
+  ]
+  tok, result = _format(messages)
+  assert [i for segment in _tokenized_segments(tok, result) for i in segment] == tok.apply_chat_template(
+      messages,
+      tools=TOOLS,
+      add_generation_prompt=False,
+      tokenize=True,
+      enable_thinking=True,
+  )
+  masked = SFTPromptMasking("messages", completion_only=True, max_target_length=4096, unk_id=0).map(
+      {"messages": _tokenized_segments(tok, result), "is_prompt": result["is_prompt"]}
+  )
+  assert tok.decode(masked["targets"][masked["targets"] != 0]) == "<CALL><R><CALL><R>Both checked.</A>"
+
+
+class _UserSpeculativeTokenizer(_PrefixStableToolTokenizer):
+  """Keep the existing no-think speculative prefix at each user boundary."""
+
+  def _render(self, messages, add_generation_prompt, tools, enable_thinking):
+    text = super()._render(messages, add_generation_prompt, tools, enable_thinking)
+    return text + ("§SPEC§" if add_generation_prompt and not enable_thinking else "")
+
+
+def test_no_think_user_prompts_keep_both_speculative_insertions():
+  messages = _standard_round()[:-1] + [
+      {"role": "user", "content": "Next question."},
+      {"role": "assistant", "content": "Answer."},
+  ]
+  tok, result = _format(messages, _UserSpeculativeTokenizer(), enable_thinking=False)
+  expected = (
+      "<B><D>Follow the tool result.<TOOLS></D><U>Look it up.</U><A>§SPEC§<CALL><R>"
+      + SENTINEL
+      + "</R><U>Next question.</U><A>§SPEC§Answer.</A>"
+  )
+  assert [i for segment in _tokenized_segments(tok, result) for i in segment] == tok.encode(expected)
+  assert result["is_prompt"] == [True, False, True, True, False]
+  # Direct tool->assistant continuation still trims speculative prompt tokens.
+  _, direct = _format(_standard_round(), _UserSpeculativeTokenizer(), enable_thinking=False)
+  assert "§SPEC§" in direct["messages"][0]
+  assert all("§SPEC§" not in text for text in direct["messages"][1:])
