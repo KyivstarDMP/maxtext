@@ -17,6 +17,8 @@
 # pylint: disable=protected-access
 
 import copy
+import json
+import os
 
 import pytest
 
@@ -628,3 +630,133 @@ def test_no_think_user_prompts_keep_both_speculative_insertions():
   _, direct = _format(_standard_round(), _UserSpeculativeTokenizer(), enable_thinking=False)
   assert "§SPEC§" in direct["messages"][0]
   assert all("§SPEC§" not in text for text in direct["messages"][1:])
+
+
+class _BodyDroppingTokenizer(_PrefixStableToolTokenizer):
+  """Retain response delimiters while dropping all or later result bodies."""
+
+  def __init__(self, keep_first=False):
+    super().__init__()
+    self.keep_first = keep_first
+
+  def _render(self, messages, add_generation_prompt, tools, enable_thinking):
+    messages = copy.deepcopy(messages)
+    result_count = 0
+    for message in messages:
+      if message["role"] == "tool":
+        if not self.keep_first or result_count:
+          message["content"] = ""
+        result_count += 1
+    return super()._render(messages, add_generation_prompt, tools, enable_thinking)
+
+
+@pytest.mark.parametrize("next_role", ["assistant", "user"])
+@pytest.mark.parametrize("keep_first", [False, True])
+def test_missing_tool_bodies_fail_at_both_segmented_boundaries(next_role, keep_first):
+  results = [{"role": "tool", "content": body} for body in (SENTINEL, "SECOND_PRIVATE_BODY")]
+  messages = _standard_round(results)
+  if next_role == "user":
+    messages.insert(-1, {"role": "user", "content": "Continue."})
+  with pytest.raises(ValueError, match="dropped or altered a tool result body") as exc_info:
+    _format(messages, _BodyDroppingTokenizer(keep_first))
+  diagnostic = str(exc_info.value)
+  assert f"result index/count: {2 if keep_first else 1}/2" in diagnostic
+  assert "body length:" in diagnostic
+  assert len(diagnostic) < 1000
+  assert all(result["content"] not in diagnostic for result in results)
+
+
+@pytest.mark.parametrize("next_role", ["assistant", "user"])
+def test_identical_tool_bodies_need_two_distinct_occurrences(next_role):
+  messages = _standard_round([{"role": "tool", "content": SENTINEL} for _ in range(2)])
+  if next_role == "user":
+    messages.insert(-1, {"role": "user", "content": "Continue."})
+  _, result = _format(messages)
+  assert sum(text.count(SENTINEL) for text in result["messages"]) == 2
+  with pytest.raises(ValueError, match="result index/count: 2/2"):
+    _format(messages, _BodyDroppingTokenizer(keep_first=True))
+
+
+class _JsonEscapedBodyTokenizer(_PrefixStableToolTokenizer):
+
+  def _render(self, messages, add_generation_prompt, tools, enable_thinking):
+    messages = copy.deepcopy(messages)
+    for message in messages:
+      if message["role"] == "tool":
+        message["content"] = json.dumps(message["content"].strip())[1:-1]
+    return super()._render(messages, add_generation_prompt, tools, enable_thinking)
+
+
+@pytest.mark.parametrize("escaped", [False, True])
+def test_whitespace_and_unicode_string_bodies_accept_supported_serialization(escaped):
+  body = '  Kyiv: "ясно"\nnext line  '
+  tokenizer = _JsonEscapedBodyTokenizer() if escaped else _PrefixStableToolTokenizer()
+  _format(_standard_round([{"role": "tool", "content": body}]), tokenizer)
+
+
+def test_structured_tool_bodies_are_skipped_with_one_warning_per_worker(monkeypatch):
+  monkeypatch.setattr(input_pipeline_utils, "_TOOL_BODY_WARNING_PIDS", set())
+  messages = _standard_round([{"role": "tool", "content": {"value": 1}}, {"role": "tool", "content": [2]}])
+  with pytest.warns(UserWarning, match="Skipping non-string tool result bodies") as captured:
+    _format(messages)
+    _format(messages)
+  assert len(captured) == 1
+
+
+@pytest.mark.parametrize(
+    "bodies,runs,valid",
+    [
+        (["one", "two"], ["one then two"], True),
+        (["one", "two"], ["two then one"], False),
+        (["same", "same"], ["same", "same"], True),
+        (["same", "same"], ["same"], False),
+        (["result"], ["res", "ult"], False),
+        (["  ", "result"], ["result"], True),
+    ],
+)
+def test_body_presence_search_consumes_occurrences_in_stream_order(bodies, runs, valid):
+  args = (_PrefixStableToolTokenizer(), [{"content": body} for body in bodies], runs)
+  if valid:
+    input_pipeline_utils.validate_tool_result_bodies(*args, mode="test", roles=["tool"] * len(bodies))
+  else:
+    with pytest.raises(ValueError, match="dropped or altered a tool result body"):
+      input_pipeline_utils.validate_tool_result_bodies(*args, mode="test", roles=["tool"] * len(bodies))
+
+
+@pytest.mark.skipif(os.environ.get("MAXTEXT_RUN_NETWORK_TESTS") != "1", reason="network integration is opt-in")
+@pytest.mark.parametrize("next_role", ["assistant", "user"])
+def test_public_smol_template_preserves_string_tool_bodies(next_role):
+  from transformers import AutoTokenizer  # pylint: disable=import-outside-toplevel
+
+  tokenizer = AutoTokenizer.from_pretrained(
+      "HuggingFaceTB/SmolLM3-3B",
+      revision="a07cc9a04f16550a088caea529712d1d335b0ac1",
+      add_bos_token=False,
+      add_eos_token=False,
+  )
+  messages = _standard_round(
+      [
+          {"role": "tool", "name": "lookup", "content": '  First "quoted" result  '},
+          {"role": "tool", "name": "lookup", "content": "Kyiv: ясно\nSecond line"},
+      ]
+  )
+  if next_role == "user":
+    messages.insert(-1, {"role": "user", "content": "Now explain it."})
+  _, formatted = _format(messages, tokenizer)
+  expected = input_pipeline_utils.extract_token_ids(
+      tokenizer.apply_chat_template(
+          messages,
+          tools=TOOLS,
+          tokenize=True,
+          add_generation_prompt=False,
+          enable_thinking=True,
+      )
+  )
+  assert [token for run in _tokenized_segments(tokenizer, formatted) for token in run] == expected
+  canonical = input_pipeline_utils.apply_chat_template_with_assistant_mask(
+      {"messages": copy.deepcopy(messages), "tools": TOOLS},
+      tokenizer,
+      "messages",
+      "tools",
+  )
+  assert [token for run in canonical["messages"] for token in run] == expected
