@@ -571,6 +571,49 @@ def test_hf_batched_map_carries_unequal_segment_counts_without_encoding():
   assert tok.decode(dataset[0]["messages"][2]).startswith(SENTINEL)
 
 
+@pytest.mark.parametrize("completion_only", [True, False])
+def test_single_row_tokenization_carries_ids_without_encoding(completion_only):
+  tokenizer, formatted = _format(_standard_round(), _DummyPrefixTokenizer())
+  key = input_pipeline_utils.SFT_SEGMENT_IDS_KEY
+  original_ids = copy.deepcopy(formatted[key])
+  original_flags = list(formatted["is_prompt"])
+
+  def never_encode(*args, **kwargs):
+    raise AssertionError("Single-row tokenization must consume the original IDs")
+
+  tokenized = input_pipeline_utils.tokenization(formatted, never_encode, False, 4096, ["messages"])
+  assert tokenized["messages"] == original_ids
+  assert tokenized[key] == original_ids
+  assert tokenized["is_prompt"] == original_flags
+  masked = SFTPromptMasking("messages", completion_only=completion_only, max_target_length=4096, unk_id=0).map(tokenized)
+  expected_loss = [
+      token for ids, prompt in zip(original_ids, original_flags) if not completion_only or not prompt for token in ids
+  ]
+  assert masked["targets"][masked["targets"] != 0].tolist() == expected_loss
+  assert tokenizer.decode(expected_loss)
+
+
+@pytest.mark.parametrize("batched", [False, True])
+@pytest.mark.parametrize("bad_ids", [[], [[1], [], [2], [3]]])
+def test_tokenization_rejects_invalid_carried_ids_in_both_shapes(batched, bad_ids):
+  tokenizer, formatted = _format(_standard_round())
+  formatted[input_pipeline_utils.SFT_SEGMENT_IDS_KEY] = bad_ids
+  if batched:
+    formatted = {key: [value] for key, value in formatted.items()}
+  with pytest.raises(ValueError, match="sft_segment_ids"):
+    input_pipeline_utils.tokenization(formatted, tokenizer, False, 4096, ["messages"])
+
+
+@pytest.mark.parametrize("next_role", ["assistant", "user"])
+def test_leading_tool_is_rejected_consistently_before_either_boundary(next_role):
+  messages = [{"role": "tool", "content": SENTINEL}, {"role": next_role, "content": "Next."}]
+  if next_role == "user":
+    messages.append({"role": "assistant", "content": "Answer."})
+  with pytest.raises(ValueError) as exc_info:
+    _format(messages)
+  assert str(exc_info.value) == "Tool message at index 0 with no preceding context."
+
+
 def test_string_only_formatter_does_not_expose_side_column():
   tok = _PrefixStableToolTokenizer()
   result = apply_chat_template(
@@ -697,10 +740,17 @@ def test_whitespace_and_unicode_string_bodies_accept_supported_serialization(esc
 def test_structured_tool_bodies_are_skipped_with_one_warning_per_worker(monkeypatch):
   monkeypatch.setattr(input_pipeline_utils, "_TOOL_BODY_WARNING_PIDS", set())
   messages = _standard_round([{"role": "tool", "content": {"value": 1}}, {"role": "tool", "content": [2]}])
-  with pytest.warns(UserWarning, match="Skipping non-string tool result bodies") as captured:
-    _format(messages)
-    _format(messages)
+  captured = []
+  monkeypatch.setattr(input_pipeline_utils.max_logging, "warning", captured.append)
+  monkeypatch.setattr(input_pipeline_utils.os, "getpid", lambda: 101)
+  _format(messages)
+  _format(messages)
   assert len(captured) == 1
+  assert "Skipping non-string tool result bodies" in captured[0]
+  # A new worker must warn even if it inherited the first worker's set.
+  monkeypatch.setattr(input_pipeline_utils.os, "getpid", lambda: 202)
+  _format(messages)
+  assert captured == [captured[0], captured[0]]
 
 
 @pytest.mark.parametrize(

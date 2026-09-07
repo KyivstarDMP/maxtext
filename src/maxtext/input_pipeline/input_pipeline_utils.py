@@ -366,11 +366,9 @@ def validate_tool_result_bodies(tokenizer_model, tool_messages, masked_run_texts
       worker_pid = os.getpid()
       if worker_pid not in _TOOL_BODY_WARNING_PIDS:
         _TOOL_BODY_WARNING_PIDS.add(worker_pid)
-        warnings.warn(
+        max_logging.warning(
             "Skipping non-string tool result bodies in the masked-context presence check; "
-            "structured body preservation is not validated.",
-            UserWarning,
-            stacklevel=2,
+            "structured body preservation is not validated."
         )
       continue
     body = body.strip()
@@ -818,6 +816,8 @@ def apply_chat_template(
         append_segment(extract_token_ids(prompt_in_chat_template), True)
         emitted_len = len(round_msgs)
       elif message["role"] == "tool":
+        if not round_msgs:
+          raise ValueError(f"Tool message at index {idx} with no preceding context.")
         round_msgs.append(message)
       elif message["role"] == "assistant":
         if not round_msgs:
@@ -1030,7 +1030,7 @@ def validate_sft_segment_ids(segment_ids, is_prompt, text_chunks):
 
 
 def tokenization(example, hf_tokenizer, truncation, max_length, column_names):
-  """Tokenize a HuggingFace dataset"""
+  """Tokenize a Hugging Face row or batch, preserving carried SFT token IDs."""
   if SFT_SEGMENT_IDS_KEY in example:
     if len(column_names) != 1:
       raise ValueError("sft_segment_ids requires exactly one conversational text column.")
@@ -1038,6 +1038,11 @@ def tokenization(example, hf_tokenizer, truncation, max_length, column_names):
     rows = example[SFT_SEGMENT_IDS_KEY]
     prompts = example["is_prompt"]
     texts = example[column_name]
+    # Dataset.map uses batches, while direct formatter callers may pass one row.
+    # Inspect the prompt axis once; both shapes use the same ID validator.
+    if prompts and isinstance(prompts[0], (bool, np.bool_)):
+      example[column_name] = validate_sft_segment_ids(rows, prompts, texts)
+      return example
     if len(rows) != len(prompts) or len(rows) != len(texts):
       raise ValueError("sft_segment_ids batch must align with text and is_prompt rows.")
     example[column_name] = [
