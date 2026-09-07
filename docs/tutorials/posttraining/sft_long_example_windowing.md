@@ -176,7 +176,9 @@ Windowing and leading-context pinning require tokenized, completion-only Grain
 SFT. Both segmented and assistant-mask formatters emit the shared token-run
 contract used by the window transform:
 
-- segmented mode validates the pin across its later decode/tokenize boundary;
+- segmented mode validates the pin against the carried IDs of segment zero
+  before windowing; it does not re-encode the decoded chunk. Legacy callers
+  without `sft_segment_ids` retain the encode-and-validate fallback;
 - assistant-mask mode carries tokenizer-produced IDs end to end and validates
   the pin against the full canonical stream.
 

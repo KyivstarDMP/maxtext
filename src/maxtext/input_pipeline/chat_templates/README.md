@@ -82,6 +82,40 @@ declare this non-rendering comment:
 
 MaxText then fails unless `sft_chat_template_mode=assistant_mask` is selected.
 
+## Tool-result body validation
+
+Ordered textual presence: for every `tool` message whose `content` is a string,
+the stripped body (or its JSON-escaped form) occurs, in message order, inside
+**some masked run** of the row, searched in stream order without stitching text
+across run boundaries. All masked runs are eligible, including those before the
+first loss-bearing run: prefix-expanded rows with `trainable:false` history
+legitimately carry results there. Non-string bodies are skipped with one
+warning per worker.
+
+Stated non-guarantees (false passes that remain possible): any user or system
+text quoting the result body (before or after the call) satisfies the check even
+if the template drops the real result; a body that also appears in a loss-bearing
+run (the check finds the masked copy and cannot tell which is the rendered
+result); attribution when identical bodies repeat; preservation of structured
+bodies; absence of extra template text. Positional proof would need
+template-owned result-region boundaries, which the generic path does not have.
+Use a template-specific oracle when that stronger guarantee is required.
+
+The check is always on in both rendering modes. In segmented mode it searches
+the emitted tool-result delta before an assistant or a user; in `assistant_mask`
+mode it searches every decoded masked run of the full row. Each occurrence is
+consumed before searching for the next body, so repeated identical bodies need
+separate matches. Empty-after-strip strings are skipped. Supported string forms
+are `body.strip()` verbatim or `json.dumps(body.strip())[1:-1]`; templates using
+other serialization must be made compatible before using this check.
+
+Validation runs during formatting, before truncation or windowing, and does not
+prove that every later window retains each result. A miss raises a bounded
+`ValueError` identifying the tokenizer, mode, roles, result index/count and body
+length, without including the body. There is no startup probe: a streaming
+dataset can encounter its first invalid tool row after training has progressed.
+Validate the corpus with the intended template before submitting it.
+
 ## Training and serving variants
 
 A serving template defines the prefix used at an online generation frontier. A
