@@ -357,6 +357,7 @@ def preprocessing_pipeline(
             "data_column_name": data_column_names[0],
             "tools_column_name": tools_column_name,
             "enable_thinking": sft_enable_thinking,
+            "return_segment_ids": tokenize,
         },
     )
     if tools_column_name:
@@ -375,6 +376,8 @@ def preprocessing_pipeline(
             "column_names": data_column_names,
         },
     )
+    if use_sft:
+      dataset = dataset.remove_columns([input_pipeline_utils.SFT_SEGMENT_IDS_KEY])
 
   dataset = input_pipeline_utils.HFDataSource(
       dataset,
