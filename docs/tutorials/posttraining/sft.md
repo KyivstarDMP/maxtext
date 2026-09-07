@@ -174,7 +174,31 @@ sft_train_on_completion_only: true
 sft_chat_template_mode: assistant_mask
 ```
 
-The default `segmented` mode remains available for compatible templates.
+The default `segmented` mode remains available for compatible templates. Its
+Grain and Hugging Face paths carry the original rendered token IDs through an
+internal `sft_segment_ids` column, aligned with the decoded strings and
+`is_prompt` flags. Tokenization consumes those IDs and removes the side column;
+it does not encode the decoded chunks again. String-only (`tokenize=False`)
+paths do not expose this column. Legacy callers without the column still encode
+strings.
+
+Segmented rendering restarts its round after an assistant followed by a new user.
+That next round replays the template's BOS and leading system/developer/tools
+context. Within one round, tool results are emitted once as a masked suffix.
+At a tool-to-user boundary, the pending result suffix and the new user prompt
+suffix are separate masked segments; earlier tokens are not replayed there.
+This per-round contract differs from rendering one full multi-turn conversation
+in `assistant_mask` mode.
+
+One existing exception remains: every emitted user generation prompt, including
+both the first user and a user after tools, can contain speculative template
+tokens absent from the canonical completed-round render. For example, a
+no-think serving template may insert an empty thought channel. An interrupted
+tool round can therefore retain two such insertions. Carrying original IDs
+prevents re-encoding drift but does not change this token selection. The existing
+longest-common-prefix completion boundary and trimming of speculative tokens in
+direct tool-to-assistant continuations remain unchanged.
+
 `assistant_mask` is Grain-only and requires a generation-marked template. For
 the complete ownership, tools, thinking-mode, and validation contract, see
 [Canonical Gemma 4 SFT rendering](gemma4_sft_canonical_rendering.md) and the
