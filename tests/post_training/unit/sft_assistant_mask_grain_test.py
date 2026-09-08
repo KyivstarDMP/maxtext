@@ -23,6 +23,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
+from maxtext.configs.types import FineTuning
 from maxtext.input_pipeline import data_processing_utils
 from maxtext.input_pipeline import grain_data_processing
 from maxtext.input_pipeline import hf_data_processing
@@ -101,6 +102,7 @@ def _config(**overrides):
       "sft_train_on_completion_only": True,
       "sft_enable_thinking": True,
       "sft_enable_thinking_column": "",
+      "sft_preserve_thinking": "auto",
   }
   values.update(overrides)
   return SimpleNamespace(**values)
@@ -144,6 +146,84 @@ def test_interleaved_rows_pass_their_own_thinking_mode():
 
   assert [call["enable_thinking"] for call in tokenizer.calls] == [False, True, False]
   assert [call["preserve_thinking"] for call in tokenizer.calls] == [False, True, False]
+
+
+class _PreservationTokenizer(_AssistantMaskTokenizer):
+  """Make both the pin and a historical token depend on preservation."""
+
+  def apply_chat_template(self, messages, **kwargs):
+    self.calls.append(copy.deepcopy(kwargs))
+    preserve = kwargs["preserve_thinking"]
+    assert type(preserve) is bool  # pylint: disable=unidiomatic-typecheck
+    prefix = 10 if preserve else 20
+    if kwargs.get("return_assistant_tokens_mask"):
+      # Token 42 is optional masked history; the rest of the ownership is fixed.
+      ids = [prefix, 2] + ([42] if preserve else []) + INPUT_IDS[2:]
+      mask = [0, 0] + ([0] if preserve else []) + ASSISTANT_MASK[2:]
+      return {"input_ids": ids, "assistant_masks": mask}
+    if len(messages) == 1 and messages[0]["role"] == "developer":
+      return [prefix]
+    return [prefix, 2]
+
+
+@pytest.mark.parametrize("setting", ["auto", False, True])
+@pytest.mark.parametrize("leading", ["developer", "tools-only", "generated"])
+def test_canonical_preservation_is_resolved_per_row_and_shared_with_every_pin_render(setting, leading):
+  tokenizer = _PreservationTokenizer()
+  for thinking in (False, True, False):
+    messages = copy.deepcopy(MESSAGES if leading == "developer" else MESSAGES[1:])
+    row = {"messages": messages, "enable_thinking": thinking}
+    columns = ["messages", "enable_thinking"]
+    if leading != "generated":
+      row["tools"] = copy.deepcopy(TOOLS)
+      columns.append("tools")
+    tokenizer.calls.clear()
+    formatted = grain_data_processing._format_chat_template_grain(
+        row,
+        data_columns=columns,
+        tokenizer_model=tokenizer,
+        pin_leading_context=True,
+        chat_template_mode="assistant_mask",
+        sft_enable_thinking_column="enable_thinking",
+        sft_preserve_thinking=setting,
+    )
+    expected = thinking if setting == "auto" else setting
+    expected_prefix = 10 if expected else 20
+    ids = [token for run in formatted["messages"] for token in run]
+    assert ids == [expected_prefix, 2] + ([42] if expected else []) + INPUT_IDS[2:]
+    assert formatted[input_pipeline_utils.SFT_PINNED_CONTEXT_IDS_KEY] == [expected_prefix]
+    assert [
+        token for run, prompt in zip(formatted["messages"], formatted["is_prompt"]) if not prompt for token in run
+    ] == [101, 102, 201, 202]
+    assert len(tokenizer.calls) == 3  # full conversation, first prompt, leading block
+    assert all(call["enable_thinking"] is thinking for call in tokenizer.calls)
+    assert all(call["preserve_thinking"] is expected for call in tokenizer.calls)
+
+
+@pytest.mark.parametrize("setting", ["auto", False, True])
+def test_preservation_config_accepts_auto_and_boolean_overrides(setting):
+  config = FineTuning(sft_preserve_thinking=setting)
+  assert config.sft_preserve_thinking == setting
+  assert type(config.sft_preserve_thinking) is type(setting)
+
+
+@pytest.mark.parametrize("setting", [None, "unknown", 2])
+def test_preservation_config_rejects_invalid_settings(setting):
+  with pytest.raises(ValueError, match="sft_preserve_thinking"):
+    FineTuning(sft_preserve_thinking=setting)
+
+
+@pytest.mark.parametrize("mode", ["segmented", "assistant_mask"])
+@pytest.mark.parametrize("setting", [None, "false", 1])
+def test_direct_formatter_rejects_unresolved_preservation_settings(mode, setting):
+  with pytest.raises(ValueError, match="sft_preserve_thinking must be 'auto' or an actual boolean"):
+    grain_data_processing._format_chat_template_grain(
+        {"messages": copy.deepcopy(MESSAGES[:2])},
+        data_columns=["messages"],
+        tokenizer_model=object(),
+        chat_template_mode=mode,
+        sft_preserve_thinking=setting,
+    )
 
 
 def test_grain_formatter_defaults_to_segmented_mode(monkeypatch):

@@ -1853,6 +1853,14 @@ class FineTuning(BaseModel):
           "When set, it overrides sft_enable_thinking for every row."
       ),
   )
+  sft_preserve_thinking: bool | Literal["auto"] = Field(
+      "auto",
+      description=(
+          "Historical-reasoning policy passed to SFT chat templates. 'auto' follows each row's "
+          "enable_thinking in assistant_mask mode and omits preserve_thinking in segmented mode. "
+          "An explicit boolean is passed to every render in either mode; the template defines what it preserves."
+      ),
+  )
   sft_long_example_handling: Literal["truncate", "window"] = Field(
       "truncate",
       description=(
@@ -1879,6 +1887,7 @@ class FineTuning(BaseModel):
   )
   sft_window_max_fan_out: int = Field(
       32,
+      ge=1,
       description="For 'window': hard cap on records emitted per example (runaway guard).",
   )
   sft_window_pin_leading_context: bool = Field(

@@ -179,6 +179,40 @@ class InstructionDataProcessingTest(unittest.TestCase):
         token="test-token",
     )
 
+  def test_local_and_hub_jinja2_templates_use_original_suffix_and_verify_sha(self):
+    template_bytes = b"{% generation %}answer{% endgeneration %}"
+    digest = hashlib.sha256(template_bytes).hexdigest()
+    with tempfile.TemporaryDirectory() as tmpdir:
+      # Hub downloads can resolve to an extensionless blob path.
+      for hub in (False, True):
+        with self.subTest(hub=hub):
+          downloaded_path = os.path.join(tmpdir, "blob" if hub else "template.jinja2")
+          with open(downloaded_path, "wb") as template_file:
+            template_file.write(template_bytes)
+          path = "hf://example-org/example-model/template.jinja2" if hub else downloaded_path
+          with patch.object(instruction_data_processing, "hf_hub_download", return_value=downloaded_path):
+            self.assertEqual(
+                instruction_data_processing.load_chat_template_from_file(path, expected_sha256=digest),
+                template_bytes.decode("utf-8"),
+            )
+            with self.assertRaisesRegex(ValueError, "SHA-256 mismatch"):
+              instruction_data_processing.load_chat_template_from_file(path, expected_sha256="0" * 64)
+
+  def test_existing_template_with_unsupported_suffix_has_specific_error(self):
+    with tempfile.TemporaryDirectory() as tmpdir:
+      for hub in (False, True):
+        with self.subTest(hub=hub):
+          downloaded_path = os.path.join(tmpdir, "blob" if hub else "template.unsupported")
+          with open(downloaded_path, "w", encoding="utf-8") as template_file:
+            template_file.write("template")
+          path = "hf://example-org/example-model/template.unsupported" if hub else downloaded_path
+          with patch.object(instruction_data_processing, "hf_hub_download", return_value=downloaded_path):
+            with self.assertRaisesRegex(ValueError, "Unsupported chat template file extension '.unsupported'"):
+              instruction_data_processing.load_chat_template_from_file(path)
+      self.assertIsNone(
+          instruction_data_processing.load_chat_template_from_file(os.path.join(tmpdir, "missing.unsupported"))
+      )
+
   def test_load_chat_template_normalizes_empty_hub_options_to_none(self):
     with tempfile.TemporaryDirectory() as tmpdir:
       downloaded_path = os.path.join(tmpdir, "chat_template.jinja")

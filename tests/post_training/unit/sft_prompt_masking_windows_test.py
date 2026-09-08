@@ -23,6 +23,7 @@ pytestmark = [pytest.mark.post_training, pytest.mark.cpu_only]
 
 import numpy as np
 
+from maxtext.configs.types import FineTuning
 from maxtext.input_pipeline import input_pipeline_utils
 from maxtext.input_pipeline.input_pipeline_utils import (
     SFT_PINNED_CONTEXT_IDS_KEY,
@@ -33,6 +34,28 @@ from maxtext.input_pipeline.input_pipeline_utils import (
 
 PAD = 0
 EOT = 129  # stand-in for <end_of_turn>
+
+
+@pytest.mark.parametrize("cap", [0, -1])
+def test_window_fanout_must_be_positive_in_config_and_direct_transform(cap):
+  with pytest.raises(ValueError, match="sft_window_max_fan_out"):
+    FineTuning(sft_window_max_fan_out=cap)
+  with pytest.raises(ValueError, match="sft_window_max_fan_out must be at least 1"):
+    SFTPromptMaskingWindows("text", completion_only=True, max_target_length=8, max_fan_out=cap)
+
+
+def test_window_fanout_one_keeps_short_rows_and_caps_long_rows(monkeypatch):
+  cap = FineTuning(sft_window_max_fan_out=1).sft_window_max_fan_out
+  transform = SFTPromptMaskingWindows("text", completion_only=True, max_target_length=8, max_fan_out=cap)
+  short = transform.flat_map({"text": [[1, 2], [3, EOT]], "is_prompt": [True, False]})
+  assert len(short) == 1
+  assert _loss_tokens(short[0]) == [3, EOT]
+  logs = []
+  monkeypatch.setattr(input_pipeline_utils.max_logging, "log", logs.append)
+  long = transform.flat_map({"text": [[1, 2], list(range(100, 120)) + [EOT]], "is_prompt": [True, False]})
+  assert len(long) == 1
+  assert _loss_tokens(long[0]) == list(range(100, 106))
+  assert any("hit max_fan_out=1" in line for line in logs)
 
 
 def _loss_tokens(record):

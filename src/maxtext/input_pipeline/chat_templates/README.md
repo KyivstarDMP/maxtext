@@ -20,8 +20,10 @@ MaxText can use the chat template already stored in a Hugging Face tokenizer,
 an inline `chat_template`, or a separate file selected by
 `chat_template_path`.
 
-Local files may be Jinja/text files or JSON objects containing a
-`chat_template` field. A Hub-hosted file uses this form:
+Local and Hub files may use `.jinja`, `.jinja2`, `.j2`, or `.txt`, or be `.json`
+objects containing a `chat_template` field. An existing file with an unsupported
+extension raises an error naming that extension. A Hub-hosted file uses this
+form:
 
 ```yaml
 chat_template_path: hf://example-org/example-model/templates/training.jinja

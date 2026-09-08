@@ -102,7 +102,7 @@ def load_chat_template_from_file(
     )
   max_logging.log(f"chat_template sha256={template_sha256} path={template_path} revision={requested_revision}")
 
-  if asset_path.endswith((".jinja", ".j2", ".txt")):
+  if asset_path.endswith((".jinja", ".jinja2", ".j2", ".txt")):
     return template_bytes.decode("utf-8")
 
   if asset_path.endswith(".json"):
@@ -112,8 +112,12 @@ def load_chat_template_from_file(
         return template_config["chat_template"]
     except (UnicodeDecodeError, json.JSONDecodeError):
       return None
+    return None
 
-  return None
+  raise ValueError(
+      f"Unsupported chat template file extension {os.path.splitext(asset_path)[1]!r}. "
+      "Supported extensions: .jinja, .jinja2, .j2, .txt, .json."
+  )
 
 
 def get_template_placeholders(template):

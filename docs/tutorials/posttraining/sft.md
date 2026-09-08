@@ -182,6 +182,16 @@ it does not encode the decoded chunks again. String-only (`tokenize=False`)
 paths do not expose this column. Legacy callers without the column still encode
 strings.
 
+Segmented SFT rejects rows with no nonempty assistant completion segment, even
+when `sft_train_on_completion_only=false`. This is an SFT input requirement,
+independent of whether prompt tokens also receive loss. An empty-content
+assistant remains valid when the template emits supervised closing tokens;
+empty completions are also allowed alongside a nonempty completion in the row.
+Trailing tool results must eventually be followed by an assistant or user so
+their context can be emitted. A row ending in unemitted results raises instead
+of silently discarding them. Terminal assistant calls without a recorded result
+remain supported.
+
 Segmented rendering restarts its round after an assistant followed by a new user.
 That next round replays the template's BOS and leading system/developer/tools
 context. Within one round, tool results are emitted once as a masked suffix.
@@ -198,6 +208,14 @@ tool round can therefore retain two such insertions. Carrying original IDs
 prevents re-encoding drift but does not change this token selection. The existing
 longest-common-prefix completion boundary and trimming of speculative tokens in
 direct tool-to-assistant continuations remain unchanged.
+
+`sft_preserve_thinking=auto` omits the preservation argument in segmented mode
+and follows each row's thinking value in canonical mode. An explicit boolean
+is passed to every render in either mode, including prefix and pin renders.
+The template decides which historical reasoning it retains. A segmented
+tool-to-user boundary can fail if adding the user makes earlier call reasoning
+disappear; explicit preservation can resolve that seam for compatible
+templates. See the thinking-mode contract below for the exact scope.
 
 `assistant_mask` is Grain-only and requires a generation-marked template. For
 the complete ownership, tools, thinking-mode, and validation contract, see

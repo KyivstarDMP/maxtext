@@ -543,6 +543,7 @@ def _format_chat_template_grain(
     sft_enable_thinking=True,
     sft_enable_thinking_column="",
     return_segment_ids=True,
+    sft_preserve_thinking="auto",
 ):
   """Grain-compatible mapping function to format raw columns into conversational messages."""
   tools_column_name = data_processing_utils.TOOLS_COLUMN if data_processing_utils.TOOLS_COLUMN in data_columns else None
@@ -599,6 +600,7 @@ def _format_chat_template_grain(
       tools_column_name=tools_column_name,
       pin_leading_context=pin_leading_context,
       enable_thinking=enable_thinking,
+      preserve_thinking=sft_preserve_thinking,
       **formatter_kwargs,
   )
 
@@ -745,6 +747,7 @@ def sft_preprocessing_pipeline(
           sft_enable_thinking=getattr(config, "sft_enable_thinking", True),
           sft_enable_thinking_column=thinking_column,
           return_segment_ids=tokenize,
+          sft_preserve_thinking=getattr(config, "sft_preserve_thinking", "auto"),
       )
   )
 
