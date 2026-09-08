@@ -56,7 +56,8 @@ The Hugging Face SFT pipeline rejects `assistant_mask`; keep its default
 
 ## Ownership contract
 
-For the canonical stream, MaxText calls the tokenizer once with:
+For the canonical stream, MaxText calls the tokenizer once with the preservation
+policy resolved as described under Thinking mode:
 
 ```python
 tokenizer.apply_chat_template(
@@ -67,7 +68,7 @@ tokenizer.apply_chat_template(
     return_dict=True,
     return_assistant_tokens_mask=True,
     enable_thinking=enable_thinking,
-    preserve_thinking=enable_thinking,
+    preserve_thinking=resolved_preserve_thinking,
 )
 ```
 
@@ -104,11 +105,39 @@ templates may use generation blocks while remaining valid in segmented mode.
 
 `sft_enable_thinking` supplies one boolean for every row. For a mixed dataset,
 set `sft_enable_thinking_column` to the name of a required per-row boolean
-column. Grain validates actual booleans and passes the selected value as both
-`enable_thinking` and `preserve_thinking` for the complete render.
+column. Grain validates actual booleans and passes the selected value as
+the row's `enable_thinking` and, by default in canonical mode,
+`preserve_thinking`.
+
+`sft_preserve_thinking` independently controls the template's historical
+reasoning policy. It accepts `auto` (the default), `true`, or `false`:
+
+| Setting          | Canonical (`assistant_mask`)           | Segmented                                  |
+| ---------------- | -------------------------------------- | ------------------------------------------ |
+| `auto`           | Pass the row's `enable_thinking` value | Omit the kwarg; use the template's default |
+| `true` / `false` | Pass the explicit boolean              | Pass the explicit boolean                  |
+
+MaxText resolves the policy separately for each row and uses it for every full,
+prefix, suffix and leading-pin render. It does not change shared tokenizer
+state. For example, `sft_enable_thinking=true` with
+`sft_preserve_thinking=false` permits current reasoning while asking the
+template not to preserve historical reasoning.
+
+The template defines which reasoning this flag affects. A template may retain
+historical tool-call reasoning while still removing reasoning from ordinary
+historical answers. The flag does not make segmented and canonical token
+streams equivalent.
+
+In segmented mode, a reasoning-bearing call followed by a tool result and a
+new user can fail the tool-to-user prefix check if the template removes that
+call's now-historical reasoning. `auto` retains this fail-loud behavior for
+templates whose default removes it. Explicit `true` can make that boundary
+prefix-stable when the template supports preserving the call reasoning; this
+is not a guarantee for every template or conversation shape.
 
 Do not use the per-row column with the Hugging Face SFT pipeline; that pipeline
-supports only the constant setting.
+supports only the constant thinking setting. It supports
+`sft_preserve_thinking` under the segmented policy above.
 
 ## Tools and tool results
 

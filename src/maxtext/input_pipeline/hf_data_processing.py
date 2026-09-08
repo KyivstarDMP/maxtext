@@ -244,6 +244,7 @@ def preprocessing_pipeline(
     chat_template: Optional[str] = None,
     formatting_func_path: Optional[str] = None,
     formatting_func_kwargs: Optional[dict] = None,
+    sft_preserve_thinking="auto",
 ):
   """pipeline for preprocessing HF dataset"""
   if use_sft and sft_chat_template_mode != "segmented":
@@ -357,6 +358,7 @@ def preprocessing_pipeline(
             "data_column_name": data_column_names[0],
             "tools_column_name": tools_column_name,
             "enable_thinking": sft_enable_thinking,
+            "preserve_thinking": sft_preserve_thinking,
             "return_segment_ids": tokenize,
         },
     )
@@ -512,6 +514,7 @@ def make_hf_train_iterator(
         sft_chat_template_mode=config.sft_chat_template_mode,
         sft_enable_thinking=config.sft_enable_thinking,
         sft_enable_thinking_column=config.sft_enable_thinking_column,
+        sft_preserve_thinking=getattr(config, "sft_preserve_thinking", "auto"),
         chat_template_path=config.chat_template_path,
         chat_template_revision=getattr(config, "chat_template_revision", "") or None,
         chat_template_sha256=getattr(config, "chat_template_sha256", "") or None,
@@ -580,6 +583,7 @@ def make_hf_eval_iterator(
         sft_chat_template_mode=config.sft_chat_template_mode,
         sft_enable_thinking=config.sft_enable_thinking,
         sft_enable_thinking_column=config.sft_enable_thinking_column,
+        sft_preserve_thinking=getattr(config, "sft_preserve_thinking", "auto"),
         chat_template_path=config.chat_template_path,
         chat_template_revision=getattr(config, "chat_template_revision", "") or None,
         chat_template_sha256=getattr(config, "chat_template_sha256", "") or None,

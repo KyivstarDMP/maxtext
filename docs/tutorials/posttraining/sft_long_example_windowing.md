@@ -54,9 +54,11 @@ bounded earlier context, masked
 New completion slices are disjoint, so every retained completion token receives
 loss once. Overlap supplies local continuity but does not duplicate loss.
 
-`sft_window_max_fan_out` is a hard guard. Reaching it logs and drops remaining
-completion tokens, so preflight data at the intended geometry and choose the
-limit deliberately.
+`sft_window_max_fan_out` must be at least 1; both configuration validation and
+the window-transform constructor reject zero or negative limits. It is still a
+hard guard: reaching a positive limit logs and drops remaining completion
+tokens, so preflight data at the intended geometry and choose the limit
+deliberately.
 
 ## Per-completion construction
 

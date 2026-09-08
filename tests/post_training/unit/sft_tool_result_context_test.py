@@ -19,10 +19,12 @@
 import copy
 import json
 import os
+from types import SimpleNamespace
 
 import pytest
 
 from maxtext.input_pipeline import grain_data_processing
+from maxtext.input_pipeline import hf_data_processing
 from maxtext.input_pipeline import input_pipeline_utils
 from maxtext.input_pipeline.input_pipeline_utils import (
     SFT_PINNED_CONTEXT_IDS_KEY,
@@ -209,7 +211,7 @@ def _standard_round(tool_messages=None):
   ]
 
 
-def _format(messages, tokenizer=None, enable_thinking=True):
+def _format(messages, tokenizer=None, enable_thinking=True, preserve_thinking="auto"):
   tokenizer = tokenizer or _PrefixStableToolTokenizer()
   return tokenizer, apply_chat_template(
       {"messages": copy.deepcopy(messages), "tools": copy.deepcopy(TOOLS)},
@@ -217,6 +219,7 @@ def _format(messages, tokenizer=None, enable_thinking=True):
       "messages",
       "tools",
       enable_thinking=enable_thinking,
+      preserve_thinking=preserve_thinking,
   )
 
 
@@ -234,6 +237,63 @@ def _format_with_pin(messages, tokenizer=None, enable_thinking=True):
 
 def _tokenized_segments(tokenizer, formatted):
   return grain_data_processing._tokenize_sft_chunks(copy.deepcopy(formatted), "messages", tokenizer)["messages"]
+
+
+@pytest.mark.parametrize("count", [1, 2])
+def test_trailing_tool_results_are_rejected_without_logging_bodies(count):
+  results = [{"role": "tool", "name": "lookup", "content": f"UNEMITTED_BODY_{index}"} for index in range(count)]
+  row = {"messages": _standard_round(results)[:-1], "tools": copy.deepcopy(TOOLS)}
+  original = copy.deepcopy(row)
+  with pytest.raises(ValueError, match=f"{count} unemitted message") as exc_info:
+    apply_chat_template(row, _PrefixStableToolTokenizer(), "messages", "tools")
+  assert f"roles: {['tool'] * count}" in str(exc_info.value)
+  assert all(result["content"] not in str(exc_info.value) for result in results)
+  assert row == original
+
+
+def test_terminal_assistant_call_without_recorded_result_remains_valid():
+  tokenizer, formatted = _format(_standard_round()[:3])
+  assert formatted["is_prompt"] == [True, False]
+  assert tokenizer.decode(formatted[input_pipeline_utils.SFT_SEGMENT_IDS_KEY][-1]) == "<CALL><R>"
+
+
+class _EmptyCompletionTokenizer(_PrefixStableToolTokenizer):
+  """Render empty assistant messages exactly like their generation prompts."""
+
+  def _render(self, messages, add_generation_prompt, tools, enable_thinking):
+    text = super()._render(messages, add_generation_prompt, tools, enable_thinking)
+    return text.replace("<A></A>", "<A>")
+
+
+@pytest.mark.parametrize("shape", ["empty-row", "prompt-only", "one-empty", "two-empty"])
+def test_segmented_rows_without_loss_bearing_segments_are_rejected(shape):
+  messages = [{"role": "user", "content": "Question."}]
+  if shape == "empty-row":
+    messages = []
+  elif shape in ("one-empty", "two-empty"):
+    messages += [{"role": "assistant", "content": ""}]
+    if shape == "two-empty":
+      messages += [{"role": "user", "content": "Next question."}, {"role": "assistant", "content": ""}]
+  with pytest.raises(ValueError, match="no loss-bearing segment"):
+    _format(messages, _EmptyCompletionTokenizer())
+
+
+def test_empty_completion_does_not_remove_other_supervised_completions():
+  messages = [
+      {"role": "user", "content": "Question."},
+      {"role": "assistant", "content": ""},
+      {"role": "user", "content": "Next question."},
+      {"role": "assistant", "content": "Answer."},
+  ]
+  _, formatted = _format(messages, _EmptyCompletionTokenizer())
+  assert formatted["is_prompt"] == [True, True, False]
+  assert formatted["messages"][-1] == "Answer.</A>"
+
+
+def test_empty_assistant_content_with_supervised_closing_tokens_is_valid():
+  _, formatted = _format([{"role": "user", "content": "Question."}, {"role": "assistant", "content": ""}])
+  assert formatted["is_prompt"] == [True, False]
+  assert formatted["messages"][-1] == "</A>"
 
 
 def test_tool_result_is_emitted_once_as_masked_context_and_stream_is_token_exact():
@@ -673,6 +733,111 @@ def test_no_think_user_prompts_keep_both_speculative_insertions():
   _, direct = _format(_standard_round(), _UserSpeculativeTokenizer(), enable_thinking=False)
   assert "§SPEC§" in direct["messages"][0]
   assert all("§SPEC§" not in text for text in direct["messages"][1:])
+
+
+class _ReasoningHistoryTokenizer(_PrefixStableToolTokenizer):
+  """Retain current-round reasoning and optionally historical call reasoning."""
+
+  def __init__(self):
+    super().__init__()
+    self.calls = []
+
+  def apply_chat_template(self, messages, **kwargs):
+    self.calls.append(copy.deepcopy(kwargs))
+    text = self._render(messages, kwargs["add_generation_prompt"], kwargs.get("tools"), kwargs["enable_thinking"])
+    last_user = max((index for index, message in enumerate(messages) if message["role"] == "user"), default=-1)
+    for index, message in enumerate(messages):
+      reasoning = message.get("reasoning")
+      if not reasoning or not (
+          index > last_user or (kwargs.get("preserve_thinking", False) and message.get("tool_calls"))
+      ):
+        continue
+      prefix = "<A><CALL>" if message.get("tool_calls") else f"<A>{message['content']}"
+      text = text.replace(prefix, "<A><THOUGHT>" + reasoning + "</THOUGHT>" + prefix[3:], 1)
+    return self.encode(text) if kwargs["tokenize"] else text
+
+
+@pytest.mark.parametrize("shape", ["plain", "tool-assistant", "tool-user"])
+@pytest.mark.parametrize("reasoning", ["", "REASONING_SENTINEL"])
+@pytest.mark.parametrize("preserve", ["auto", False, True])
+def test_segmented_preservation_policy_at_every_render_boundary(shape, reasoning, preserve):
+  messages = _standard_round()
+  if shape == "plain":
+    messages = messages[:2] + [
+        {"role": "assistant", "content": "First answer.", "reasoning": reasoning},
+        {"role": "user", "content": "Next question."},
+        {"role": "assistant", "content": "Next answer."},
+    ]
+  else:
+    messages[2]["reasoning"] = reasoning
+    if shape == "tool-user":
+      messages.insert(-1, {"role": "user", "content": "Next question."})
+  tokenizer = _ReasoningHistoryTokenizer()
+  row = {"messages": copy.deepcopy(messages), "tools": copy.deepcopy(TOOLS)}
+  kwargs = {"pin_leading_context": True, "enable_thinking": True, "preserve_thinking": preserve}
+  if shape == "tool-user" and reasoning and preserve is not True:
+    with pytest.raises(ValueError, match="tool-to-user prompt mismatch"):
+      apply_chat_template(row, tokenizer, "messages", "tools", **kwargs)
+  else:
+    formatted = apply_chat_template(row, tokenizer, "messages", "tools", **kwargs)
+    assert "".join(formatted["messages"]).count("REASONING_SENTINEL") == bool(reasoning)
+    if shape != "plain":
+      assert "".join(formatted["messages"]).count(SENTINEL) == 1
+    # These passing fixture shapes retain the existing segmented token selection.
+    if not (shape == "tool-user" and reasoning):
+      _, baseline = _format(messages, _ReasoningHistoryTokenizer())
+      assert formatted[input_pipeline_utils.SFT_SEGMENT_IDS_KEY] == baseline[input_pipeline_utils.SFT_SEGMENT_IDS_KEY]
+      assert formatted["is_prompt"] == baseline["is_prompt"]
+  assert tokenizer.calls
+  for call in tokenizer.calls:
+    if preserve == "auto":
+      assert "preserve_thinking" not in call
+    else:
+      assert call["preserve_thinking"] is preserve
+
+
+@pytest.mark.parametrize("preserve", ["auto", False, True])
+def test_hf_pipeline_passes_preservation_policy_through_rendering_and_tokenization(monkeypatch, preserve):
+  import datasets  # pylint: disable=import-outside-toplevel
+
+  tokenizer = _ReasoningHistoryTokenizer()
+  tokenizer.pad_token_id = 0
+  dataset = datasets.Dataset.from_dict({"messages": [json.dumps(_standard_round())], "tools": [json.dumps(TOOLS)]})
+  monkeypatch.setattr(hf_data_processing.transformers.AutoTokenizer, "from_pretrained", lambda *args, **kwargs: tokenizer)
+
+  def _check_before_batching(formatted, *args, **kwargs):
+    row = formatted[0]
+    assert input_pipeline_utils.SFT_SEGMENT_IDS_KEY not in formatted.column_names
+    assert all(type(token) is int for run in row["messages"] for token in run)  # pylint: disable=unidiomatic-typecheck
+    assert row["is_prompt"] == [True, False, True, False]
+    assert tokenizer.calls
+    for call in tokenizer.calls:
+      if preserve == "auto":
+        assert "preserve_thinking" not in call
+      else:
+        assert call["preserve_thinking"] is preserve
+    raise RuntimeError("verified HF rows before batching")
+
+  monkeypatch.setattr(input_pipeline_utils, "HFDataSource", _check_before_batching)
+  with pytest.raises(RuntimeError, match="verified HF rows before batching"):
+    hf_data_processing.preprocessing_pipeline(
+        dataloading_host_index=0,
+        dataloading_host_count=1,
+        global_mesh=SimpleNamespace(size=1),
+        dataset=dataset,
+        config=SimpleNamespace(elastic_enabled=False),
+        data_column_names=["messages", "tools"],
+        tokenize=True,
+        tokenizer_path="synthetic-tokenizer",
+        hf_access_token=None,
+        global_batch_size=1,
+        max_target_length=4096,
+        shuffle=False,
+        data_shuffle_seed=0,
+        use_sft=True,
+        chat_template="synthetic template",
+        sft_preserve_thinking=preserve,
+    )
 
 
 class _BodyDroppingTokenizer(_PrefixStableToolTokenizer):
