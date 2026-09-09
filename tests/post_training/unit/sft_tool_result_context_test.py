@@ -274,7 +274,8 @@ def test_segmented_rows_without_loss_bearing_segments_are_rejected(shape):
     messages += [{"role": "assistant", "content": ""}]
     if shape == "two-empty":
       messages += [{"role": "user", "content": "Next question."}, {"role": "assistant", "content": ""}]
-  with pytest.raises(ValueError, match="no loss-bearing segment"):
+  diagnostic = "unemitted message" if shape == "prompt-only" else "no loss-bearing segment"
+  with pytest.raises(ValueError, match=diagnostic):
     _format(messages, _EmptyCompletionTokenizer())
 
 
@@ -709,29 +710,50 @@ def test_interrupted_tool_round_then_second_call_is_token_exact():
 
 
 class _UserSpeculativeTokenizer(_PrefixStableToolTokenizer):
-  """Keep the existing no-think speculative prefix at each user boundary."""
+  """Emit a speculative no-think suffix at each user generation boundary."""
 
   def _render(self, messages, add_generation_prompt, tools, enable_thinking):
     text = super()._render(messages, add_generation_prompt, tools, enable_thinking)
     return text + ("§SPEC§" if add_generation_prompt and not enable_thinking else "")
 
 
-def test_no_think_user_prompts_keep_both_speculative_insertions():
+@pytest.mark.parametrize("with_tool", [False, True])
+@pytest.mark.parametrize("thinking", [False, True])
+def test_trailing_user_is_rejected_without_logging_its_body(with_tool, thinking):
+  messages = (
+      _standard_round()[:-1]
+      if with_tool
+      else [
+          {"role": "user", "content": "Question."},
+          {"role": "assistant", "content": "Answer."},
+      ]
+  )
+  messages.append({"role": "user", "content": "UNEMITTED_USER_BODY"})
+  row = {"messages": messages, "tools": copy.deepcopy(TOOLS)}
+  original = copy.deepcopy(row)
+  with pytest.raises(ValueError, match="1 unemitted message") as exc_info:
+    apply_chat_template(row, _UserSpeculativeTokenizer(), "messages", "tools", enable_thinking=thinking)
+  assert "roles: ['user']" in str(exc_info.value)
+  assert "UNEMITTED_USER_BODY" not in str(exc_info.value)
+  assert row == original
+
+
+def test_no_think_user_prompts_exclude_both_speculative_insertions():
   messages = _standard_round()[:-1] + [
       {"role": "user", "content": "Next question."},
       {"role": "assistant", "content": "Answer."},
   ]
   tok, result = _format(messages, _UserSpeculativeTokenizer(), enable_thinking=False)
   expected = (
-      "<B><D>Follow the tool result.<TOOLS></D><U>Look it up.</U><A>§SPEC§<CALL><R>"
+      "<B><D>Follow the tool result.<TOOLS></D><U>Look it up.</U><A><CALL><R>"
       + SENTINEL
-      + "</R><U>Next question.</U><A>§SPEC§Answer.</A>"
+      + "</R><U>Next question.</U><A>Answer.</A>"
   )
   assert [i for segment in _tokenized_segments(tok, result) for i in segment] == tok.encode(expected)
   assert result["is_prompt"] == [True, False, True, True, False]
   # Direct tool->assistant continuation still trims speculative prompt tokens.
   _, direct = _format(_standard_round(), _UserSpeculativeTokenizer(), enable_thinking=False)
-  assert "§SPEC§" in direct["messages"][0]
+  assert "§SPEC§" not in direct["messages"][0]
   assert all("§SPEC§" not in text for text in direct["messages"][1:])
 
 

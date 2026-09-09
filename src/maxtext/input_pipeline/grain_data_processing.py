@@ -195,6 +195,8 @@ def get_datasets(
     grain_index_storage_option=None,
 ):
   """Load a Grain dataset for the selected ``grain_file_type``."""
+  if stamp_dataset_id and data_file_type != "arrayrecord":
+    raise ValueError("Dataset ID stamping is implemented only for ArrayRecord sources.")
   if data_file_type == "arrayrecord":
     # Helper function to find files, create data source, and wrap in MapDataset
     def create_dataset_from_pattern(pattern):
@@ -980,8 +982,10 @@ def make_grain_train_iterator(
       config.global_batch_size_to_load % global_mesh.size == 0
   ), "Batch size should be divisible by number of global devices."
 
-  if config.per_dataset_metrics and (config.use_multimodal or config.grain_file_type in ("mmap", "mmap_npy")):
-    raise ValueError("Per-dataset metrics currently require a text ArrayRecord, TFRecord or Parquet pipeline.")
+  if config.per_dataset_metrics and (config.use_multimodal or config.grain_file_type != "arrayrecord"):
+    raise ValueError(
+        "Per-dataset metrics currently require the text ArrayRecord pipeline, which stamps source dataset IDs."
+    )
   pipeline_fn = _get_pipeline_fn(config)
   mmap_npy_num_samples = (
       config.steps * config.global_batch_size_to_load
@@ -1145,8 +1149,10 @@ def make_grain_eval_iterator(
       config.global_batch_size_to_load_eval % global_mesh.size == 0
   ), "Batch size should be divisible by number of global devices."
 
-  if config.per_dataset_metrics and (config.use_multimodal or config.grain_file_type in ("mmap", "mmap_npy")):
-    raise ValueError("Per-dataset metrics currently require a text ArrayRecord, TFRecord or Parquet pipeline.")
+  if config.per_dataset_metrics and (config.use_multimodal or config.grain_file_type != "arrayrecord"):
+    raise ValueError(
+        "Per-dataset metrics currently require the text ArrayRecord pipeline, which stamps source dataset IDs."
+    )
   pipeline_fn = _get_pipeline_fn(config)
   mmap_npy_eval_num_samples = None
   if config.grain_file_type == "mmap_npy" and hasattr(config, "eval_steps") and config.eval_steps > 0:

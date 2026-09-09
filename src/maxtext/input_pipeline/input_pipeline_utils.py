@@ -259,44 +259,12 @@ def extract_token_ids(tokens):
 
 
 def _split_turn_into_prompt_and_completion(tokenizer_model, round_msgs):
-  """Splits a conversational round (system + user + assistant) into prompt and completion formatted strings.
-
-  Uses the longest-common-prefix between the full conversation tokens and the
-  generation-prompt tokens to locate where the prompt ends and completion begins.
-
-  Args:
-    tokenizer_model: The tokenizer instance.
-    round_msgs: Messages for the current conversational turn including the assistant response.
-
-  Returns:
-    A tuple of (prompt_str, completion_str).
-  """
-  full_tokens = extract_token_ids(
-      tokenizer_model.apply_chat_template(round_msgs, add_generation_prompt=False, tokenize=True)
+  """Return display strings split at the full-render generation-prompt boundary."""
+  prompt_ids, completion_ids = _split_turn_token_ids(tokenizer_model, round_msgs)
+  return (
+      tokenizer_model.decode(prompt_ids, skip_special_tokens=False),
+      tokenizer_model.decode(completion_ids, skip_special_tokens=False),
   )
-  prompt_tokens = extract_token_ids(
-      tokenizer_model.apply_chat_template(round_msgs[:-1], add_generation_prompt=True, tokenize=True)
-  )
-
-  # Find the longest common prefix where prompt ends and completion begins
-  common_len = 0
-  for full_id, prompt_id in zip(full_tokens, prompt_tokens):
-    if full_id == prompt_id:
-      common_len += 1
-    else:
-      break
-
-  if common_len == 0:
-    raise ValueError(
-        "Chat template generation prompt mismatch: no common prefix tokens found.\n"
-        f"Full conversation tokens: {full_tokens} ('{tokenizer_model.decode(full_tokens)}')\n"
-        f"Generation prompt tokens: {prompt_tokens} ('{tokenizer_model.decode(prompt_tokens)}')\n"
-        "Cannot determine completion boundary."
-    )
-
-  prompt_str = tokenizer_model.decode(full_tokens[:common_len], skip_special_tokens=False)
-  completion_str = tokenizer_model.decode(full_tokens[common_len:], skip_special_tokens=False)
-  return prompt_str, completion_str
 
 
 def _resolve_sft_preserve_thinking(
@@ -320,7 +288,7 @@ def _sft_template_kwargs(tools: Any, enable_thinking: bool, preserve_thinking: b
   return kwargs
 
 
-def _get_completion_in_chat_template(
+def _split_turn_token_ids(
     tokenizer_model, round_msgs, tools=None, enable_thinking=True, preserve_thinking: bool | None = None
 ):
   """
@@ -343,7 +311,7 @@ def _get_completion_in_chat_template(
     round_msgs: Messages for the current conversational turn including the assistant response.
 
   Returns:
-    The original completion token IDs from the full chat-template render.
+    The original prompt and completion token IDs from the full render.
   """
   template_kwargs = _sft_template_kwargs(tools, enable_thinking, preserve_thinking)
   prompt_completion_tokens = tokenizer_model.apply_chat_template(
@@ -373,8 +341,14 @@ def _get_completion_in_chat_template(
         "Cannot determine completion boundary."
     )
 
-  completion_tokens = prompt_completion_ids[common_len:]
-  return completion_tokens
+  return prompt_completion_ids[:common_len], prompt_completion_ids[common_len:]
+
+
+def _get_completion_in_chat_template(
+    tokenizer_model, round_msgs, tools=None, enable_thinking=True, preserve_thinking: bool | None = None
+):
+  """Return original completion IDs, preserving the existing helper interface."""
+  return _split_turn_token_ids(tokenizer_model, round_msgs, tools, enable_thinking, preserve_thinking)[1]
 
 
 def validate_tool_result_bodies(tokenizer_model, tool_messages, masked_run_texts, *, mode, roles):
@@ -790,6 +764,18 @@ def apply_chat_template(
     messages.append(tokenizer_model.decode(ids, skip_special_tokens=False))
     is_prompt.append(prompt)
 
+  def unemitted_prompt_ids(prompt_ids):
+    if not emitted_len:
+      return prompt_ids
+    baseline_ids = extract_token_ids(
+        tokenizer_model.apply_chat_template(
+            round_msgs[:emitted_len], add_generation_prompt=False, tokenize=True, **template_kwargs
+        )
+    )
+    if prompt_ids[: len(baseline_ids)] != baseline_ids:
+      raise ValueError("Chat template assistant prompt changes previously emitted context tokens.")
+    return prompt_ids[len(baseline_ids) :]
+
   try:
     for idx, message in enumerate(conversation):
       if message["role"] in ("system", "developer"):
@@ -820,7 +806,7 @@ def apply_chat_template(
               roles=[item.get("role") for item in round_msgs],
           )
           append_segment(pending_ids, True)
-          _, user_ids = _render_suffix_ids(
+          _render_suffix_ids(
               tokenizer_model,
               round_msgs,
               round_msgs + [message],
@@ -831,9 +817,10 @@ def apply_chat_template(
               boundary_name="tool-to-user prompt",
               preserve_thinking=preservation,
           )
-          round_msgs.append(message)
-          append_segment(user_ids, True)
+          # Validate the transition now, but emit its prompt only once the real
+          # assistant is available, so speculative generation tokens are excluded.
           emitted_len = len(round_msgs)
+          round_msgs.append(message)
           continue
         round_msgs.append(message)
         if pin_leading_context and not pinned_context_rendered:
@@ -846,14 +833,7 @@ def apply_chat_template(
               preserve_thinking=preservation,
           )
           pinned_context_rendered = True
-        prompt_in_chat_template = tokenizer_model.apply_chat_template(
-            round_msgs,
-            add_generation_prompt=True,
-            tokenize=True,
-            **template_kwargs,
-        )
-        append_segment(extract_token_ids(prompt_in_chat_template), True)
-        emitted_len = len(round_msgs)
+        # Defer the prompt until the full assistant render determines its boundary.
       elif message["role"] == "tool":
         if not round_msgs:
           raise ValueError(f"Tool message at index {idx} with no preceding context.")
@@ -879,13 +859,22 @@ def apply_chat_template(
           round_msgs.append(message)
         else:
           round_msgs.append(message)
-          completion = _get_completion_in_chat_template(
+          prompt_ids, completion = _split_turn_token_ids(
               tokenizer_model,
               round_msgs,
               tools=tools,
               enable_thinking=enable_thinking,
               preserve_thinking=preservation,
           )
+          if pin_leading_context and not segment_ids:
+            validate_pinned_context_prefix(
+                tokenizer_model,
+                pinned_context_ids,
+                prompt_ids,
+                [item.get("role") for item in round_msgs],
+                "full-render prompt",
+            )
+          append_segment(unemitted_prompt_ids(prompt_ids), True)
         append_segment(completion, False)
         emitted_len = len(round_msgs)
         # Clear round only when the next message starts a new user turn or conversation ends
@@ -1649,11 +1638,10 @@ class IndexShardIterDataset(grain.IterDataset):
 
 @dataclasses.dataclass
 class ParseFeatures(grain.MapTransform):
-  """Parse serialized tf.train.Example protos for arrayrecord/tfrecord datasets.
+  """Parse typed tf.train.Example fields, retaining numeric and byte carriers.
 
-  Also validates that the stored field type matches `tokenize`: raises
-  ValueError if `tokenize=True` but the column contains integers (pre-tokenized)
-  or if `tokenize=False` but the column contains bytes (raw text).
+  NormalizeFeatures applies text/boolean conversion afterwards. Text/messages
+  aliases and absent optional tools are handled without weakening required fields.
   """
 
   def __init__(self, data_columns, tokenize):

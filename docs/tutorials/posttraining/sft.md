@@ -200,14 +200,14 @@ suffix are separate masked segments; earlier tokens are not replayed there.
 This per-round contract differs from rendering one full multi-turn conversation
 in `assistant_mask` mode.
 
-One existing exception remains: every emitted user generation prompt, including
-both the first user and a user after tools, can contain speculative template
-tokens absent from the canonical completed-round render. For example, a
-no-think serving template may insert an empty thought channel. An interrupted
-tool round can therefore retain two such insertions. Carrying original IDs
-prevents re-encoding drift but does not change this token selection. The existing
-longest-common-prefix completion boundary and trimming of speculative tokens in
-direct tool-to-assistant continuations remain unchanged.
+For a user followed by an assistant, prompt emission waits for the completed
+round. Both prompt and completion are slices of that full token render, split
+at its common prefix with the generation prompt. Speculative prompt suffixes
+absent from the actual response are therefore excluded, including after an
+interrupted tool round. Original token IDs still flow downstream unchanged.
+Previously emitted tool/history tokens must remain an exact prefix; a template
+that changes them is rejected. Rows ending in an unemitted user message are
+also rejected; the data producer must trim dangling tails before training.
 
 `sft_preserve_thinking=auto` omits the preservation argument in segmented mode
 and follows each row's thinking value in canonical mode. An explicit boolean

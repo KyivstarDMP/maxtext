@@ -166,6 +166,7 @@ class MultiHostDataLoadIterator:
     return input_gdas
 
   def _make_padding_batch(self):
+    """Return a zero batch from recent data or the empty-host shape template."""
     # Fast path: clone the shape/dtype of the host's most recent REAL batch and zero it. Covers a host that
     # loaded >=1 batch then exhausted (the confirmed E0200 mechanism).
     if self.last_local_data is not None:

@@ -148,9 +148,8 @@ def _assemble_per_dataset_aux(config, data, xent_sum_by_ds, correct_by_ds):
   token_count_by_ds = jax.ops.segment_sum(
       (data["targets_segmentation"] != 0).reshape(-1).astype(jnp.int32), ids, num_segments=num_seg
   )
-  if xent_sum_by_ds is None:  # tiled loss path not yet wired for per-dataset (Phase 2) — emit zeros
-    xent_sum_by_ds = jnp.zeros(num_seg, jnp.float32)
-    correct_by_ds = jnp.zeros(num_seg, jnp.int32)
+  if xent_sum_by_ds is None or correct_by_ds is None:
+    raise ValueError("Per-dataset metrics require loss and correct-token sums; this loss path does not provide them.")
   return {
       "xent_sum_by_ds": xent_sum_by_ds,
       "correct_by_ds": correct_by_ds,
@@ -174,6 +173,11 @@ def loss_fn(model, config, data, dropout_rng, params, sparsity_state=None, is_tr
     aux: a dictionary including intermediate_outputs, xent_sum, and total_weights
   """
   is_block_diffusion = getattr(config, "training_objective", "causal_lm") == "block_diffusion"
+  if config.per_dataset_metrics:
+    if is_block_diffusion or (config.use_indexer and not config.indexer_sparse_training):
+      raise ValueError("Per-dataset metrics are not supported for block diffusion or indexer warm-up.")
+    if not isinstance(model, nn.Module) and config.num_vocab_tiling > 1:
+      raise ValueError("NNX tiled per-dataset metrics require the separate numerical metrics repair.")
   if getattr(config, "attention_type", "global") == "block_diffusion" and not is_block_diffusion:
     raise ValueError(
         "Block-diffusion attention requires target-aligned block-diffusion losses; "

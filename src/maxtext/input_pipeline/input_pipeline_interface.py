@@ -61,6 +61,8 @@ def create_process_specific_iterator(config: pyconfig.HyperParameters, mesh, pro
 
 def create_data_iterator(config: pyconfig.HyperParameters, mesh):
   """Create train and eval data iterators given configs and mesh."""
+  if config.per_dataset_metrics and config.dataset_type != "grain":
+    raise ValueError("Per-dataset metrics require the Grain ArrayRecord pipeline.")
 
   if (
       config.dataset_type == "hf"
