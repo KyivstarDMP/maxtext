@@ -1078,7 +1078,9 @@ class _MetricsNNXHead(nnx.Module):
     return self.logits_dense(hidden)
 
 
-def _per_dataset_tiling_fixture(backend, *, with_ids=True, metrics=True, names="a,b,absent", tiles=4, is_train=True):
+def _per_dataset_tiling_fixture(
+    backend, *, with_ids=True, metrics=True, names="a,b,absent", tiles=4, is_train=True, return_total_correct=False
+):
   """Small real output heads; all sharding and tiled-loss functions remain unmocked."""
   cfg = SimpleNamespace(
       per_dataset_metrics=metrics,
@@ -1108,7 +1110,9 @@ def _per_dataset_tiling_fixture(backend, *, with_ids=True, metrics=True, names="
     graphdef, params, rest = nnx.split(model, nnx.Param, ...)
 
     def tiled(p, h):
-      return vocab_tiling_nnx_loss(nnx.merge(graphdef, p, rest, copy=True), h, data, cfg, is_train)
+      return vocab_tiling_nnx_loss(
+          nnx.merge(graphdef, p, rest, copy=True), h, data, cfg, is_train, return_total_correct=return_total_correct
+      )
 
     def logits(p, h):
       return nnx.merge(graphdef, p, rest, copy=True).logits_from_hidden_states_for_vocab_tiling(h, True, "train")
@@ -1118,7 +1122,7 @@ def _per_dataset_tiling_fixture(backend, *, with_ids=True, metrics=True, names="
     params = model.init(jax.random.key(0), hidden)
 
     def tiled(p, h):
-      return vocab_tiling_linen_loss(h, data, cfg, model, p, is_train)
+      return vocab_tiling_linen_loss(h, data, cfg, model, p, is_train, return_total_correct=return_total_correct)
 
     def logits(p, h):
       return model.apply(p, h)
@@ -1330,3 +1334,43 @@ def test_per_dataset_tiling_nnx_trainer_loss_and_gradients(tied, with_ids, is_tr
     np.testing.assert_allclose(tiled_aux["per_dataset"]["xent_sum_by_ds"].sum(), tiled_aux["xent_sum"], rtol=3e-5)
   else:
     assert "per_dataset" not in tiled_aux
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("backend", ["linen", "nnx"])
+@pytest.mark.parametrize("with_ids", [False, True])
+@pytest.mark.parametrize("corrupt", [False, True])
+def test_per_dataset_tiling_independent_accuracy(backend, with_ids, corrupt, monkeypatch):
+  """Known-answer scalar survives a deliberately broken grouped integer reduction."""
+  from maxtext.utils import vocabulary_tiling  # pylint: disable=import-outside-toplevel
+
+  original = vocabulary_tiling._sum_by_dataset  # pylint: disable=protected-access
+  if corrupt:
+
+    def drop_correct_counts(values, ids, slots):
+      result = original(values, ids, slots)
+      return jnp.zeros_like(result) if jnp.issubdtype(values.dtype, jnp.integer) else result
+
+    monkeypatch.setattr(vocabulary_tiling, "_sum_by_dataset", drop_correct_counts)
+  cfg, data, params, hidden, tiled, logits = _per_dataset_tiling_fixture(
+      backend, with_ids=with_ids, is_train=with_ids, return_total_correct=True
+  )
+  total, _, grouped_loss, grouped_correct, correct_scalar = jax.jit(tiled)(params, hidden)
+  expected_loss, expected_correct, _, _ = _independent_dataset_sums(logits(params, hidden), data, cfg)
+  assert int(correct_scalar) == int(expected_correct.sum()) > 0
+  np.testing.assert_allclose(grouped_loss, expected_loss, rtol=2e-5, atol=2e-6)
+  np.testing.assert_allclose(total, expected_loss.sum(), rtol=2e-5, atol=2e-6)
+  if corrupt:
+    assert int(grouped_correct.sum()) == 0
+    assert int(grouped_correct.sum()) != int(correct_scalar)
+  else:
+    assert int(grouped_correct.sum()) == int(correct_scalar)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("backend", ["linen", "nnx"])
+def test_per_dataset_tiling_independent_accuracy_disabled(backend):
+  _, _, params, hidden, tiled, _ = _per_dataset_tiling_fixture(backend, metrics=False, return_total_correct=True)
+  outputs = jax.jit(tiled)(params, hidden)
+  assert len(outputs) == 5 and outputs[2:] == (None, None, None)
+  assert "argmax[" not in str(jax.make_jaxpr(tiled)(params, hidden))

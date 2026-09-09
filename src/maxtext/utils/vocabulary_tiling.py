@@ -32,11 +32,21 @@ from maxtext.utils.sharding import (
 from maxtext.common.common_types import ShardMode
 from maxtext.utils import max_utils
 
-
 # Submodule names whose params are used by logits_from_hidden_states_for_vocab_tiling:
 # the final norm, the LM-head dense, and the embedding table when logits are tied.
 # vocab_tiling_nnx_loss splits these out as the only params the loss differentiates.
 _OUTPUT_HEAD_PATH_KEYS = ("token_embedder", "shared_embedding", "decoder_norm", "logits_dense")
+
+
+def _sum_by_dataset(values: jax.Array, dataset_ids: jax.Array, num_slots: int) -> jax.Array:
+  """Sum each dataset with reductions that remain correct inside a tiled scan.
+
+  A TPU compiler can fold segment_sum into the scan carry and move its
+  all-reduce outside the loop while retaining a per-partition carry reset.
+  Selection reductions avoid that scatter pattern. IDs outside [0, num_slots)
+  contribute to no slot, matching segment_sum's default behavior.
+  """
+  return jnp.stack([jnp.sum(jnp.where(dataset_ids == slot, values, 0)) for slot in range(num_slots)])
 
 
 def _is_output_head_param_path(path, _value):
@@ -63,6 +73,8 @@ def vocab_tiling_linen_loss(
     model,
     params,
     is_train,
+    *,
+    return_total_correct=False,
 ):
   """Calculates cross-entropy loss using vocab tiling for Linen models.
 
@@ -78,6 +90,8 @@ def vocab_tiling_linen_loss(
     model: The Linen model instance.
     params: The model parameters.
     is_train: A boolean indicating if the model is in training mode.
+    return_total_correct: Append an independently accumulated scalar correct count.
+      It is None when metrics are disabled; the default preserves the four-value API.
   Returns:
     A tuple of (total_loss, total_z_loss, loss_by_dataset, correct_by_dataset).
     Dataset vectors are non-differentiable and are None when metrics are disabled.
@@ -138,7 +152,7 @@ def vocab_tiling_linen_loss(
   per_dataset = config.per_dataset_metrics
 
   def _per_dataset_linen():
-    """Forward-only tiled (xent_sum, correct_count) vectors, segment-summed by dataset (no grad).
+    """Forward-only tiled dataset sums and an independent scalar correct count (no grad).
 
     One extra forward over the tiled logits, wrapped in stop_gradient (these are metrics, not part
     of the training objective), so it stays outside the custom_vjp above. Each chunk holds full
@@ -165,7 +179,7 @@ def vocab_tiling_linen_loss(
     rd = _reshape(ids_full, (config.num_vocab_tiling, tile), reshaped_data_spec)
 
     def _pd_body(acc, chunk):
-      xent_acc, correct_acc = acc
+      xent_acc, correct_acc, total_correct_acc = acc
       h, lbl, seg, dsid = chunk
       h = _maybe_shard_with_name(h, chunked_hidden_spec)
       logits = model.apply(
@@ -179,17 +193,20 @@ def vocab_tiling_linen_loss(
           logits, jax.nn.one_hot(lbl, config.vocab_size), z_loss=config.z_loss_multiplier
       )
       m = seg != 0
-      xent_acc = xent_acc + jax.ops.segment_sum(chunk_xent * m, dsid, num_segments=num_seg)
+      xent_acc = xent_acc + _sum_by_dataset(chunk_xent * m, dsid, num_seg)
       correct = (jnp.argmax(logits, axis=-1) == lbl) & m
-      correct_acc = correct_acc + jax.ops.segment_sum(correct.astype(jnp.int32), dsid, num_segments=num_seg)
-      return (xent_acc, correct_acc), None
+      correct_acc = correct_acc + _sum_by_dataset(correct.astype(jnp.int32), dsid, num_seg)
+      total_correct_acc += jnp.sum(correct.astype(jnp.int32))
+      return (xent_acc, correct_acc, total_correct_acc), None
 
-    (xent_by_ds, correct_by_ds), _ = jax.lax.scan(
-        _pd_body, (jnp.zeros(num_seg, jnp.float32), jnp.zeros(num_seg, jnp.int32)), (rh, rl, rs, rd)
+    (xent_by_ds, correct_by_ds, total_correct), _ = jax.lax.scan(
+        _pd_body,
+        (jnp.zeros(num_seg, jnp.float32), jnp.zeros(num_seg, jnp.int32), jnp.zeros((), jnp.int32)),
+        (rh, rl, rs, rd),
     )
-    return jax.lax.stop_gradient(xent_by_ds), jax.lax.stop_gradient(correct_by_ds)
+    return tuple(jax.lax.stop_gradient(value) for value in (xent_by_ds, correct_by_ds, total_correct))
 
-  pd_xent_by_ds, pd_correct_by_ds = _per_dataset_linen() if per_dataset else (None, None)
+  pd_xent_by_ds, pd_correct_by_ds, total_correct = _per_dataset_linen() if per_dataset else (None, None, None)
 
   # Customized forward and backward maps for the embedding tiling
   @jax.custom_vjp
@@ -292,7 +309,7 @@ def vocab_tiling_linen_loss(
       _, vjp_fn = jax.vjp(loss_fn_for_vjp, gathered_params, hidden_chunk)
 
       # 1.0 since total_loss is sum of all individual chunked loss
-      (grad_params_update, grad_hidden_chunk) = vjp_fn(1.0)
+      grad_params_update, grad_hidden_chunk = vjp_fn(1.0)
       grad_hidden_chunk = _maybe_shard_with_name(grad_hidden_chunk, chunked_hidden_spec)
 
       grad_params_acc = jax.tree_util.tree_map(
@@ -332,10 +349,11 @@ def vocab_tiling_linen_loss(
       segmentation,
   )
 
-  return total_loss, total_z_loss, pd_xent_by_ds, pd_correct_by_ds
+  outputs = (total_loss, total_z_loss, pd_xent_by_ds, pd_correct_by_ds)
+  return outputs + (total_correct,) if return_total_correct else outputs
 
 
-def vocab_tiling_nnx_loss(model, hidden_states, data, config, is_train):
+def vocab_tiling_nnx_loss(model, hidden_states, data, config, is_train, *, return_total_correct=False):
   """Computes cross-entropy loss with vocab tiling for NNX models.
 
   NNX equivalent of `vocab_tiling_linen_loss`. A `custom_vjp` runs the loss in
@@ -351,6 +369,8 @@ def vocab_tiling_nnx_loss(model, hidden_states, data, config, is_train):
     data: Dict with ``targets`` and ``targets_segmentation``.
     config: Model and training config.
     is_train: Whether the model is in training mode.
+    return_total_correct: Append an independently accumulated scalar correct count.
+      It is None when metrics are disabled; the default preserves the four-value API.
 
   Returns:
     A tuple ``(total_loss, total_z_loss, loss_by_dataset, correct_by_dataset)``.
@@ -467,7 +487,7 @@ def vocab_tiling_nnx_loss(model, hidden_states, data, config, is_train):
     )
 
     def _fwd_scan_body(accumulators, chunk_data):
-      loss_accumulator, z_loss_accumulator, loss_by_dataset, correct_by_dataset = accumulators
+      loss_accumulator, z_loss_accumulator, loss_by_dataset, correct_by_dataset, total_correct = accumulators
       hidden_chunk, label_chunk, segmentation_chunk, dataset_id_chunk = chunk_data
       hidden_chunk = _maybe_shard_with_name(hidden_chunk, chunked_hidden_spec)
       label_chunk = _maybe_shard_with_name(label_chunk, chunked_data_spec)
@@ -483,17 +503,18 @@ def vocab_tiling_nnx_loss(model, hidden_states, data, config, is_train):
       masked_xent = chunk_xent * mask
       if per_dataset:
         dataset_id_chunk = _maybe_shard_with_name(dataset_id_chunk, chunked_data_spec)
-        loss_by_dataset += jax.ops.segment_sum(masked_xent, dataset_id_chunk, num_segments=num_dataset_slots)
+        loss_by_dataset += _sum_by_dataset(masked_xent, dataset_id_chunk, num_dataset_slots)
         correct = (jnp.argmax(chunk_logits, axis=-1) == label_chunk) & mask
-        correct_by_dataset += jax.ops.segment_sum(
-            correct.astype(jnp.int32), dataset_id_chunk, num_segments=num_dataset_slots
-        )
+        correct_by_dataset += _sum_by_dataset(correct.astype(jnp.int32), dataset_id_chunk, num_dataset_slots)
+        # This reference never reads dataset IDs or grouped counts.
+        total_correct += jnp.sum(correct.astype(jnp.int32))
 
       return (
           loss_accumulator + jnp.sum(masked_xent),
           z_loss_accumulator + jnp.sum(chunk_z_loss * mask),
           loss_by_dataset,
           correct_by_dataset,
+          total_correct,
       ), None
 
     # Always accumulate in fp32 — `cross_entropy_with_logits` returns fp32 regardless of
@@ -503,6 +524,7 @@ def vocab_tiling_nnx_loss(model, hidden_states, data, config, is_train):
         jnp.zeros((), dtype=jnp.float32),
         jnp.zeros(num_dataset_slots, dtype=jnp.float32) if per_dataset else None,
         jnp.zeros(num_dataset_slots, dtype=jnp.int32) if per_dataset else None,
+        jnp.zeros((), dtype=jnp.int32) if per_dataset else None,
     )
     outputs, _ = jax.lax.scan(
         _fwd_scan_body,
@@ -524,7 +546,7 @@ def vocab_tiling_nnx_loss(model, hidden_states, data, config, is_train):
 
   def _chunked_cross_entropy_loss_bwd(residuals, cotangents):
     # z_loss is folded into the xent loss; dataset vectors are reporting-only.
-    loss_cotangent, _, _, _ = cotangents
+    loss_cotangent, _, _, _, _ = cotangents
 
     (
         chunk_head_params,
@@ -553,7 +575,7 @@ def vocab_tiling_nnx_loss(model, hidden_states, data, config, is_train):
       # pylint: disable=unnecessary-lambda-assignment
       loss_fn_for_vjp = lambda p, h: _single_chunk_loss_fn(p, h, label_chunk, segmentation_chunk)
       _, vjp_fn = jax.vjp(loss_fn_for_vjp, chunk_head_params, hidden_chunk)
-      (grad_head_update, grad_hidden_chunk) = vjp_fn(1.0)
+      grad_head_update, grad_hidden_chunk = vjp_fn(1.0)
       grad_hidden_chunk = _maybe_shard_with_name(grad_hidden_chunk, chunked_hidden_spec)
 
       grad_head_acc = jax.tree_util.tree_map(lambda acc, update: acc + update, grad_head_acc, grad_head_update)
@@ -587,10 +609,11 @@ def vocab_tiling_nnx_loss(model, hidden_states, data, config, is_train):
 
   chunked_cross_entropy_loss.defvjp(_chunked_cross_entropy_loss_fwd, _chunked_cross_entropy_loss_bwd)
 
-  total_loss, total_z_loss, loss_by_dataset, correct_by_dataset = chunked_cross_entropy_loss(
+  total_loss, total_z_loss, loss_by_dataset, correct_by_dataset, total_correct = chunked_cross_entropy_loss(
       head_params, other_params, rest, hidden_states, labels, segmentation, dataset_ids
   )
   if per_dataset:
     loss_by_dataset = jax.lax.stop_gradient(loss_by_dataset)
     correct_by_dataset = jax.lax.stop_gradient(correct_by_dataset)
-  return total_loss, total_z_loss, loss_by_dataset, correct_by_dataset
+  outputs = (total_loss, total_z_loss, loss_by_dataset, correct_by_dataset)
+  return outputs + (jax.lax.stop_gradient(total_correct),) if return_total_correct else outputs
