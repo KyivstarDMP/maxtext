@@ -116,5 +116,28 @@ def create_data_iterator(config: pyconfig.HyperParameters, mesh):
 
     if config.expansion_factor_real_data > 1:
       assert len(process_indices_eval) == jax.process_count() // config.expansion_factor_real_data
-    output_eval_iterator = create_process_specific_iterator(config, mesh, process_indices_eval, eval_iterator)
+    if config.per_dataset_metrics and config.per_dataset_eval_files:
+      # Option B: one single-dataset eval iterator per component, keyed by name. jit_eval_step is
+      # shape-based, so a dict here is fine; the eval loop runs one pass per entry.
+      names = [n for n in config.per_dataset_eval_names.split(",") if n]
+      globs = [g for g in config.per_dataset_eval_files.split(";") if g]
+      assert len(names) == len(
+          globs
+      ), f"per_dataset_eval_names ({len(names)}) and per_dataset_eval_files ({len(globs)}) must align"
+      # force_padding_batch=True (per-dataset iterators ONLY): these small single-dataset splits do not
+      # divide evenly across hosts, so without padding a short host raises StopIteration and exits the eval
+      # loop early -> unequal jit_eval_step launch counts -> E0200 SPMD desync. Padding keeps every host in
+      # lockstep for a fixed eval_steps launches. The aggregate else-branch below is left untouched (keeps
+      # config.generate_padding_batch_eval). See docs/012.
+      output_eval_iterator = {
+          name: create_process_specific_iterator(
+              config,
+              mesh,
+              process_indices_eval,
+              functools.partial(eval_iterator, eval_files_override=glob, force_padding_batch=True),
+          )
+          for name, glob in zip(names, globs)
+      }
+    else:
+      output_eval_iterator = create_process_specific_iterator(config, mesh, process_indices_eval, eval_iterator)
   return output_train_iterator, output_eval_iterator

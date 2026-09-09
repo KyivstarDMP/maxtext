@@ -15,6 +15,7 @@
 """Operations used by Grain"""
 
 import dataclasses
+import json
 import warnings
 from threading import current_thread
 from typing import Any, Iterable, TYPE_CHECKING
@@ -26,7 +27,7 @@ if TYPE_CHECKING:
 import grain.python as grain
 import numpy as np
 from grain._src.python.dataset.sources.tfrecord_dataset import _TFRecordReader, _TFRecordDatasetIterator  # pylint: disable=protected-access
-from grain.experimental import TFRecordIterDataset
+from grain.experimental import FlatMapTransform, TFRecordIterDataset
 from maxtext.diffusion.block_diffusion import corruption as block_diffusion_corruption
 from maxtext.input_pipeline.protos import example_pb2
 from maxtext.input_pipeline import tokenizer
@@ -292,13 +293,138 @@ def _split_turn_into_prompt_and_completion(tokenizer_model, round_msgs):
   return prompt_str, completion_str
 
 
-def _get_completion_in_chat_template(tokenizer_model, round_msgs):
-  """Calculates the completion part of a conversation turn formatted with a chat template."""
-  _, completion_str = _split_turn_into_prompt_and_completion(tokenizer_model, round_msgs)
-  return completion_str
+def verify_chat_template_generation_prompt_logic(tokenizer_model):
+  """Verifies the tokenizer's chat template for correct SFT loss masking.
+
+  This function ensures that the tokens added by `add_generation_prompt=True`
+  are identical to the tokens that begin an assistant's turn in a complete
+  conversation, which is critical for masking prompt tokens during SFT loss
+  calculation.
+
+  Example of a mismatch:
+    A `ValueError` is raised if the generation prompt and the actual
+    assistant prefix do not match. For example:
+
+    - `add_generation_prompt=True` on a user message produces a prompt ending in:
+      `...<|im_start|>generation\n`
+    - A full turn with an assistant message starts the reply with:
+      `...<|im_start|>assistant\n...`
+
+    This function would fail because the tokens for "generation" do not
+    match the tokens for "assistant".
+
+  Args:
+    tokenizer_model: The Hugging Face tokenizer instance to verify.
+
+  Raises:
+    ValueError: If the `add_generation_prompt` tokens do not exactly
+      match the beginning of an assistant message in the template.
+  """
+  dummy_msgs = [{"role": "system", "content": "System message"}, {"role": "user", "content": "Test message"}]
+
+  try:
+    prompt_wo_gen_tokens = tokenizer_model.apply_chat_template(
+        dummy_msgs, add_generation_prompt=False, tokenize=True, enable_thinking=True
+    )
+  except TemplateError:
+    max_logging.info(
+        "Tokenizer failed to apply chat template with 'system' role. "
+        "Falling back to 'user' role only for chat template verification."
+    )
+    dummy_msgs.pop(0)
+    prompt_wo_gen_tokens = tokenizer_model.apply_chat_template(
+        dummy_msgs, add_generation_prompt=False, tokenize=True, enable_thinking=True
+    )
+  prompt_wo_gen_ids = extract_token_ids(prompt_wo_gen_tokens)
+
+  prompt_w_gen_tokens = tokenizer_model.apply_chat_template(
+      dummy_msgs, add_generation_prompt=True, tokenize=True, enable_thinking=True
+  )
+  prompt_w_gen_ids = extract_token_ids(prompt_w_gen_tokens)
+
+  if prompt_w_gen_ids[: len(prompt_wo_gen_ids)] != prompt_wo_gen_ids:
+    raise ValueError("Unable to extract generation prompt tokens.")
+  # Extract the tokenized generation prompt (the expected assistant prefix)
+  assistant_prefix = prompt_w_gen_ids[len(prompt_wo_gen_ids) :]
+  full_turn_tokens = extract_token_ids(
+      tokenizer_model.apply_chat_template(
+          dummy_msgs + [{"role": "assistant", "content": "Dummy response"}],
+          add_generation_prompt=False,
+          tokenize=True,
+          enable_thinking=True,
+      )
+  )
+  full_turn_ids = extract_token_ids(full_turn_tokens)
+  # Extract the actual tokens that appear right after the user message in the full turn
+  actual_prefix_in_full_turn = full_turn_ids[len(prompt_wo_gen_ids) : len(prompt_wo_gen_ids) + len(assistant_prefix)]
+
+  if actual_prefix_in_full_turn != assistant_prefix:
+    expected_str = tokenizer_model.decode(assistant_prefix)
+    actual_str = tokenizer_model.decode(actual_prefix_in_full_turn)
+    raise ValueError(
+        "Chat template generation prompt mismatch!\n"
+        f"Expected assistant prefix tokens: {assistant_prefix} ('{expected_str}')\n"
+        f"Actual prefix tokens found: {actual_prefix_in_full_turn} ('{actual_str}')\n"
+        "This means the tokenizer's chat template will break the sft masking logic."
+    )
 
 
-def apply_chat_template(example, tokenizer_model, data_column_name):
+def _get_completion_in_chat_template(tokenizer_model, round_msgs, tools=None):
+  """
+  Calculates the completion part of a conversation turn when formatted with a chat template.
+
+  Uses the longest-common-prefix between the full conversation tokens and the
+  generation-prompt tokens to locate where the completion starts.
+
+  For most models (Llama, Qwen, …) the generation prompt is an exact prefix of the
+  full conversation, so common_len == len(prompt_ids).
+
+  For Gemma4, add_generation_prompt=True emits thinking-channel tokens
+  (<|channel>thought\\n<channel|>) that diverge from the plain conversation
+  at the model-turn boundary. The common prefix ends just before that
+  divergence, and the completion correctly captures the thinking content
+  and response tokens.
+
+  Args:
+    tokenizer_model: The tokenizer instance.
+    round_msgs: Messages for the current conversational turn including the assistant response.
+
+  Returns:
+    A string representing the completion formatted by the chat template.
+  """
+  tools_kwargs = {"tools": tools} if tools is not None else {}
+  prompt_completion_tokens = tokenizer_model.apply_chat_template(
+      round_msgs, add_generation_prompt=False, tokenize=True, enable_thinking=True, **tools_kwargs
+  )
+  # include generation_prompt as part of the prompt tokens
+  prompt_tokens = tokenizer_model.apply_chat_template(
+      round_msgs[:-1], add_generation_prompt=True, tokenize=True, enable_thinking=True, **tools_kwargs
+  )
+
+  prompt_completion_ids = extract_token_ids(prompt_completion_tokens)
+  prompt_ids = extract_token_ids(prompt_tokens)
+
+  # Walk forward until the two sequences diverge
+  common_len = 0
+  for full_id, prompt_id in zip(prompt_completion_ids, prompt_ids):
+    if full_id == prompt_id:
+      common_len += 1
+    else:
+      break
+
+  if common_len == 0:
+    raise ValueError(
+        "Chat template generation prompt mismatch: no common prefix tokens found.\n"
+        f"Full conversation tokens: {prompt_completion_ids} ('{tokenizer_model.decode(prompt_completion_ids)}')\n"
+        f"Generation prompt tokens: {prompt_ids} ('{tokenizer_model.decode(prompt_ids)}')\n"
+        "Cannot determine completion boundary."
+    )
+
+  completion_tokens = prompt_completion_ids[common_len:]
+  return tokenizer_model.decode(completion_tokens, skip_special_tokens=False)
+
+
+def apply_chat_template(example, tokenizer_model, data_column_name, tools_column_name=None):
   """Formats conversational data by applying the tokenizer's chat template
   and identifying prompt/completion segments for SFT masking.
 
@@ -322,21 +448,39 @@ def apply_chat_template(example, tokenizer_model, data_column_name):
   messages = []
   is_prompt = []
   round_msgs = []
+  conversation = example[data_column_name]
+  if isinstance(conversation, str):
+    conversation = json.loads(conversation)
+  tools = example.get(tools_column_name) if tools_column_name else None
+  if isinstance(tools, str):
+    tools = json.loads(tools)
+  tools_kwargs = {"tools": tools} if tools is not None else {}
   try:
-    for idx, message in enumerate(example[data_column_name]):
+    for idx, message in enumerate(conversation):
       if message["role"] == "system":
         if idx != 0:
           raise ValueError(f"System message found at index {idx}. System messages must be at index 0.")
         round_msgs.append(message)
       elif message["role"] == "user":
         round_msgs.append(message)
-      elif message["role"] == "assistant":
+        prompt_in_chat_template = tokenizer_model.apply_chat_template(
+            round_msgs, add_generation_prompt=True, tokenize=False, enable_thinking=True, **tools_kwargs
+        )
+        messages.append(prompt_in_chat_template)
+        is_prompt.append(True)
+      elif message["role"] == "tool":
         round_msgs.append(message)
-        prompt_str, completion_str = _split_turn_into_prompt_and_completion(tokenizer_model, round_msgs)
-        messages.extend([prompt_str, completion_str])
-        is_prompt.extend([True, False])
-        # Round ended, clearing the buffer.
-        round_msgs.clear()
+      elif message["role"] == "assistant":
+        if not round_msgs:
+          raise ValueError(f"Assistant message at index {idx} with no preceding context.")
+        round_msgs.append(message)
+        messages.append(_get_completion_in_chat_template(tokenizer_model, round_msgs, tools=tools))
+        is_prompt.append(False)
+        # Clear round only when the next message starts a new user turn or conversation ends
+        # This preserves context for consecutive assistant/tool messages
+        next_idx = idx + 1
+        if next_idx >= len(conversation) or conversation[next_idx]["role"] == "user":
+          round_msgs.clear()
   except ValueError as e:
     max_logging.log(f"Unable to apply chat template: {e}")
     raise e
@@ -383,10 +527,125 @@ class SFTPromptMasking(grain.MapTransform):
     for i, text in enumerate(element[self.text_column_name]):
       inputs += text
       targets += [self.unk_id] * len(text) if self.completion_only and element["is_prompt"][i] else text
-    return {
+    out = {
         "inputs": np.asarray(inputs[: self.max_target_length], dtype=np.int32),
         "targets": np.asarray(targets[: self.max_target_length], dtype=np.int32),
     }
+    if "dataset_id" in element:
+      out["dataset_id"] = np.full(len(out["inputs"]), np.int32(element["dataset_id"]), dtype=np.int32)
+    return out
+
+
+@dataclasses.dataclass
+class SFTPromptMaskingWindows(FlatMapTransform):
+  """Construct SFT inputs/targets for completion-only training, splitting examples longer than
+  ``max_target_length`` into multiple ``<= max_target_length`` records via a prompt-pinned sliding
+  window instead of head-truncating them.
+
+  Motivation: the 1:1 :class:`SFTPromptMasking` truncates the concatenated sequence with
+  ``[:max_target_length]``. For any example longer than ``max_target_length`` this drops the tail —
+  including the turn terminator (e.g. ``<end_of_turn>``) — from both ``inputs`` and ``targets``, so
+  the stop token never enters the loss and the model is trained on a stop-less completion prefix.
+
+  This transform instead emits, per completion segment of an over-length example, a sequence of
+  windows. Each window is ``[ conversation-prefix-so-far (front-capped, masked) ] +
+  [ small completion overlap (masked) ] + [ a slice of new completion tokens (loss) ]``. The loss
+  slices tile the completion with NO overlap, so every completion token — including the terminator
+  in the final window — contributes to the loss exactly once. Examples that already fit yield a
+  single record byte-identical to :class:`SFTPromptMasking`.
+
+  Only completion-only SFT is supported (the context/overlap tokens are masked with ``unk_id``).
+  """
+
+  max_fan_out: int = 32
+
+  def __init__(
+      self,
+      text_column_name,
+      completion_only,
+      max_target_length,
+      unk_id=0,
+      overlap=256,
+      context_cap=-1,
+      max_fan_out=32,
+  ):
+    self.text_column_name = text_column_name
+    self.completion_only = completion_only
+    self.max_target_length = max_target_length
+    self.unk_id = unk_id
+    self.overlap = overlap
+    self.context_cap = context_cap
+    self.max_fan_out = max_fan_out
+
+  def _single_record(self, segments, is_prompt):
+    """Fast path identical to SFTPromptMasking.map for examples that fit in max_target_length."""
+    inputs, targets = [], []
+    for seg, is_p in zip(segments, is_prompt):
+      seg = list(seg)
+      inputs += seg
+      targets += [self.unk_id] * len(seg) if (self.completion_only and is_p) else seg
+    return {
+        "inputs": np.asarray(inputs, dtype=np.int32),
+        "targets": np.asarray(targets, dtype=np.int32),
+    }
+
+  def _stamp_ds(self, records, element):
+    """Attach a per-token dataset_id (constant across an example's fan-out windows)."""
+    if "dataset_id" in element:
+      ds_id = np.int32(element["dataset_id"])
+      for r in records:
+        r["dataset_id"] = np.full(len(r["inputs"]), ds_id, dtype=np.int32)
+    return records
+
+  def flat_map(self, element):
+    length = self.max_target_length
+    segments = element[self.text_column_name]
+    is_prompt = element["is_prompt"]
+
+    total = sum(len(seg) for seg in segments)
+    if total <= length:
+      return self._stamp_ds([self._single_record(segments, is_prompt)], element)
+
+    # Clamp window geometry so every window always leaves room for >=1 loss token:
+    #   ctx (<= cap) + overlap (<= overlap_cap) + min_room <= length.
+    overlap_cap = max(0, min(self.overlap, length // 8))
+    min_room = max(1, length // 8)
+    auto_cap = self.context_cap if (self.context_cap and self.context_cap > 0) else length // 2
+    cap = max(1, min(auto_cap, length - overlap_cap - min_room))
+
+    records = []
+    prefix = []  # all tokens of preceding segments, replayed (masked) as grounding context
+    for seg, is_p in zip(segments, is_prompt):
+      seg = list(seg)
+      if self.completion_only and is_p:
+        prefix += seg
+        continue
+      comp = seg
+      if not comp:
+        continue
+      ctx = prefix[-cap:] if len(prefix) > cap else list(prefix)
+      i, n = 0, len(comp)
+      while i < n:
+        if len(records) >= self.max_fan_out:
+          max_logging.log(
+              f"SFTPromptMaskingWindows: hit max_fan_out={self.max_fan_out}; dropping {n - i} "
+              "trailing completion token(s) (including the turn terminator) for one example."
+          )
+          return self._stamp_ds(records, element)
+        overlap_tokens = comp[max(0, i - overlap_cap) : i]
+        room = length - len(ctx) - len(overlap_tokens)
+        loss_tokens = comp[i : i + room]
+        n_mask = len(ctx) + len(overlap_tokens)
+        records.append(
+            {
+                "inputs": np.asarray(ctx + overlap_tokens + loss_tokens, dtype=np.int32),
+                "targets": np.asarray([self.unk_id] * n_mask + loss_tokens, dtype=np.int32),
+            }
+        )
+        i += len(loss_tokens)
+      prefix += comp
+
+    return self._stamp_ds(records, element)
 
 
 @dataclasses.dataclass
@@ -637,8 +896,16 @@ class ParseFeatures(grain.MapTransform):
     self.data_columns = list(data_columns)
     self.tokenize = tokenize
 
+  # Columns that may legitimately be absent from a record (e.g. datasets without
+  # function-calling data). Missing optional columns are skipped, not an error,
+  # so a single mixture can blend tools/non-tools datasets.
+  OPTIONAL_COLUMNS = frozenset({"tools"})
+
   def map(self, element):
     """Parse a serialized tf.train.Example proto and extract features."""
+    dataset_id = None
+    if isinstance(element, dict) and "raw" in element:  # per_dataset_metrics: stamped upstream
+      dataset_id, element = element["dataset_id"], element["raw"]
     example = example_pb2.Example()
     example.ParseFromString(element)
     features = example.features.feature
@@ -647,6 +914,8 @@ class ParseFeatures(grain.MapTransform):
     for col in self.data_columns:
       target_col = col
       if col not in features:
+        if col in self.OPTIONAL_COLUMNS:
+          continue
         # Fallback alias: support bidirectional mapping between 'text' and 'messages'
         if col == "text" and "messages" in features:
           target_col = "messages"
@@ -678,6 +947,8 @@ class ParseFeatures(grain.MapTransform):
       if "top_k_indices" in parsed and len(parsed["top_k_indices"]) > 0:
         parsed["top_k_indices"] = parsed["top_k_indices"].reshape(seq_len, -1)
 
+    if dataset_id is not None:
+      parsed["dataset_id"] = np.int32(dataset_id)
     return parsed
 
 
@@ -689,11 +960,23 @@ class NormalizeFeatures(grain.MapTransform):
     self.column_names = column_names
     self.tokenize = tokenize
 
+  # Columns that may legitimately be absent from a record (e.g. datasets
+  # without function-calling data). Missing optional columns are skipped
+  # instead of raising, so a single mixture can blend tools/non-tools datasets.
+  OPTIONAL_COLUMNS = frozenset({"tools"})
+
   def map(self, element):
-    if self.tokenize:
-      return {col: element[col][0].decode() for col in self.column_names}
-    else:
-      return {col: element[col] for col in self.column_names}
+    """Normalize feature keys, skipping optional columns (e.g. `tools`) absent from a record."""
+    out = {}
+    for col in self.column_names:
+      if col not in element:
+        if col in self.OPTIONAL_COLUMNS:
+          continue  # e.g. a dataset that has no `tools` column
+        raise KeyError(f"Required column '{col}' missing from record. Present columns: {sorted(element.keys())}")
+      out[col] = element[col][0].decode() if self.tokenize else element[col]
+    if "dataset_id" in element:
+      out["dataset_id"] = element["dataset_id"]
+    return out
 
 
 @dataclasses.dataclass
@@ -710,9 +993,12 @@ class KeepFeatures(grain.MapTransform):
     self.feature_names = feature_names
     self.tokenize = tokenize
 
+  # See ParseFeatures.OPTIONAL_COLUMNS — absent optional columns are skipped, not an error.
+  OPTIONAL_COLUMNS = frozenset({"tools"})
+
   def map(self, element: dict[str, Any]) -> dict[str, Any]:
     """Applies the feature filtering to the input element."""
-    missing = [n for n in self.feature_names if n not in element]
+    missing = [n for n in self.feature_names if n not in element and n not in self.OPTIONAL_COLUMNS]
     if missing:
       raise ValueError(
           f"Column {missing} not found in dataset. Available columns: {sorted(element.keys())}. "
@@ -756,6 +1042,18 @@ class Rekey(grain.MapTransform):
     if not self.keep_old_keys:
       for key in old_keys:
         del element[key]
+    return element
+
+
+class DropKeys(grain.MapTransform):
+  """Remove the given keys from each element (e.g. packer-emitted junk columns)."""
+
+  def __init__(self, keys):
+    self.keys = tuple(keys)
+
+  def map(self, element):
+    for k in self.keys:
+      element.pop(k, None)
     return element
 
 
@@ -1082,6 +1380,8 @@ def shift_and_refine(x, ignored_ids, axis=1):
   """Left-shift targets and mask labels equal to one of ``ignored_ids``."""
   x["targets"] = shift_left(x["targets"], ignored_ids[0], axis=axis)
   x["targets_segmentation"] = shift_left(x["targets_segmentation"], 0, axis=axis)
+  if "dataset_id" in x:
+    x["dataset_id"] = shift_left(x["dataset_id"], 0, axis=axis)
   for ignore_id in ignored_ids:
     x["targets_segmentation"] = np.where(x["targets"] != ignore_id, x["targets_segmentation"], 0)
 

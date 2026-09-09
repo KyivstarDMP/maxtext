@@ -1626,6 +1626,10 @@ class Tokenizer(BaseModel):
       True,
       description="If False, use chunking for long sequences instead of truncation.",
   )
+  num_vocab_tiling: int = Field(
+      1,
+      description="Enables memory-saving optimization by tiling cross-entropy loss computation. >1 to enable.",
+  )
 
 
 class DatasetGeneral(BaseModel):
@@ -1823,6 +1827,68 @@ class FineTuning(BaseModel):
   use_sft: bool = Field(False, description="If True, enables Supervised Fine-Tuning.")
   sft_train_on_completion_only: bool = Field(
       False, description="If True, trains only on the completion part of the text."
+  )
+  sft_long_example_handling: Literal["truncate", "window"] = Field(
+      "truncate",
+      description=(
+          "How to handle SFT examples longer than max_target_length (grain pipeline). "
+          "'truncate' head-truncates (drops the tail, incl. the turn terminator <end_of_turn>, "
+          "from long examples). 'window' splits a long example into multiple <=max_target_length "
+          "records via a prompt-pinned sliding window so the terminator always enters the loss; "
+          "requires sft_train_on_completion_only=True."
+      ),
+  )
+  sft_window_overlap: int = Field(
+      256,
+      description=(
+          "For sft_long_example_handling='window': completion tokens carried as masked context "
+          "between consecutive windows. Clamped to <= max_target_length // 8."
+      ),
+  )
+  sft_window_context_cap: int = Field(
+      -1,
+      description=(
+          "For 'window': max tokens of conversation-prefix context pinned (masked) in front of "
+          "each window. -1 = auto (max_target_length // 2)."
+      ),
+  )
+  sft_window_max_fan_out: int = Field(
+      32,
+      description="For 'window': hard cap on records emitted per example (runaway guard).",
+  )
+  per_dataset_metrics: bool = Field(
+      False,
+      description=(
+          "If True, emit per-mixture-component (per-dataset) train loss/accuracy (segment-summed "
+          "within each mixed batch) and per-dataset eval loss/accuracy (one eval pass per dataset). "
+          "Opt-in; zero-overhead when False. Requires packing=true."
+      ),
+  )
+  per_dataset_names: str = Field(
+      "",
+      description=(
+          "Comma-joined, ordered names of the train mixture components (runner-supplied from the "
+          "blend manifest, same order as grain_train_files). Index i (1-based) maps to names[i-1]."
+      ),
+  )
+  per_dataset_eval_names: str = Field(
+      "",
+      description="Comma-joined, ordered names of eval datasets; one separate eval pass is run per name.",
+  )
+  per_dataset_eval_files: str = Field(
+      "",
+      description=(
+          "Semicolon-joined eval file globs aligned 1:1 with per_dataset_eval_names (runner-filled). "
+          "Each becomes its own single-dataset eval iterator (Option B: N separate passes)."
+      ),
+  )
+  per_dataset_log_period: int = Field(
+      0,
+      description=(
+          "Train steps to accumulate per-dataset metrics over before emitting one token-weighted "
+          "point (loss = sum(xent)/sum(tokens) across the window). Larger = smoother curves, fewer "
+          "scalar writes, better per-point coverage. <= 0 follows log_period; 1 emits every step."
+      ),
   )
   formatting_func_path: str = Field(
       "",

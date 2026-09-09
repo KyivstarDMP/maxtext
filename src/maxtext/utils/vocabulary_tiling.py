@@ -133,6 +133,60 @@ def vocab_tiling_linen_loss(
   # TODO (chengnuojin) all gather only embedding table instead of all params after NNX module is enabled
   gathered_params = all_gather_over_fsdp(params, param_spec, model.mesh, get_logical_axis_rules(), config.shard_mode)
 
+  per_dataset = config.per_dataset_metrics
+
+  def _per_dataset_linen():
+    """Forward-only tiled (xent_sum, correct_count) vectors, segment-summed by dataset (no grad).
+
+    One extra forward over the tiled logits, wrapped in stop_gradient (these are metrics, not part
+    of the training objective), so it stays outside the custom_vjp above. Each chunk holds full
+    per-token logits, so next-token accuracy is a per-chunk argmax.
+
+    Train batches carry ``dataset_id`` -> [num_datasets+1] per-component vectors. Eval batches
+    (Option B: one pass per dataset) carry none, so everything is bucketed into slot 1 and the
+    result is simply this pass's AGGREGATE xent/correct - which is what the caller needs, since
+    with vocab tiling the decoder returns ``logits=None`` (decoders.py: num_vocab_tiling > 1 and
+    model_mode == MODEL_MODE_TRAIN, which eval's teacher-forced forward also uses).
+    """
+    has_ids = "dataset_id" in data
+    if has_ids:
+      num_seg = len([n for n in config.per_dataset_names.split(",") if n]) + 1
+      ids_full = data["dataset_id"]
+    else:
+      num_seg = 2
+      ids_full = jnp.ones_like(labels)
+    bsz, slen, edim = hidden_states.shape
+    tile = (bsz * slen) // config.num_vocab_tiling
+    rh = _reshape(hidden_states, (config.num_vocab_tiling, tile, edim), reshaped_hidden_spec)
+    rl = _reshape(labels, (config.num_vocab_tiling, tile), reshaped_data_spec)
+    rs = _reshape(segmentation, (config.num_vocab_tiling, tile), reshaped_data_spec)
+    rd = _reshape(ids_full, (config.num_vocab_tiling, tile), reshaped_data_spec)
+
+    def _pd_body(acc, chunk):
+      xent_acc, correct_acc = acc
+      h, lbl, seg, dsid = chunk
+      h = _maybe_shard_with_name(h, chunked_hidden_spec)
+      logits = model.apply(
+          {"params": gathered_params["params"]},
+          h,
+          deterministic=deterministic,
+          method="logits_from_hidden_states_for_vocab_tiling",
+      )
+      logits = _maybe_shard_with_name(logits, chunked_logits_spec)
+      chunk_xent, _ = max_utils.cross_entropy_with_logits(logits, jax.nn.one_hot(lbl, config.vocab_size), z_loss=0.0)
+      m = seg != 0
+      xent_acc = xent_acc + jax.ops.segment_sum(chunk_xent * m, dsid, num_segments=num_seg)
+      correct = (jnp.argmax(logits, axis=-1) == lbl) & m
+      correct_acc = correct_acc + jax.ops.segment_sum(correct.astype(jnp.int32), dsid, num_segments=num_seg)
+      return (xent_acc, correct_acc), None
+
+    (xent_by_ds, correct_by_ds), _ = jax.lax.scan(
+        _pd_body, (jnp.zeros(num_seg, jnp.float32), jnp.zeros(num_seg, jnp.int32)), (rh, rl, rs, rd)
+    )
+    return jax.lax.stop_gradient(xent_by_ds), jax.lax.stop_gradient(correct_by_ds)
+
+  pd_xent_by_ds, pd_correct_by_ds = _per_dataset_linen() if per_dataset else (None, None)
+
   # Customized forward and backward maps for the embedding tiling
   @jax.custom_vjp
   def chunked_cross_entropy_loss(gathered_params, hidden_states, labels, segmentation):
@@ -274,6 +328,8 @@ def vocab_tiling_linen_loss(
       segmentation,
   )
 
+  if per_dataset:
+    return total_loss, total_z_loss, pd_xent_by_ds, pd_correct_by_ds
   return total_loss, total_z_loss
 
 

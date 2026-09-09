@@ -24,6 +24,7 @@ from concurrent import futures
 import json
 
 import jax
+import numpy as np
 
 import grain.python as grain
 from grain.experimental import ElasticIterator
@@ -157,6 +158,20 @@ def _make_mmap_multiprocessing_options(dataset, config, grain_worker_count, grai
   return grain.MultiprocessingOptions(num_workers=grain_worker_count, per_worker_buffer_size=grain_per_worker_buffer_size)
 
 
+class _StampDatasetId(grain.MapTransform):
+  """Wrap each raw record with its 1-based mixture-component id (for per_dataset_metrics).
+
+  Applied per component *before* ``grain.IterDataset.mix`` — the only point where source identity
+  still exists. ``ParseFeatures`` unwraps ``{"raw": bytes, "dataset_id": id}`` downstream.
+  """
+
+  def __init__(self, dataset_id):
+    self.dataset_id = int(dataset_id)
+
+  def map(self, element):
+    return {"raw": element, "dataset_id": self.dataset_id}
+
+
 def get_datasets(
     data_file_pattern,
     data_file_type,
@@ -171,6 +186,7 @@ def get_datasets(
     grain_prefetch_buffer_size,
     grain_data_source_max_workers,
     mixture_config_path=None,
+    stamp_dataset_id=False,
     elastic=False,
     hf_access_token=None,
     dataset_config=None,
@@ -202,7 +218,9 @@ def get_datasets(
 
       datasets_dict = dict(zip(mixture_config.keys(), dataset_list))
 
-      for name, ds in datasets_dict.items():
+      for idx, (name, ds) in enumerate(datasets_dict.items()):
+        if stamp_dataset_id:
+          ds = ds.map(_StampDatasetId(idx + 1))
         datasets_dict[name] = _apply_mapdataset_transforms(
             ds,
             shuffle,
@@ -234,6 +252,8 @@ def get_datasets(
 
       # Apply shuffle, repeat, sharding, and conversion to IterDataset to each dataset before mixing
       for d, _ in enumerate(dataset_list):
+        if stamp_dataset_id:
+          dataset_list[d] = dataset_list[d].map(_StampDatasetId(d + 1))
         dataset_list[d] = _apply_mapdataset_transforms(
             dataset_list[d],
             shuffle,
@@ -251,6 +271,8 @@ def get_datasets(
     else:
       # Single pattern case - no need for parallelization
       dataset = create_dataset_from_pattern(data_file_pattern)
+      if stamp_dataset_id:
+        dataset = dataset.map(_StampDatasetId(1))
       dataset = _apply_mapdataset_transforms(
           dataset,
           shuffle,
@@ -423,6 +445,7 @@ def pretrain_preprocessing_pipeline(
     tokenize,
     grain_worker_count,
     grain_per_worker_buffer_size,
+    stamp_dataset_id=False,  # unused; accepted so all grain pipelines share one partial
 ):
   """Use grain pipeline to pre-process the dataset and return iterators for pretrain"""
   if config.grain_file_type in ("mmap", "mmap_npy"):
@@ -477,6 +500,7 @@ def dpo_preprocessing_pipeline(
     tokenize,
     grain_worker_count,
     grain_per_worker_buffer_size,
+    stamp_dataset_id=False,  # unused; accepted so all grain pipelines share one partial
 ):
   """Use grain to pre-process the dataset and return iterators for dpo fine-tuning"""
   dataset = data_processing_utils.parse_and_keep_features(dataset, config, data_columns, tokenize)
@@ -511,32 +535,34 @@ def dpo_preprocessing_pipeline(
 
 def _format_chat_template_grain(element, data_columns, tokenizer_model):
   """Grain-compatible mapping function to format raw columns into conversational messages."""
+  tools_column_name = data_processing_utils.TOOLS_COLUMN if data_processing_utils.TOOLS_COLUMN in data_columns else None
+  primary_columns = [c for c in data_columns if c != data_processing_utils.TOOLS_COLUMN]
+
   # Convert raw columns to conversational messages
-  if "messages" in data_columns:
+  if "messages" in primary_columns:
     messages = element["messages"]
-  elif set(data_columns) == {"prompt", "completion"}:
-    messages = [
-        {"role": "user", "content": element["prompt"]},
-        {"role": "assistant", "content": element["completion"]},
-    ]
-  elif set(data_columns) == {"question", "answer"}:
-    messages = [
-        {"role": "user", "content": element["question"]},
-        {"role": "assistant", "content": element["answer"]},
-    ]
+    if isinstance(messages, (str, bytes)):
+      messages = json.loads(messages)
+  elif set(primary_columns) == {"prompt", "completion"}:
+    messages = [{"role": "user", "content": element["prompt"]}, {"role": "assistant", "content": element["completion"]}]
+  elif set(primary_columns) == {"question", "answer"}:
+    messages = [{"role": "user", "content": element["question"]}, {"role": "assistant", "content": element["answer"]}]
   else:
     # Fallback if it's already a single string
-    messages = element[data_columns[0]]
+    messages = element[primary_columns[0]]
 
   assert all(
       hasattr(m, "__contains__") and "role" in m and "content" in m for m in messages
   ), f"SFT requires a conversational format. Expected dicts with 'role' and 'content', but got: {messages}"
 
   # Assign the standardized messages back to the primary column
-  element[data_columns[0]] = messages
+  element[primary_columns[0]] = messages
 
   return input_pipeline_utils.apply_chat_template(
-      element, tokenizer_model=tokenizer_model, data_column_name=data_columns[0]
+      element,
+      tokenizer_model=tokenizer_model,
+      data_column_name=primary_columns[0],
+      tools_column_name=tools_column_name,
   )
 
 
@@ -554,8 +580,15 @@ def sft_preprocessing_pipeline(
     tokenize,
     grain_worker_count,
     grain_per_worker_buffer_size,
+    stamp_dataset_id=False,
 ):
-  """Use grain pipeline to pre-process the dataset and return iterators for sft fine-tuning"""
+  """Use grain pipeline to pre-process the dataset and return iterators for sft fine-tuning.
+
+  ``stamp_dataset_id`` must mirror the flag given to :func:`get_datasets`: it says whether the
+  records actually carry a ``dataset_id`` column. Only the train mixture is stamped — per-dataset
+  eval (Option B) runs one pass per dataset and needs no id — so this cannot be derived from
+  ``config.per_dataset_metrics`` alone.
+  """
   dataset = data_processing_utils.parse_and_keep_features(dataset, config, data_columns, tokenize)
 
   tokenizer_model, pad_id = data_processing_utils.get_tokenizer_and_pad_id(config)
@@ -566,6 +599,8 @@ def sft_preprocessing_pipeline(
   data_processing_utils.validate_and_configure_sft_columns(
       data_columns, tokenizer_model, getattr(config, "chat_template", None)
   )
+
+  primary_columns = [c for c in data_columns if c != data_processing_utils.TOOLS_COLUMN]
 
   dataset = dataset.map(
       functools.partial(
@@ -579,20 +614,48 @@ def sft_preprocessing_pipeline(
     dataset = dataset.map(
         functools.partial(
             _tokenize_sft_chunks,
-            text_column_name=data_columns[0],
+            text_column_name=primary_columns[0],
             tokenizer_model=tokenizer_model,
         )
     )
 
-  dataset = dataset.map(
-      input_pipeline_utils.SFTPromptMasking(
-          text_column_name=data_columns[0],
-          completion_only=config.sft_train_on_completion_only,
-          max_target_length=config.max_target_length,
-          unk_id=pad_id,
-      )
-  )
+  long_handling = getattr(config, "sft_long_example_handling", "truncate")
+  if long_handling == "window":
+    assert (
+        config.sft_train_on_completion_only
+    ), "sft_long_example_handling='window' requires sft_train_on_completion_only=True"
+    # Split examples longer than max_target_length into windows (one-to-many) instead of
+    # head-truncating them, so the turn terminator (<end_of_turn>) always enters the loss.
+    windows = input_pipeline_utils.SFTPromptMaskingWindows(
+        text_column_name=primary_columns[0],
+        completion_only=config.sft_train_on_completion_only,
+        max_target_length=config.max_target_length,
+        unk_id=pad_id,
+        overlap=config.sft_window_overlap,
+        context_cap=config.sft_window_context_cap,
+        max_fan_out=config.sft_window_max_fan_out,
+    )
+    # grain applies a FlatMapTransform via IterDataset.apply() in newer releases and via the
+    # FlatMapIterDataset constructor in older ones (<=0.2.12). Support both so this works
+    # regardless of the grain version pinned in the runner image.
+    if hasattr(dataset, "apply"):
+      dataset = dataset.apply(windows)
+    else:
+      dataset = grain.experimental.FlatMapIterDataset(dataset, windows)
+  else:
+    dataset = dataset.map(
+        input_pipeline_utils.SFTPromptMasking(
+            text_column_name=primary_columns[0],
+            completion_only=config.sft_train_on_completion_only,
+            max_target_length=config.max_target_length,
+            unk_id=pad_id,
+        )
+    )
   data_columns = ("inputs", "targets")
+  # Only include dataset_id when the records were actually stamped (train mixture). Adding it for
+  # eval would put it in the packer's length_struct and grain would raise KeyError: 'dataset_id'.
+  if stamp_dataset_id:
+    data_columns = data_columns + ("dataset_id",)
 
   batch_size = data_processing_utils.get_local_batch_size(config)
   dataset = data_processing_utils.format_and_batch(
@@ -774,6 +837,8 @@ def make_grain_train_iterator(
       config.global_batch_size_to_load % global_mesh.size == 0
   ), "Batch size should be divisible by number of global devices."
 
+  if config.per_dataset_metrics and (config.use_multimodal or config.grain_file_type in ("mmap", "mmap_npy")):
+    raise ValueError("Per-dataset metrics currently require a text ArrayRecord, TFRecord or Parquet pipeline.")
   pipeline_fn = _get_pipeline_fn(config)
   mmap_npy_num_samples = (
       config.steps * config.global_batch_size_to_load
@@ -820,6 +885,7 @@ def make_grain_train_iterator(
       grain_data_source_max_workers=config.grain_data_source_max_workers,
       grain_index_storage_option=getattr(config, "grain_index_storage_option", None),
       mixture_config_path=config.grain_train_mixture_config_path,
+      stamp_dataset_id=config.per_dataset_metrics,
       elastic=config.grain_use_elastic_iterator,
       hf_access_token=getattr(config, "hf_access_token", None),
       dataset_config=dataset_config,
@@ -833,6 +899,8 @@ def make_grain_train_iterator(
       "grain_worker_count": config.grain_worker_count,
       "grain_per_worker_buffer_size": config.grain_per_worker_buffer_size,
   }
+  if not config.use_multimodal:
+    preprocessing_fn_kwargs["stamp_dataset_id"] = config.per_dataset_metrics
   if config.use_sft and config.use_multimodal:
     preprocessing_fn_kwargs["image_column"] = config.train_image_column
 
@@ -917,12 +985,25 @@ def make_grain_eval_iterator(
     config: ml_collections.ConfigDict,
     global_mesh,
     process_indices,
+    eval_files_override=None,
+    force_padding_batch=False,
 ):
-  """Load, preprocess dataset and return iterators"""
+  """Load, preprocess dataset and return iterators.
+
+  ``eval_files_override`` (per_dataset_metrics Option B): use this glob instead of
+  ``config.grain_eval_files`` so one iterator can be built per eval dataset.
+
+  ``force_padding_batch`` (per_dataset_metrics Option B): force the multi-host iterator to pad instead of
+  raising StopIteration, so every host issues an identical (fixed) number of eval collectives even when a
+  small per-dataset split does not divide evenly across hosts. Without this, a short host exits early and
+  the SPMD launch groups diverge (E0200). See docs/012.
+  """
   assert (
       config.global_batch_size_to_load_eval % global_mesh.size == 0
   ), "Batch size should be divisible by number of global devices."
 
+  if config.per_dataset_metrics and (config.use_multimodal or config.grain_file_type in ("mmap", "mmap_npy")):
+    raise ValueError("Per-dataset metrics currently require a text ArrayRecord, TFRecord or Parquet pipeline.")
   pipeline_fn = _get_pipeline_fn(config)
   mmap_npy_eval_num_samples = None
   if config.grain_file_type == "mmap_npy" and hasattr(config, "eval_steps") and config.eval_steps > 0:
@@ -956,7 +1037,7 @@ def make_grain_eval_iterator(
 
   get_ds_fn = functools.partial(
       get_datasets,
-      grain_eval_files,
+      eval_files_override or grain_eval_files,
       config.grain_file_type,
       shuffle=False,  # No shuffle for eval
       shuffle_seed=config.data_shuffle_seed,
@@ -979,6 +1060,8 @@ def make_grain_eval_iterator(
       "grain_worker_count": config.grain_worker_count_eval,
       "grain_per_worker_buffer_size": config.grain_per_worker_buffer_size_eval,
   }
+  if not config.use_multimodal:
+    eval_preprocessing_fn_kwargs["stamp_dataset_id"] = False
   if config.use_sft and config.use_multimodal:
     eval_preprocessing_fn_kwargs["image_column"] = config.eval_image_column
 
@@ -987,6 +1070,37 @@ def make_grain_eval_iterator(
       **eval_preprocessing_fn_kwargs,
   )
 
+  use_padding = config.generate_padding_batch_eval or force_padding_batch
+
+  # Option B (force_padding_batch) is text-only: the zero-data-host template below covers text columns.
+  # A multimodal split with an empty host would need image columns too, so fail fast at setup.
+  assert not (force_padding_batch and config.use_multimodal), (
+      "per_dataset_metrics Option B (force_padding_batch) is not supported for multimodal eval: the "
+      "zero-data-host padding template covers text columns only (see docs/012)."
+  )
+
+  # Zero-batch template for a host whose strided eval shard is EMPTY (a split with fewer records than
+  # dataloading hosts): it has no real batch to clone, so _make_padding_batch would otherwise ValueError.
+  # These are exactly the six int32 columns a *text* eval batch carries: the two data columns plus their
+  # _position/_segmentation, packed to (local batch, max_target_length). stamp_dataset_id=False for eval, so
+  # there is no dataset_id column. Left None for multimodal (pre-existing generate_padding_batch_eval path),
+  # which preserves the prior clone-last-batch behavior.
+  padding_batch_template = None
+  if use_padding and not config.use_multimodal:
+    local_bs = data_processing_utils.get_local_batch_size(config)
+    seq = config.max_target_length
+    padding_batch_template = {
+        col: np.zeros((local_bs, seq), np.int32)
+        for col in (
+            "inputs",
+            "inputs_position",
+            "inputs_segmentation",
+            "targets",
+            "targets_position",
+            "targets_segmentation",
+        )
+    }
+
   if not config.colocated_python_data_input:
     eval_ds = get_ds_fn(
         dataloading_host_index=process_indices.index(jax.process_index()),
@@ -994,7 +1108,7 @@ def make_grain_eval_iterator(
     )
     eval_dataloader = preprocessing_fn(dataset=eval_ds)
     return multihost_dataloading.MultiHostDataLoadIterator(
-        eval_dataloader, global_mesh, config.generate_padding_batch_eval
+        eval_dataloader, global_mesh, use_padding, padding_batch_template=padding_batch_template
     )
   else:
     global_shape = (config.global_batch_size_to_load_eval, config.max_target_length)

@@ -25,6 +25,9 @@ from maxtext.input_pipeline import tokenizer
 from maxtext.utils import elastic_utils
 
 
+TOOLS_COLUMN = "tools"
+
+
 def parse_and_keep_features(dataset, config, data_columns, tokenize):
   """Parse arrayrecord features or keep specified columns for other formats."""
   if config.grain_file_type in ("arrayrecord", "tfrecord"):
@@ -35,11 +38,25 @@ def parse_and_keep_features(dataset, config, data_columns, tokenize):
   return dataset
 
 
+@functools.lru_cache(maxsize=None)
+def _build_tokenizer_cached(tokenizer_path, tokenizer_type, add_bos, add_eos, hf_access_token):
+  """Build a tokenizer once per distinct configuration, then reuse it.
+
+  Each preprocessing pipeline constructs its own tokenizer. That was fine with one train and one
+  eval iterator, but per-dataset eval (Option B) builds one pipeline per dataset (~59), on every
+  data-loading host. For a remote HF id every construction is a Hub API call
+  (AutoTokenizer.from_pretrained -> is_base_mistral -> model_info), so a large slice issues
+  hosts x datasets calls in one startup burst and trips the Hub rate limit (429). Caching also
+  saves the redundant load time and memory. Args are the plain hashable tokenizer identity.
+  """
+  return tokenizer.build_tokenizer(tokenizer_path, tokenizer_type, add_bos, add_eos, hf_access_token)
+
+
 def get_tokenizer_and_pad_id(config, add_bos: bool | None = None, add_eos: bool | None = None):
   """Builds tokenizer and extracts pad_id safely."""
   bos = config.add_bos if add_bos is None else add_bos
   eos = config.add_eos if add_eos is None else add_eos
-  tokenizer_model = tokenizer.build_tokenizer(
+  tokenizer_model = _build_tokenizer_cached(
       config.tokenizer_path,
       config.tokenizer_type,
       bos,
@@ -60,7 +77,7 @@ def validate_and_configure_sft_columns(data_columns, tokenizer_model, chat_templ
   if chat_template and hasattr(tokenizer_model, "chat_template"):
     tokenizer_model.chat_template = chat_template
 
-  supported_columns = [["prompt", "completion"], ["messages"], ["question", "answer"]]
+  supported_columns = [["prompt", "completion"], ["messages"], ["messages", TOOLS_COLUMN], ["question", "answer"]]
   assert any(
       set(data_columns) == set(supported) for supported in supported_columns
   ), f"Dataset column names mismatch. Expected columns to match one of {supported_columns}, but got {data_columns}"
@@ -124,6 +141,15 @@ def format_and_batch(dataset, config, batch_size, pad_id, data_columns, tokenize
         "inputs_position": "inputs_positions",
     }
     dataset = dataset.map(input_pipeline_utils.Rekey(rekey_dict))
+    if "dataset_id" in data_columns:
+      # grain's packer emits junk dataset_id_segment_ids/_positions; keep only the token-aligned id.
+      # Gated on the actual column set (not per_dataset_metrics) so the eval pipeline — which is
+      # never stamped — doesn't get a pointless no-op map.
+      dataset = dataset.map(
+          input_pipeline_utils.DropKeys(
+              ("dataset_id_segment_ids", "dataset_id_positions", "dataset_id_segmentation", "dataset_id_position")
+          )
+      )
   else:
     dataset = dataset.map(input_pipeline_utils.PadOrTrimToMaxLength(config.max_target_length, pad_id))
 

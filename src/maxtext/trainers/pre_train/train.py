@@ -105,9 +105,57 @@ def get_first_step(model, state):
   return int(state.optimizer.step.get_value())
 
 
-# -----------------------------------------------------------------------------
-# Top-level Functions
-# -----------------------------------------------------------------------------
+def _num_datasets_plus1(config):
+  """Static [num_datasets + 1]: slot 0 = pad/unknown, 1..num_datasets = mixture components."""
+  return len([n for n in config.per_dataset_names.split(",") if n]) + 1
+
+
+def _per_dataset_from_logits(logits, masked_xent, data, config):
+  """Non-tiled per-dataset (xent_sum, correct_count) vectors of shape [num_datasets+1].
+
+  `masked_xent` is the per-token cross-entropy already multiplied by the completion mask, so a
+  segment-sum by `dataset_id` gives each component's summed loss. `correct` is next-token accuracy
+  over the same mask. Both emit an SPMD all-reduce over the DP-sharded batch inside pjit.
+  """
+  num_seg = _num_datasets_plus1(config)
+  ids = data["dataset_id"].reshape(-1)
+  mask = data["targets_segmentation"] != 0
+  xent_sum_by_ds = jax.ops.segment_sum(masked_xent.reshape(-1), ids, num_segments=num_seg)
+  correct = (jnp.argmax(logits, axis=-1) == data["targets"]) & mask
+  correct_by_ds = jax.ops.segment_sum(correct.reshape(-1).astype(jnp.int32), ids, num_segments=num_seg)
+  return xent_sum_by_ds, correct_by_ds
+
+
+def _total_correct_from_logits(logits, data):
+  """Aggregate next-token correct-token count over the loss mask (non-tiled path only).
+
+  With vocab tiling the decoder returns logits=None, so the tiled path sources this from the
+  tiled scan instead (see vocab_tiling_linen_loss).
+  """
+  return jnp.sum((jnp.argmax(logits, axis=-1) == data["targets"]) & (data["targets_segmentation"] != 0))
+
+
+def _assemble_per_dataset_aux(config, data, xent_sum_by_ds, correct_by_ds):
+  """Per-dataset aux dict (xent_sum / correct / token_count, each [num_datasets+1]) or None.
+
+  Only for the train path (batches carry `dataset_id`); eval Option B runs per-dataset passes and
+  has no `dataset_id`, so this returns None there.
+  """
+  if not (config.per_dataset_metrics and "dataset_id" in data):
+    return None
+  num_seg = _num_datasets_plus1(config)
+  ids = data["dataset_id"].reshape(-1)
+  token_count_by_ds = jax.ops.segment_sum(
+      (data["targets_segmentation"] != 0).reshape(-1).astype(jnp.int32), ids, num_segments=num_seg
+  )
+  if xent_sum_by_ds is None:  # tiled loss path not yet wired for per-dataset (Phase 2) — emit zeros
+    xent_sum_by_ds = jnp.zeros(num_seg, jnp.float32)
+    correct_by_ds = jnp.zeros(num_seg, jnp.int32)
+  return {
+      "xent_sum_by_ds": xent_sum_by_ds,
+      "correct_by_ds": correct_by_ds,
+      "token_count_by_ds": token_count_by_ds,
+  }
 
 
 def loss_fn(model, config, data, dropout_rng, params, sparsity_state=None, is_train=True):
@@ -177,6 +225,12 @@ def loss_fn(model, config, data, dropout_rng, params, sparsity_state=None, is_tr
         "encoder_images": encoder_images,
         "encoder_image_masks": encoder_image_masks,
     }
+
+  # Per-dataset (per mixture component) accumulators; filled in the loss branch below (train only).
+  xent_sum_by_ds = None
+  correct_by_ds = None
+  # Aggregate correct-token count for this batch; used for eval accuracy (train or eval).
+  total_correct = None
   mutable_collections = ["intermediates"]
   if config.mtp_num_layers > 0 and is_train:
     # The single model.apply call now triggers the entire chain if MTP is enabled:
@@ -229,7 +283,17 @@ def loss_fn(model, config, data, dropout_rng, params, sparsity_state=None, is_tr
     elif config.num_vocab_tiling > 1:
       hidden_state_key = ("intermediates", "decoder", "hidden_states")
       hidden_states = maxtext_utils.get_nested_value(intermediate_outputs, hidden_state_key)[0]
-      xent_sum, total_z_loss = vocab_tiling_linen_loss(hidden_states, data, config, model, params, is_train)
+      if config.per_dataset_metrics:
+        xent_sum, total_z_loss, _pd_xent, _pd_correct = vocab_tiling_linen_loss(
+            hidden_states, data, config, model, params, is_train
+        )
+        # No full logits exist on the tiled path, so accuracy comes from the tiled scan. Train
+        # batches give per-component vectors; eval batches bucket into one slot (the aggregate).
+        total_correct = jnp.sum(_pd_correct)
+        if "dataset_id" in data:
+          xent_sum_by_ds, correct_by_ds = _pd_xent, _pd_correct
+      else:
+        xent_sum, total_z_loss = vocab_tiling_linen_loss(hidden_states, data, config, model, params, is_train)
     else:
       if is_block_diffusion:
         logits = block_diffusion_target_alignment.align_logits_to_targets(
@@ -265,6 +329,10 @@ def loss_fn(model, config, data, dropout_rng, params, sparsity_state=None, is_tr
 
       xent_sum = jnp.sum(xent)
       total_z_loss = jnp.sum(z_loss)
+      if config.per_dataset_metrics:
+        total_correct = _total_correct_from_logits(logits, data)
+        if "dataset_id" in data:
+          xent_sum_by_ds, correct_by_ds = _per_dataset_from_logits(logits, xent, data, config)
   else:
     # Flax NNX model: forward pass, then pop Intermediates sown during it.
     logits = model(
@@ -346,12 +414,18 @@ def loss_fn(model, config, data, dropout_rng, params, sparsity_state=None, is_tr
 
       xent_sum = jnp.sum(xent)
       total_z_loss = jnp.sum(z_loss)
+      if config.per_dataset_metrics:
+        total_correct = _total_correct_from_logits(logits, data)
+        if "dataset_id" in data:
+          xent_sum_by_ds, correct_by_ds = _per_dataset_from_logits(logits, xent, data, config)
 
   if is_block_diffusion:
     assert targets_loss_mask is not None
     total_weights = jnp.sum(targets_loss_mask)
   else:
     total_weights = jnp.sum(data["targets_segmentation"] != 0)
+  per_dataset_aux = _assemble_per_dataset_aux(config, data, xent_sum_by_ds, correct_by_ds)
+  combined_sum = xent_sum
   # If gradient accumulation is enabled, we don't need to divide xent_sum
   # by total_weights and then multiply the computed gradient by total_weights,
   # since it's equivalent to computing the gradient from xent_sum.
@@ -361,15 +435,14 @@ def loss_fn(model, config, data, dropout_rng, params, sparsity_state=None, is_tr
   # EPS was used to avoid division by zero, but it's not needed when gradient
   # accumulation is enabled since there's no division.
   if config.gradient_accumulation_steps > 1 and not config.use_tunix_gradient_accumulation:
-    loss = xent_sum
+    loss = combined_sum
   else:
     # When using Tunix gradient accumulation, we revert to standard normalization.
     # Unlike the manual accumulation path above, Tunix (via optax.MultiSteps) expects
     # a normalized loss for each step. It handles the accumulation state
     # updates and scaling internally.
-    loss = xent_sum / (total_weights + EPS)
+    loss = combined_sum / (total_weights + EPS)
 
-  # We keep z-loss normalized by total_weights.
   total_z_loss = total_z_loss / (total_weights + EPS)
 
   # Calculate and Add MTP Loss
@@ -460,6 +533,11 @@ def loss_fn(model, config, data, dropout_rng, params, sparsity_state=None, is_tr
     if moe_overflow_flags:
       has_moe_overflow = jnp.any(jnp.stack([jnp.any(x) for x in moe_overflow_flags]))
   aux["has_moe_overflow"] = has_moe_overflow
+
+  if per_dataset_aux is not None:
+    aux["per_dataset"] = per_dataset_aux
+  if total_correct is not None:
+    aux["total_correct"] = total_correct
   return loss, aux
 
 
@@ -612,6 +690,7 @@ def train_step(model, config, state_mesh_shardings, params_shardings, state, dat
   moe_bias_updates = aux.get("moe_bias_updates")
   mtp_moe_bias_updates = aux.get("mtp_moe_bias_updates")
   mtp_loss = aux.get("mtp_loss", 0.0)
+  per_dataset = aux.get("per_dataset")
   new_opt_state = None
   bias_metrics = {}
 
@@ -806,6 +885,9 @@ def train_step(model, config, state_mesh_shardings, params_shardings, state, dat
   }
   if config.retry_when_tokens_dropped:
     metrics["has_moe_overflow"] = has_moe_overflow if has_moe_overflow is not None else jnp.bool_(False)
+
+  if per_dataset is not None:
+    metrics["per_dataset"] = per_dataset
   if getattr(config, "record_internal_nn_metrics", False):
     record_activation_metrics(metrics, intermediate_outputs, config)
 
@@ -841,18 +923,23 @@ def eval_step(model, config, state, data, dropout_rng=None):
   indexer_loss = aux.get("indexer_loss", 0.0)
   mtp_loss = aux.get("mtp_loss", 0.0)
   eval_total_loss = xent_sum
-  metrics = {
-      "scalar": {
-          "evaluation/loss": loss,
-          "evaluation/z_loss": z_loss,
-          "evaluation/total_loss": eval_total_loss,
-          "evaluation/total_weights": total_weights,
-          "evaluation/moe_lb_loss": moe_lb_loss,
-          "evaluation/indexer_loss": indexer_loss,
-          "evaluation/mtp_loss": mtp_loss,
-          "evaluation/mtp_acceptance_rate_percent": mtp_acceptance_rate,
-      },
+  eval_scalar = {
+      "evaluation/loss": loss,
+      "evaluation/z_loss": z_loss,
+      "evaluation/total_loss": eval_total_loss,
+      "evaluation/total_weights": total_weights,
+      "evaluation/moe_lb_loss": moe_lb_loss,
+      "evaluation/indexer_loss": indexer_loss,
+      "evaluation/mtp_loss": mtp_loss,
+      "evaluation/mtp_acceptance_rate_percent": mtp_acceptance_rate,
   }
+  # Aggregate correct-token count for per-dataset eval accuracy. loss_fn supplies it from whichever
+  # path applies (tiled scan or full logits); it is simply absent if neither could produce one
+  # (e.g. the NNX tiled path), and the eval loop degrades to loss/perplexity only.
+  eval_total_correct = aux.get("total_correct")
+  if eval_total_correct is not None:
+    eval_scalar["evaluation/total_correct"] = eval_total_correct.astype(jnp.float32)
+  metrics = {"scalar": eval_scalar}
 
   return metrics
 
@@ -964,29 +1051,63 @@ def training_loop_iteration(
       and (step - eval_start_step) % eval_interval == 0
   ):
     assert eval_data_iterator
-    # Explicitly reset the eval iterator and counters before starting the eval loop
-    eval_data_iterator.reset()
-    metric_logger_instance.reset_eval_metrics()
-    max_logging.log(f"Starting eval after train step {step}")
+    if isinstance(eval_data_iterator, dict):
+      # per_dataset_metrics Option B: one full eval pass per dataset; each pass's aggregate is that
+      # dataset's metric. Every host MUST issue exactly the same number of p_eval_step collectives
+      # per dataset, else the SPMD launch groups diverge -> E0200 core-halt. We therefore run a
+      # FIXED `eval_steps` launches: the per-dataset iterators are built with force_padding_batch=True
+      # (input_pipeline_interface.py), so next() never raises StopIteration and no host exits early.
+      # All-zero padding batches have targets_segmentation==0 -> contribute 0 to loss/weights/correct,
+      # so the metric is identical to a real-only pass (see docs/012).
+      assert eval_steps > 0, (
+          "per_dataset_metrics Option B requires eval_steps > 0: the per-dataset iterators pad "
+          "indefinitely (force_padding_batch), so eval_steps is what bounds each dataset pass."
+      )
+      _eval_sharding = sharding.get_input_data_sharding(config, mesh, rules=config.logical_axis_rules_for_eval)
+      per_dataset_eval = {}
+      for ds_name, ds_iter in eval_data_iterator.items():
+        ds_iter.reset()
+        xent_sum_acc, tokens_acc, correct_acc = 0.0, 0.0, 0.0
+        has_correct = True  # accuracy is optional; loss/perplexity always work
+        # pylint: disable=not-callable
+        for _ in range(eval_steps):
+          eval_batch = jax.device_put(next(ds_iter), _eval_sharding)
+          with jax.set_mesh(mesh), nn_partitioning.axis_rules(logical_axis_rules_for_eval):
+            em = p_eval_step(state, eval_batch, *step_rng_args)["scalar"]
+          xent_sum_acc += float(em["evaluation/total_loss"])
+          tokens_acc += float(em["evaluation/total_weights"])
+          if "evaluation/total_correct" in em:
+            correct_acc += float(em["evaluation/total_correct"])
+          else:
+            has_correct = False
+        per_dataset_eval[ds_name] = (xent_sum_acc, tokens_acc, correct_acc if has_correct else None)
+        max_logging.log(f"  eval[{ds_name}]: {eval_steps} steps, {int(tokens_acc)} loss-tokens")
+      metric_logger_instance.write_per_dataset_eval(per_dataset_eval, step)
 
-    eval_step_count = 0
-    last_eval_step_completion = datetime.datetime.now()
-    # pylint: disable=not-callable
-    for eval_batch in eval_data_iterator:
-      # Shard input eval data
-      eval_batch = jax.device_put(
-          eval_batch, sharding.get_input_data_sharding(config, mesh, rules=config.logical_axis_rules_for_eval)
-      )
-      if 0 < eval_steps <= eval_step_count:
-        break
-      with jax.set_mesh(mesh), nn_partitioning.axis_rules(logical_axis_rules_for_eval):
-        eval_metrics = p_eval_step(state, eval_batch, *step_rng_args)
-      eval_step_time_delta = datetime.datetime.now() - last_eval_step_completion
+    else:
+      # Explicitly reset the eval iterator and counters before starting the eval loop
+      eval_data_iterator.reset()
+      metric_logger_instance.reset_eval_metrics()
+      max_logging.log(f"Starting eval after train step {step}")
+
+      eval_step_count = 0
       last_eval_step_completion = datetime.datetime.now()
-      metric_logger_instance.buffer_and_write_metrics(
-          eval_metrics, eval_step_count, step_time_delta=eval_step_time_delta, is_training=False
-      )
-      eval_step_count += 1
+      # pylint: disable=not-callable
+      for eval_batch in eval_data_iterator:
+        # Shard input eval data
+        eval_batch = jax.device_put(
+            eval_batch, sharding.get_input_data_sharding(config, mesh, rules=config.logical_axis_rules_for_eval)
+        )
+        if 0 < eval_steps <= eval_step_count:
+          break
+        with jax.set_mesh(mesh), nn_partitioning.axis_rules(logical_axis_rules_for_eval):
+          eval_metrics = p_eval_step(state, eval_batch, *step_rng_args)
+        eval_step_time_delta = datetime.datetime.now() - last_eval_step_completion
+        last_eval_step_completion = datetime.datetime.now()
+        metric_logger_instance.buffer_and_write_metrics(
+            eval_metrics, eval_step_count, step_time_delta=eval_step_time_delta, is_training=False
+        )
+        eval_step_count += 1
 
   prof.maybe_deactivate_profiler(step, state)
 

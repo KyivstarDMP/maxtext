@@ -101,6 +101,9 @@ class MetricLogger:
     self.performance_metric_queue = self.get_performance_metric_queue(config)
     self.learning_rate_schedule = learning_rate_schedule
     self.cumulative_eval_metrics = {"scalar": defaultdict(float)}
+    # Running [xent_sum, token_count, correct] per dataset, summed across the current log_period
+    # window; flushed as one token-weighted point per window by _expand_per_dataset_train.
+    self._per_dataset_accum = None
     # self.buffered_metrics is a polymorphic deferred-write queue. Entries are one of:
     #   ("train", train_step, metrics, step_time_delta)
     #   ("eval", eval_step, metrics, step_time_delta)
@@ -128,6 +131,8 @@ class MetricLogger:
   def write_metrics(self, metrics, step, metric_type="train"):
     """Entry point for all metrics writing. metric_type is one of 'train', 'eval', 'running_eval'."""
     if metrics:
+      if metric_type == "train" and "per_dataset" in metrics:
+        self._expand_per_dataset_train(metrics, step)
       self.log_metrics(metrics, step, metric_type)
 
       if self.config.enable_tensorboard and metric_type != "running_eval":
@@ -147,6 +152,112 @@ class MetricLogger:
 
       if metric_type == "train":
         self._maybe_abort_after_write_metrics(metrics)
+
+  def _expand_per_dataset_train(self, metrics, step):
+    """Accumulate per-dataset train metrics and emit one aggregate point per window.
+
+    Window length is `per_dataset_log_period` steps, or `log_period` when that is <= 0.
+
+    A single packed batch covers only a handful of the mixture's components, so a per-step
+    per-dataset curve is extremely noisy (a few sequences per dataset per step) and costs one
+    scalar write per dataset per step. Instead we sum the raw [num_datasets+1] vectors across the
+    window and emit a single token-weighted point when it closes:
+
+        loss     = sum(xent)    / sum(tokens)      over the window
+        accuracy = sum(correct) / sum(tokens)      over the window
+        tokens   = sum(tokens)                     over the window (coverage)
+
+    Summing first and dividing once is a ratio-of-sums, i.e. exactly the token-weighted mean —
+    never a mean-of-ratios — so it stays consistent with the aggregate `learning/lm_loss`.
+
+    Slot 0 (pad/unknown) is dropped; index i (1-based) maps to per_dataset_names[i-1]. Datasets
+    with no tokens in the whole window report only `tokens = 0`; their loss/accuracy keys are
+    omitted rather than written as NaN (writing NaN makes the summary writer log
+    "NaN or Inf found in input tensor" once per absent dataset).
+    """
+    pd = metrics.pop("per_dataset")
+    xs = np.asarray(pd["xent_sum_by_ds"], dtype=np.float64)
+    tk = np.asarray(pd["token_count_by_ds"], dtype=np.float64)
+    ok = np.asarray(pd["correct_by_ds"], dtype=np.float64)
+    if self._per_dataset_accum is None:
+      self._per_dataset_accum = [xs.copy(), tk.copy(), ok.copy()]
+    else:
+      self._per_dataset_accum[0] += xs
+      self._per_dataset_accum[1] += tk
+      self._per_dataset_accum[2] += ok
+
+    # Window length: per_dataset_log_period when set, else fall back to the general log_period.
+    period = int(self.config.per_dataset_log_period)
+    if period <= 0:
+      period = int(self.config.log_period)
+    period = max(1, period)
+    if (step + 1) % period != 0 and step != self.config.steps - 1:
+      return  # window still open — nothing written this step
+
+    xs_w, tk_w, ok_w = self._per_dataset_accum
+    self._per_dataset_accum = None
+    names = [n for n in self.config.per_dataset_names.split(",") if n]
+    scalar = metrics["scalar"]
+    # Key layout is `per_dataset_train_<type>/<name>`: W&B groups panels into sections by the FIRST '/'
+    # segment (default "group by first prefix"), so putting the metric type in that segment gives one
+    # section per (split, type) — per_dataset_train_loss / _accuracy / _tokens — each holding one panel
+    # per dataset. TensorBoard groups on the same prefix. See docs/012.
+    for i, name in enumerate(names, start=1):
+      t = float(tk_w[i])
+      scalar[f"per_dataset_train_tokens/{name}"] = t
+      if t > 0:
+        scalar[f"per_dataset_train_loss/{name}"] = float(xs_w[i]) / t
+        scalar[f"per_dataset_train_accuracy/{name}"] = float(ok_w[i]) / t
+
+  def write_per_dataset_eval(self, per_dataset_eval, step):
+    """Write per-dataset eval metrics (Option B): {name: (xent_sum, tokens, correct)} -> named scalars.
+
+    Each dataset's aggregate over its own eval pass becomes
+    per_dataset_eval_{loss,perplexity,accuracy,tokens}/<name>. Written straight to the TB/JSON/GCS
+    sinks (bypassing the eval-aggregation path, which is keyed on the single-pass evaluation/* keys).
+
+    The metric type is the FIRST '/' segment (`per_dataset_eval_loss/<name>`, not
+    `per_dataset_eval/loss/<name>`) so W&B — which groups panels into sections by the first prefix —
+    puts one section per (split, type), each holding one panel per dataset. See docs/012.
+    """
+    scalar = {}
+    for name, (xent_sum, tokens, correct) in per_dataset_eval.items():
+      if tokens > 0:
+        loss = xent_sum / tokens
+        scalar[f"per_dataset_eval_loss/{name}"] = loss
+        scalar[f"per_dataset_eval_perplexity/{name}"] = float(np.exp(loss))
+        if correct is not None:  # accuracy is optional (see the eval loop)
+          scalar[f"per_dataset_eval_accuracy/{name}"] = correct / tokens
+      scalar[f"per_dataset_eval_tokens/{name}"] = tokens
+    metrics = {"scalar": scalar, "scalars": {}}
+    if self.config.enable_tensorboard:
+      self.write_metrics_to_tensorboard(metrics, step, "eval")
+    if self.config.metrics_file:
+      self.write_metrics_locally(metrics, step)
+    if self.config.gcs_metrics and jax.process_index() == 0:
+      self.write_metrics_for_gcs(metrics, step, "eval")
+    # W&B logs via a separate hook (docker wandb-support.patch) that requires monotonically increasing
+    # steps. This method runs BEFORE the train step's buffered flush (train.py), so emitting to W&B here
+    # at `step` would make W&B drop the still-buffered train point at step-1. Defer the W&B emission to
+    # the next train buffer_and_write_metrics (mirrors _finalize_eval_metrics); TB/local/GCS above are
+    # order-independent so they stay here. See docs/012.
+    if scalar:
+      self._pending_per_dataset_eval_wandb = (dict(scalar), step)
+
+  def _flush_pending_per_dataset_eval_wandb(self):
+    """Emit any deferred per-dataset eval scalars to W&B at their eval step.
+
+    Called from buffer_and_write_metrics (train) AFTER the previous train step has been flushed, so the
+    eval step is >= the last W&B step and nothing is dropped. No-op unless the wandb hook is active
+    (self.enable_wandb / self.write_metrics_to_wandb are added by the wandb-support patch).
+    """
+    pending = getattr(self, "_pending_per_dataset_eval_wandb", None)
+    if pending is None:
+      return
+    scalar, eval_step = pending
+    self._pending_per_dataset_eval_wandb = None
+    if getattr(self, "enable_wandb", False):
+      self.write_metrics_to_wandb({"scalar": scalar, "scalars": {}}, eval_step)
 
   def log_metrics(self, metrics, step, metric_type):
     """Logs metrics via max_logging."""
@@ -420,6 +531,9 @@ class MetricLogger:
       self.buffered_metrics.append(("train", step, metrics, step_time_delta))
       if self._pending_eval_step_count > 0:
         self._finalize_eval_metrics(step)
+      # Emit deferred per-dataset eval scalars now: the previous train step was flushed above, so the
+      # eval step is monotonically safe for W&B (see write_per_dataset_eval).
+      self._flush_pending_per_dataset_eval_wandb()
     else:
       self._pending_eval_step_count += 1
       self.buffered_metrics.append(("eval", step, metrics, step_time_delta))
@@ -506,5 +620,7 @@ class MetricLogger:
     for entry in self.buffered_metrics:
       self._flush_one_buffered_entry(entry)
     self.buffered_metrics = []
+    # Safety net for the rare case where eval fires on the final step and no train flush follows.
+    self._flush_pending_per_dataset_eval_wandb()
 
     max_utils.close_summary_writer(self.writer)
