@@ -1337,9 +1337,14 @@ class Tokenizer(BaseModel):
       None,
       description="Path to the tokenizer model file.",
   )
+  tokenizer_revision: str = Field("", description="Optional Hugging Face revision passed when loading a Hub tokenizer.")
   tokenizer_type: TokenizerType = Field(TokenizerType.SENTENCEPIECE, description="The type of tokenizer.")
   use_chat_template: bool = Field(False, description="Whether to use the chat template for tokenization.")
-  chat_template_path: str = Field("", description="Path to chat template json file.")
+  chat_template_path: str = Field(
+      "", description="Path to a Jinja/text chat template or JSON object containing a chat_template field."
+  )
+  chat_template_revision: str = Field("", description="Optional Hugging Face revision for an hf:// chat_template_path.")
+  chat_template_sha256: str = Field("", description="Optional SHA-256 expected for the exact loaded chat-template bytes.")
   chat_template: str = Field(
       "",
       description="Chat template to use with HF tokenizers. It should be a valid Jinja2-formatted template.",
@@ -1517,6 +1522,34 @@ class FineTuning(BaseModel):
   sft_train_on_completion_only: bool = Field(
       False, description="If True, trains only on the completion part of the text."
   )
+  sft_chat_template_mode: Literal["segmented", "assistant_mask"] = Field(
+      "segmented",
+      description=(
+          "How Grain serializes SFT conversations and discovers loss ownership. 'segmented' preserves the "
+          "legacy per-round chat-template/LCP path. 'assistant_mask' renders one canonical token stream and "
+          "uses {% generation %} ownership returned by the tokenizer; it requires tokenization and "
+          "completion-only loss."
+      ),
+  )
+  sft_enable_thinking: bool = Field(
+      True,
+      description="Conversation-level enable_thinking value used when no per-row SFT mode column is configured.",
+  )
+  sft_enable_thinking_column: str = Field(
+      "",
+      description=(
+          "Optional required Grain SFT column containing one boolean enable_thinking value per conversation. "
+          "When set, it overrides sft_enable_thinking for every row."
+      ),
+  )
+  sft_preserve_thinking: bool | Literal["auto"] = Field(
+      "auto",
+      description=(
+          "Historical-reasoning policy passed to SFT chat templates. 'auto' follows each row's "
+          "enable_thinking in assistant_mask mode and omits preserve_thinking in segmented mode. "
+          "An explicit boolean is passed to every render in either mode; the template defines what it preserves."
+      ),
+  )
   sft_long_example_handling: Literal["truncate", "window"] = Field(
       "truncate",
       description=(
@@ -1537,13 +1570,36 @@ class FineTuning(BaseModel):
   sft_window_context_cap: int = Field(
       -1,
       description=(
-          "For 'window': max tokens of conversation-prefix context pinned (masked) in front of "
+          "For 'window': max tokens of bounded conversation-prefix context (masked) in front of "
           "each window. -1 = auto (max_target_length // 2)."
       ),
   )
   sft_window_max_fan_out: int = Field(
       32,
+      ge=1,
       description="For 'window': hard cap on records emitted per example (runaway guard).",
+  )
+  sft_window_pin_leading_context: bool = Field(
+      False,
+      description=(
+          "For Grain 'window' handling: preserve the canonical leading system/developer/native-tools "
+          "block when the ordinary context tail would left-cut it. The block remains masked."
+      ),
+  )
+  sft_window_pinned_context_overflow: Literal["error"] = Field(
+      "error",
+      description=(
+          "Behavior when the complete pinned leading block is at least as long as the effective context cap. "
+          "Only 'error' is supported so protected instructions are never silently left/right-truncated or "
+          "dropped. Shorten/split the pin, increase the context budget, or explicitly drop/quarantine the row "
+          "with accounting during preflight."
+      ),
+  )
+  sft_window_pinned_context_warn_fraction: float = Field(
+      0.5,
+      gt=0.0,
+      lt=1.0,
+      description=("Warn when a pinned leading block consumes more than this fraction of the effective context cap."),
   )
   per_dataset_metrics: bool = Field(
       False,
@@ -1719,6 +1775,18 @@ class TrainingLoop(BaseModel):
       description="Total number of training steps. -1 defaults to learning_rate_schedule_steps.",
   )
   log_period: int = Field(100, description="Frequency (in steps) to log metrics and flush Tensorboard.")
+  log_text_period: int = Field(0, ge=0, description="Log decoded training text samples every N steps; 0 disables it.")
+  log_text_num_samples: int = Field(1, ge=1, description="Number of batch rows to decode when text logging is active.")
+  log_text_num_docs: int = Field(
+      1,
+      ge=-1,
+      description="Maximum packed documents to log per row; 0 logs none and -1 logs all.",
+  )
+  log_text_num_tokens: int = Field(
+      64,
+      ge=-1,
+      description="Show the first and last N tokens per document; 0 logs counts only and -1 logs the full document.",
+  )
   eval_start_step: int = Field(
       0,
       ge=0,

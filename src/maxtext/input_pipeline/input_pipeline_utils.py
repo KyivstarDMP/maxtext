@@ -16,9 +16,11 @@
 
 import dataclasses
 import json
+import os
 import warnings
+from collections.abc import Mapping
 from threading import current_thread
-from typing import Any, Iterable, TYPE_CHECKING
+from typing import Any, Iterable, Literal, TYPE_CHECKING
 
 if TYPE_CHECKING:
   import datasets
@@ -28,6 +30,7 @@ import grain.python as grain
 import numpy as np
 from grain._src.python.dataset.sources.tfrecord_dataset import _TFRecordReader, _TFRecordDatasetIterator  # pylint: disable=protected-access
 from grain.experimental import FlatMapTransform, TFRecordIterDataset
+from jinja2.exceptions import TemplateError
 from maxtext.input_pipeline.protos import example_pb2
 from maxtext.input_pipeline import tokenizer
 from maxtext.multimodal import processor as mm_processor
@@ -37,6 +40,9 @@ from maxtext.utils import max_logging
 
 Features = dict[str, Any]
 INPUT_TOKENS_KEY = "input_ids"
+SFT_PINNED_CONTEXT_IDS_KEY = "sft_pinned_context_ids"
+SFT_SEGMENT_IDS_KEY = "sft_segment_ids"
+_TOOL_BODY_WARNING_PIDS = set()
 
 ########## Functions used by TFDS pipeline
 
@@ -214,74 +220,30 @@ def extract_token_ids(tokens):
     raise ValueError(f"Can't extract token_ids from type {type(tokens)}")
 
 
-def verify_chat_template_generation_prompt_logic(tokenizer_model):
-  """Verifies the tokenizer's chat template for correct SFT loss masking.
-
-  This function ensures that the tokens added by `add_generation_prompt=True`
-  are identical to the tokens that begin an assistant's turn in a complete
-  conversation, which is critical for masking prompt tokens during SFT loss
-  calculation.
-
-  Example of a mismatch:
-    A `ValueError` is raised if the generation prompt and the actual
-    assistant prefix do not match. For example:
-
-    - `add_generation_prompt=True` on a user message produces a prompt ending in:
-      `...<|im_start|>generation\n`
-    - A full turn with an assistant message starts the reply with:
-      `...<|im_start|>assistant\n...`
-
-    This function would fail because the tokens for "generation" do not
-    match the tokens for "assistant".
-
-  Args:
-    tokenizer_model: The Hugging Face tokenizer instance to verify.
-
-  Raises:
-    ValueError: If the `add_generation_prompt` tokens do not exactly
-      match the beginning of an assistant message in the template.
-  """
-  dummy_msgs = [{"role": "system", "content": "System message"}, {"role": "user", "content": "Test message"}]
-
-  try:
-    prompt_wo_gen_tokens = tokenizer_model.apply_chat_template(dummy_msgs, add_generation_prompt=False, tokenize=True, enable_thinking=True)
-  except TemplateError:
-    max_logging.info(
-        "Tokenizer failed to apply chat template with 'system' role. "
-        "Falling back to 'user' role only for chat template verification."
-    )
-    dummy_msgs.pop(0)
-    prompt_wo_gen_tokens = tokenizer_model.apply_chat_template(dummy_msgs, add_generation_prompt=False, tokenize=True, enable_thinking=True)
-  prompt_wo_gen_ids = extract_token_ids(prompt_wo_gen_tokens)
-
-  prompt_w_gen_tokens = tokenizer_model.apply_chat_template(dummy_msgs, add_generation_prompt=True, tokenize=True, enable_thinking=True)
-  prompt_w_gen_ids = extract_token_ids(prompt_w_gen_tokens)
-
-  if prompt_w_gen_ids[: len(prompt_wo_gen_ids)] != prompt_wo_gen_ids:
-    raise ValueError("Unable to extract generation prompt tokens.")
-  # Extract the tokenized generation prompt (the expected assistant prefix)
-  assistant_prefix = prompt_w_gen_ids[len(prompt_wo_gen_ids) :]
-  full_turn_tokens = extract_token_ids(
-      tokenizer_model.apply_chat_template(
-          dummy_msgs + [{"role": "assistant", "content": "Dummy response"}], add_generation_prompt=False, tokenize=True, enable_thinking=True
-      )
-  )
-  full_turn_ids = extract_token_ids(full_turn_tokens)
-  # Extract the actual tokens that appear right after the user message in the full turn
-  actual_prefix_in_full_turn = full_turn_ids[len(prompt_wo_gen_ids) : len(prompt_wo_gen_ids) + len(assistant_prefix)]
-
-  if actual_prefix_in_full_turn != assistant_prefix:
-    expected_str = tokenizer_model.decode(assistant_prefix)
-    actual_str = tokenizer_model.decode(actual_prefix_in_full_turn)
-    raise ValueError(
-        "Chat template generation prompt mismatch!\n"
-        f"Expected assistant prefix tokens: {assistant_prefix} ('{expected_str}')\n"
-        f"Actual prefix tokens found: {actual_prefix_in_full_turn} ('{actual_str}')\n"
-        "This means the tokenizer's chat template will break the sft masking logic."
-    )
+def _resolve_sft_preserve_thinking(
+    setting: bool | Literal["auto"], enable_thinking: bool, *, mode: Literal["segmented", "assistant_mask"]
+) -> bool | None:
+  """Resolve one row's preservation policy; None means omit the template kwarg."""
+  if setting == "auto":
+    return enable_thinking if mode == "assistant_mask" else None
+  if type(setting) is not bool:  # pylint: disable=unidiomatic-typecheck
+    raise ValueError("sft_preserve_thinking must be 'auto' or an actual boolean.")
+  return setting
 
 
-def _get_completion_in_chat_template(tokenizer_model, round_msgs, tools=None):
+def _sft_template_kwargs(tools: Any, enable_thinking: bool, preserve_thinking: bool | None) -> dict[str, Any]:
+  """Keep the resolved policy identical across full, prefix, suffix and pin renders."""
+  kwargs: dict[str, Any] = {"enable_thinking": enable_thinking}
+  if tools is not None:
+    kwargs["tools"] = tools
+  if preserve_thinking is not None:
+    kwargs["preserve_thinking"] = preserve_thinking
+  return kwargs
+
+
+def _get_completion_in_chat_template(
+    tokenizer_model, round_msgs, tools=None, enable_thinking=True, preserve_thinking: bool | None = None
+):
   """
   Calculates the completion part of a conversation turn when formatted with a chat template.
 
@@ -302,12 +264,16 @@ def _get_completion_in_chat_template(tokenizer_model, round_msgs, tools=None):
     round_msgs: Messages for the current conversational turn including the assistant response.
 
   Returns:
-    A string representing the completion formatted by the chat template.
+    The original completion token IDs from the full chat-template render.
   """
-  tools_kwargs = {"tools": tools} if tools is not None else {}
-  prompt_completion_tokens = tokenizer_model.apply_chat_template(round_msgs, add_generation_prompt=False, tokenize=True, enable_thinking=True, **tools_kwargs)
+  template_kwargs = _sft_template_kwargs(tools, enable_thinking, preserve_thinking)
+  prompt_completion_tokens = tokenizer_model.apply_chat_template(
+      round_msgs, add_generation_prompt=False, tokenize=True, **template_kwargs
+  )
   # include generation_prompt as part of the prompt tokens
-  prompt_tokens = tokenizer_model.apply_chat_template(round_msgs[:-1], add_generation_prompt=True, tokenize=True, enable_thinking=True, **tools_kwargs)
+  prompt_tokens = tokenizer_model.apply_chat_template(
+      round_msgs[:-1], add_generation_prompt=True, tokenize=True, **template_kwargs
+  )
 
   prompt_completion_ids = extract_token_ids(prompt_completion_tokens)
   prompt_ids = extract_token_ids(prompt_tokens)
@@ -329,10 +295,373 @@ def _get_completion_in_chat_template(tokenizer_model, round_msgs, tools=None):
     )
 
   completion_tokens = prompt_completion_ids[common_len:]
-  return tokenizer_model.decode(completion_tokens, skip_special_tokens=False)
+  return completion_tokens
 
 
-def apply_chat_template(example, tokenizer_model, data_column_name, tools_column_name=None):
+def validate_tool_result_bodies(tokenizer_model, tool_messages, masked_run_texts, *, mode, roles):
+  """Require ordered string-body presence within masked runs, without joining runs.
+
+  This is a textual presence check, not proof of result-region attribution:
+  quoted copies in other masked text can satisfy it. Structured bodies are not
+  covered. Each matched occurrence is consumed before the next body is sought.
+  """
+  run_index = 0
+  offset = 0
+  for result_index, message in enumerate(tool_messages):
+    body = message.get("content")
+    if not isinstance(body, str):
+      worker_pid = os.getpid()
+      if worker_pid not in _TOOL_BODY_WARNING_PIDS:
+        _TOOL_BODY_WARNING_PIDS.add(worker_pid)
+        max_logging.warning(
+            "Skipping non-string tool result bodies in the masked-context presence check; "
+            "structured body preservation is not validated."
+        )
+      continue
+    body = body.strip()
+    if not body:
+      continue
+    alternatives = {body, json.dumps(body)[1:-1]}
+    while run_index < len(masked_run_texts):
+      run = masked_run_texts[run_index]
+      matches = [
+          (position, position + len(candidate))
+          for candidate in alternatives
+          if (position := run.find(candidate, offset)) >= 0
+      ]
+      if matches:
+        _, offset = min(matches)
+        break
+      run_index += 1
+      offset = 0
+    else:
+      tokenizer_name = str(getattr(tokenizer_model, "name_or_path", type(tokenizer_model).__name__))[:200]
+      raise ValueError(
+          "Chat template dropped or altered a tool result body in masked context. "
+          f"Tokenizer: {tokenizer_name}; mode: {mode}; roles: {roles[:32]}; "
+          f"message count: {len(roles)}; result index/count: {result_index + 1}/{len(tool_messages)}; "
+          f"body length: {len(body)}."
+      )
+
+
+def _render_suffix_ids(
+    tokenizer_model,
+    baseline_msgs,
+    superset_msgs,
+    *,
+    baseline_gen,
+    superset_gen,
+    tools,
+    enable_thinking,
+    boundary_name,
+    preserve_thinking: bool | None = None,
+):
+  """Extract a token suffix only when the previous render remains an exact prefix."""
+  kwargs = _sft_template_kwargs(tools, enable_thinking, preserve_thinking)
+  baseline_ids = extract_token_ids(
+      tokenizer_model.apply_chat_template(
+          baseline_msgs,
+          add_generation_prompt=baseline_gen,
+          tokenize=True,
+          **kwargs,
+      )
+  )
+  superset_ids = extract_token_ids(
+      tokenizer_model.apply_chat_template(
+          superset_msgs,
+          add_generation_prompt=superset_gen,
+          tokenize=True,
+          **kwargs,
+      )
+  )
+  common_len = 0
+  for left, right in zip(baseline_ids, superset_ids):
+    if left != right:
+      break
+    common_len += 1
+  if common_len != len(baseline_ids):
+    # Structural diagnostics deliberately omit decoded windows and message bodies.
+    raise ValueError(
+        f"Chat template {boundary_name} mismatch: baseline render is not an exact token prefix. "
+        f"Tokenizer: {getattr(tokenizer_model, 'name_or_path', type(tokenizer_model).__name__)}; "
+        f"roles: {[message.get('role') for message in superset_msgs]}; "
+        f"divergence offset: {common_len}; baseline tokens: {len(baseline_ids)}; "
+        f"superset tokens: {len(superset_ids)}; "
+        f"Trailing tool messages: {sum(message.get('role') == 'tool' for message in superset_msgs[len(baseline_msgs):])}; "
+        f"Baseline divergence window: {baseline_ids[max(0, common_len - 16):common_len + 16]}; "
+        f"Superset divergence window: {superset_ids[max(0, common_len - 16):common_len + 16]}."
+    )
+  return superset_ids, superset_ids[len(baseline_ids) :]
+
+
+def _get_tool_results_and_completion_deltas(  # pylint: disable=too-many-locals
+    tokenizer_model,
+    round_msgs,
+    assistant_message,
+    tools=None,
+    enable_thinking=True,
+    preserve_thinking: bool | None = None,
+):
+  """Render trailing tool results and the assistant response as adjacent token deltas.
+
+  ``round_msgs`` must be the live round state and end in one or more tool
+  messages. The chat template render immediately before those tool messages is
+  required to be an exact token prefix of the render including the tools and
+  the next assistant generation prompt. Returning only the suffix preserves a
+  single canonical token stream without replaying the preceding tool call.
+  When a template uses the response opener as the assistant call turn's
+  model-emitted stop/end-of-message token, that shared opener stays in the
+  loss-applied call completion. Only the newly rendered tool-result suffix is
+  returned as masked context.
+
+  Args:
+    tokenizer_model: The tokenizer instance.
+    round_msgs: Live messages for the current round, ending in role=tool.
+    assistant_message: The assistant message that follows the trailing tools.
+    tools: Optional tool declarations passed to the chat template.
+
+  Returns:
+    A pair containing the masked tool-result/assistant-prefix token IDs and
+    the loss-applied assistant-completion token IDs.
+
+  Raises:
+    ValueError: If no trailing tool messages exist, the template is not
+      prefix-stable at the tool-result boundary, or the tool result is absent
+      from the rendered context.
+  """
+  first_tool_idx = len(round_msgs)
+  while first_tool_idx > 0 and round_msgs[first_tool_idx - 1]["role"] == "tool":
+    first_tool_idx -= 1
+
+  trailing_tool_count = len(round_msgs) - first_tool_idx
+  if trailing_tool_count == 0:
+    raise ValueError("Tool-result prompt extraction requires round_msgs to end with role='tool'.")
+  if first_tool_idx == 0:
+    raise ValueError("Tool-result prompt extraction requires context before the trailing tool message(s).")
+
+  tokenizer_name = getattr(tokenizer_model, "name_or_path", type(tokenizer_model).__name__)
+  roles = [message.get("role", "<missing>") for message in round_msgs]
+  template_kwargs = _sft_template_kwargs(tools, enable_thinking, preserve_thinking)
+  superset_ids, suffix_ids = _render_suffix_ids(
+      tokenizer_model,
+      round_msgs[:first_tool_idx],
+      round_msgs,
+      baseline_gen=False,
+      superset_gen=True,
+      tools=tools,
+      enable_thinking=enable_thinking,
+      boundary_name="tool-result prompt",
+      preserve_thinking=preserve_thinking,
+  )
+  baseline_ids = superset_ids[: len(superset_ids) - len(suffix_ids)]
+
+  # Some templates emit speculative generation-prompt tokens which are not present when the
+  # concrete assistant message has no corresponding content. Some templates add
+  # an opening thinking-channel token after a tool result, but omits it from a full assistant
+  # render with no reasoning field. Keep only the generation-prompt prefix shared by the real
+  # assistant render so the carried delta does not add redundant tokens.
+  tool_context_tokens = tokenizer_model.apply_chat_template(
+      round_msgs,
+      add_generation_prompt=False,
+      tokenize=True,
+      **template_kwargs,
+  )
+  assistant_tokens = tokenizer_model.apply_chat_template(
+      round_msgs + [assistant_message],
+      add_generation_prompt=False,
+      tokenize=True,
+      **template_kwargs,
+  )
+  tool_context_ids = extract_token_ids(tool_context_tokens)
+  assistant_ids = extract_token_ids(assistant_tokens)
+
+  if baseline_ids != tool_context_ids[: len(baseline_ids)]:
+    raise ValueError(
+        "Chat template tool-result context mismatch: adding the trailing tool message(s) changes tokens "
+        "inside the preceding conversation. "
+        f"Tokenizer: {tokenizer_name}; baseline tokens: {len(baseline_ids)}; "
+        f"tool-context tokens: {len(tool_context_ids)}."
+    )
+  if len(tool_context_ids) == len(baseline_ids):
+    raise ValueError(
+        "Chat template emitted no tool-result context tokens. The role=tool message shape may be "
+        "incompatible with this tokenizer template.\n"
+        f"Tokenizer: {tokenizer_name}\n"
+        f"Roles: {roles}\n"
+        f"Trailing tool messages: {trailing_tool_count}\n"
+        f"Baseline tokens: {len(baseline_ids)}; tool-context tokens: {len(tool_context_ids)}."
+    )
+
+  assistant_common_len = 0
+  for prompt_id, assistant_id in zip(superset_ids, assistant_ids):
+    if prompt_id != assistant_id:
+      break
+    assistant_common_len += 1
+
+  if (
+      tool_context_ids != superset_ids[: len(tool_context_ids)]
+      or tool_context_ids != assistant_ids[: len(tool_context_ids)]
+  ):
+    raise ValueError(
+        "Chat template tool-result context mismatch: rendering the following assistant changes tokens "
+        "inside the tool-result context.\n"
+        f"Tokenizer: {tokenizer_name}\n"
+        f"Roles: {roles}\n"
+        f"Trailing tool messages: {trailing_tool_count}\n"
+        f"Baseline tokens: {len(baseline_ids)}; tool-context tokens: {len(tool_context_ids)}; "
+        f"generation-prompt tokens: {len(superset_ids)}; assistant tokens: {len(assistant_ids)}; "
+        f"assistant divergence offset: {assistant_common_len}"
+    )
+  if assistant_common_len < len(tool_context_ids):
+    raise ValueError(
+        "Chat template assistant generation prompt diverges before the complete tool-result context. "
+        f"Tokenizer: {tokenizer_name}; tool-context tokens: {len(tool_context_ids)}; "
+        f"assistant divergence offset: {assistant_common_len}."
+    )
+
+  delta_ids = superset_ids[len(baseline_ids) : assistant_common_len]
+  completion_ids = assistant_ids[assistant_common_len:]
+  validate_tool_result_bodies(
+      tokenizer_model,
+      round_msgs[first_tool_idx:],
+      [tokenizer_model.decode(delta_ids, skip_special_tokens=False)],
+      mode="segmented",
+      roles=roles,
+  )
+  return delta_ids, completion_ids
+
+
+def validate_pinned_context_prefix(tokenizer_model, pinned_ids, prompt_ids, roles, boundary_name):
+  """Require a pinned leading block to be an exact token prefix of a real prompt render."""
+  common_len = 0
+  for pinned_id, prompt_id in zip(pinned_ids, prompt_ids):
+    if pinned_id != prompt_id:
+      break
+    common_len += 1
+
+  if common_len == len(pinned_ids):
+    return
+
+  tokenizer_name = getattr(tokenizer_model, "name_or_path", type(tokenizer_model).__name__)
+  tokenizer_revision = getattr(tokenizer_model, "_commit_hash", None)
+  if tokenizer_revision is None:
+    tokenizer_revision = getattr(tokenizer_model, "init_kwargs", {}).get("_commit_hash", "unknown")
+  window_radius = 16
+  start = max(0, common_len - window_radius)
+  pinned_end = min(len(pinned_ids), common_len + window_radius)
+  prompt_end = min(len(prompt_ids), common_len + window_radius)
+  pinned_window = pinned_ids[start:pinned_end]
+  prompt_window = prompt_ids[start:prompt_end]
+  raise ValueError(
+      "Chat template pinned-context mismatch: the canonical leading system/developer/tools block "
+      f"is not an exact token prefix at the {boundary_name} boundary.\n"
+      f"Tokenizer: {tokenizer_name}; revision: {tokenizer_revision}\n"
+      f"Roles: {roles}\n"
+      f"Pinned tokens: {len(pinned_ids)}; prompt tokens: {len(prompt_ids)}; divergence offset: {common_len}\n"
+      f"Pinned divergence window [{start}:{pinned_end}]: {pinned_window} "
+      f"('{tokenizer_model.decode(pinned_window, skip_special_tokens=False)}')\n"
+      f"Prompt divergence window [{start}:{prompt_end}]: {prompt_window} "
+      f"('{tokenizer_model.decode(prompt_window, skip_special_tokens=False)}')"
+  )
+
+
+def _get_pinned_context_ids(
+    tokenizer_model,
+    leading_message,
+    first_prompt_messages,
+    tools=None,
+    enable_thinking=True,
+    preserve_thinking: bool | None = None,
+):
+  """Render only the canonical leading system/developer/native-tools block as token IDs.
+
+  A tools-only conversation still has a tokenizer-generated leading developer
+  block. Use an empty synthetic developer message only for rendering that
+  block; it is not inserted into the source conversation. When neither an
+  explicit leading message nor tools exist, retain only a tokenizer-generated
+  leading block that is an exact prefix of the real first-user prompt. If the
+  synthetic block is not a prefix, fall back to an exact BOS-only prefix.
+  """
+  template_kwargs = _sft_template_kwargs(tools, enable_thinking, preserve_thinking)
+  prompt_ids = extract_token_ids(
+      tokenizer_model.apply_chat_template(
+          first_prompt_messages,
+          add_generation_prompt=True,
+          tokenize=True,
+          **template_kwargs,
+      )
+  )
+
+  if leading_message is not None or tools:
+    pinned_messages = [leading_message or {"role": "developer", "content": ""}]
+    pinned_ids = extract_token_ids(
+        tokenizer_model.apply_chat_template(
+            pinned_messages,
+            add_generation_prompt=False,
+            tokenize=True,
+            **template_kwargs,
+        )
+    )
+  else:
+    synthetic_ids = []
+    try:
+      synthetic_ids = extract_token_ids(
+          tokenizer_model.apply_chat_template(
+              [{"role": "developer", "content": ""}],
+              add_generation_prompt=False,
+              tokenize=True,
+              **_sft_template_kwargs(None, enable_thinking, preserve_thinking),
+          )
+      )
+    except TemplateError:
+      # Some templates reject developer/system messages. BOS remains a safe
+      # candidate if and only if the real first-user render begins with it.
+      pass
+
+    if synthetic_ids and synthetic_ids == prompt_ids[: len(synthetic_ids)]:
+      pinned_ids = synthetic_ids
+    else:
+      bos_token_id = getattr(tokenizer_model, "bos_token_id", None)
+      bos_ids = [int(bos_token_id)] if bos_token_id is not None else []
+      if bos_ids and bos_ids == prompt_ids[: len(bos_ids)]:
+        pinned_ids = bos_ids
+      else:
+        tokenizer_name = getattr(tokenizer_model, "name_or_path", type(tokenizer_model).__name__)
+        tokenizer_revision = getattr(tokenizer_model, "_commit_hash", None)
+        if tokenizer_revision is None:
+          tokenizer_revision = getattr(tokenizer_model, "init_kwargs", {}).get("_commit_hash", "unknown")
+        raise ValueError(
+            "Unable to derive a safe generated leading-context pin: neither the complete synthetic "
+            "developer block nor BOS is an exact token prefix of the real first-user prompt. "
+            f"Tokenizer: {tokenizer_name}; revision: {tokenizer_revision}; enable_thinking={enable_thinking}; "
+            f"synthetic tokens: {len(synthetic_ids)}; BOS token: {bos_token_id}; prompt tokens: {len(prompt_ids)}; "
+            f"prompt prefix IDs: {prompt_ids[:16]}"
+        )
+
+  # Do not recover a mismatch by taking len(pinned_ids) tokens from prompt_ids or by
+  # pinning the complete first prompt. Without tokenizer-provided message spans, the
+  # former can cut into the user message or omit part of a context-dependent leading
+  # block, while the latter would replay the first user's task in later windows.
+  validate_pinned_context_prefix(
+      tokenizer_model,
+      pinned_ids,
+      prompt_ids,
+      [message.get("role", "<missing>") for message in first_prompt_messages],
+      "chat-template",
+  )
+  return pinned_ids
+
+
+def apply_chat_template(
+    example,
+    tokenizer_model,
+    data_column_name,
+    tools_column_name=None,
+    pin_leading_context=False,
+    enable_thinking=True,
+    return_segment_ids=True,
+    preserve_thinking: bool | Literal["auto"] = "auto",
+):
   """Formats conversational data by applying the tokenizer's chat template
   and identifying prompt/completion segments for SFT masking.
 
@@ -343,6 +672,11 @@ def apply_chat_template(example, tokenizer_model, data_column_name, tools_column
       which contains the specific chat template.
     data_column_name: The name of the column in the `example` dictionary
       that contains the list of messages.
+    tools_column_name: Optional column containing native tool declarations.
+    pin_leading_context: Whether to emit the tokenized canonical leading
+      system/developer/tools block for long-example windowing.
+    return_segment_ids: Emit aligned original IDs for downstream tokenization.
+    preserve_thinking: Explicit template policy, or "auto" to omit the kwarg.
 
   Returns:
     The modified `example` dictionary.
@@ -355,50 +689,339 @@ def apply_chat_template(example, tokenizer_model, data_column_name, tools_column
   """
   messages = []
   is_prompt = []
+  segment_ids = []
   round_msgs = []
+  emitted_len = 0
+  leading_message = None
+  pinned_context_ids = []
+  pinned_context_rendered = False
   conversation = example[data_column_name]
   if isinstance(conversation, str):
     conversation = json.loads(conversation)
   tools = example.get(tools_column_name) if tools_column_name else None
   if isinstance(tools, str):
     tools = json.loads(tools)
-  tools_kwargs = {"tools": tools} if tools is not None else {}
+  preservation = _resolve_sft_preserve_thinking(preserve_thinking, enable_thinking, mode="segmented")
+  template_kwargs = _sft_template_kwargs(tools, enable_thinking, preservation)
+
+  def append_segment(ids, prompt):
+    if not ids:
+      return
+    segment_ids.append(list(ids))
+    messages.append(tokenizer_model.decode(ids, skip_special_tokens=False))
+    is_prompt.append(prompt)
+
   try:
     for idx, message in enumerate(conversation):
-      if message["role"] == "system":
+      if message["role"] in ("system", "developer"):
         if idx != 0:
-          raise ValueError(f"System message found at index {idx}. System messages must be at index 0.")
+          raise ValueError(f"'{message['role']}' message found at index {idx}. It must be at index 0.")
+        leading_message = message
         round_msgs.append(message)
       elif message["role"] == "user":
+        if round_msgs and round_msgs[-1]["role"] == "tool":
+          # Tools have accumulated but have not yet been emitted. Flush their
+          # suffix before taking the user suffix, or their bodies would be lost.
+          _, pending_ids = _render_suffix_ids(
+              tokenizer_model,
+              round_msgs[:emitted_len],
+              round_msgs,
+              baseline_gen=False,
+              superset_gen=False,
+              tools=tools,
+              enable_thinking=enable_thinking,
+              boundary_name="tool-result context",
+              preserve_thinking=preservation,
+          )
+          validate_tool_result_bodies(
+              tokenizer_model,
+              round_msgs[emitted_len:],
+              [tokenizer_model.decode(pending_ids, skip_special_tokens=False)],
+              mode="segmented",
+              roles=[item.get("role") for item in round_msgs],
+          )
+          append_segment(pending_ids, True)
+          _, user_ids = _render_suffix_ids(
+              tokenizer_model,
+              round_msgs,
+              round_msgs + [message],
+              baseline_gen=False,
+              superset_gen=True,
+              tools=tools,
+              enable_thinking=enable_thinking,
+              boundary_name="tool-to-user prompt",
+              preserve_thinking=preservation,
+          )
+          round_msgs.append(message)
+          append_segment(user_ids, True)
+          emitted_len = len(round_msgs)
+          continue
         round_msgs.append(message)
+        if pin_leading_context and not pinned_context_rendered:
+          pinned_context_ids = _get_pinned_context_ids(
+              tokenizer_model,
+              leading_message,
+              round_msgs,
+              tools=tools,
+              enable_thinking=enable_thinking,
+              preserve_thinking=preservation,
+          )
+          pinned_context_rendered = True
         prompt_in_chat_template = tokenizer_model.apply_chat_template(
-            round_msgs, add_generation_prompt=True, tokenize=False, enable_thinking=True, **tools_kwargs
+            round_msgs,
+            add_generation_prompt=True,
+            tokenize=True,
+            **template_kwargs,
         )
-        messages.append(prompt_in_chat_template)
-        is_prompt.append(True)
+        append_segment(extract_token_ids(prompt_in_chat_template), True)
+        emitted_len = len(round_msgs)
       elif message["role"] == "tool":
+        if not round_msgs:
+          raise ValueError(f"Tool message at index {idx} with no preceding context.")
         round_msgs.append(message)
       elif message["role"] == "assistant":
         if not round_msgs:
           raise ValueError(f"Assistant message at index {idx} with no preceding context.")
-        round_msgs.append(message)
-        messages.append(_get_completion_in_chat_template(tokenizer_model, round_msgs, tools=tools))
-        is_prompt.append(False)
+        if round_msgs[-1]["role"] == "tool":
+          # Tool results condition this assistant response, so preserve their tokenizer-rendered
+          # delta as prompt context. Marking it as a prompt keeps the result visible to attention
+          # while excluding it from completion-only loss. Response openers remain in
+          # the preceding loss-applied call completion because they are model-emitted stop/EOM
+          # tokens; the resumed render reuses that token before appending the masked result body.
+          tool_results_delta, completion = _get_tool_results_and_completion_deltas(
+              tokenizer_model,
+              round_msgs,
+              message,
+              tools=tools,
+              enable_thinking=enable_thinking,
+              preserve_thinking=preservation,
+          )
+          append_segment(tool_results_delta, True)
+          round_msgs.append(message)
+        else:
+          round_msgs.append(message)
+          completion = _get_completion_in_chat_template(
+              tokenizer_model,
+              round_msgs,
+              tools=tools,
+              enable_thinking=enable_thinking,
+              preserve_thinking=preservation,
+          )
+        append_segment(completion, False)
+        emitted_len = len(round_msgs)
         # Clear round only when the next message starts a new user turn or conversation ends
         # This preserves context for consecutive assistant/tool messages
         next_idx = idx + 1
         if next_idx >= len(conversation) or conversation[next_idx]["role"] == "user":
           round_msgs.clear()
+          emitted_len = 0
+      else:
+        raise ValueError(f"Unsupported message role '{message['role']}' at index {idx}.")
+    if emitted_len < len(round_msgs):
+      pending_roles = [message.get("role") for message in round_msgs[emitted_len:]]
+      raise ValueError(
+          f"Conversation ends with {len(pending_roles)} unemitted message(s) (roles: {pending_roles}). "
+          "Trailing tool results require a following assistant or user message."
+      )
+    if not any(flag is False for flag in is_prompt):
+      raise ValueError("SFT row produced no loss-bearing segment; context-only rows are not supported.")
   except ValueError as e:
     max_logging.log(f"Unable to apply chat template: {e}")
     raise e
   example["is_prompt"] = is_prompt
   example[data_column_name] = messages
+  if return_segment_ids:
+    example[SFT_SEGMENT_IDS_KEY] = segment_ids
+  if pin_leading_context:
+    example[SFT_PINNED_CONTEXT_IDS_KEY] = pinned_context_ids
   return example
 
 
+def apply_chat_template_with_assistant_mask(
+    example,
+    tokenizer_model,
+    data_column_name,
+    tools_column_name=None,
+    pin_leading_context=False,
+    enable_thinking=True,
+    preserve_thinking: bool | Literal["auto"] = "auto",
+):
+  """Render one canonical SFT token stream and use template-owned loss spans.
+
+  This is the token-native alternative to :func:`apply_chat_template`'s
+  segmented longest-common-prefix path. The tokenizer renders the complete
+  conversation exactly once and returns an ``assistant_masks`` array produced
+  by Jinja ``{% generation %}`` blocks. The aligned token IDs and mask are then
+  converted into the existing MaxText ``token_runs`` / ``is_prompt`` contract
+  without re-tokenizing. Rows containing tools decode masked runs for the
+  ordered body-presence check; this never changes token IDs or ownership.
+
+  The template may use a per-message ``trainable`` boolean to suppress marker
+  ownership for historical assistant turns in dataset-expanded prefixes.
+  MaxText does not interpret that field itself; it consumes only the mask
+  returned by Transformers.
+
+  Args:
+    example: A dictionary containing a complete conversational row.
+    tokenizer_model: A Hugging Face tokenizer with a generation-marked chat
+      template.
+    data_column_name: Column containing the message list.
+    tools_column_name: Optional column containing native tool declarations.
+    pin_leading_context: Whether to emit the canonical leading
+      system/developer/native-tools token prefix for long-example windowing.
+    preserve_thinking: Explicit template policy, or "auto" to follow this row's
+      enable_thinking value for every render, including the leading pin.
+  Returns:
+    The modified example with token-ID runs in ``data_column_name``, matching
+    ``is_prompt`` flags, and optionally ``sft_pinned_context_ids``.
+
+  Raises:
+    ValueError: If the row or tokenizer output violates the canonical
+      token-stream/mask contract.
+  """
+  conversation = example[data_column_name]
+  if isinstance(conversation, str):
+    conversation = json.loads(conversation)
+  if not isinstance(conversation, list) or not conversation:
+    raise ValueError("Canonical assistant-mask SFT requires a non-empty message list.")
+
+  leading_message = None
+  first_user_index = None
+  for index, message in enumerate(conversation):
+    if not isinstance(message, Mapping) or "role" not in message:
+      raise ValueError(f"SFT message at index {index} must be a mapping with a role.")
+    role = message["role"]
+    if role in ("system", "developer"):
+      if index != 0:
+        raise ValueError(f"'{role}' message found at index {index}. It must be at index 0.")
+      leading_message = message
+    elif role == "user" and first_user_index is None:
+      first_user_index = index
+    elif role not in ("user", "assistant", "tool"):
+      raise ValueError(f"Unsupported message role '{role}' at index {index}.")
+
+  tools = example.get(tools_column_name) if tools_column_name else None
+  if isinstance(tools, str):
+    tools = json.loads(tools)
+  preservation = _resolve_sft_preserve_thinking(preserve_thinking, enable_thinking, mode="assistant_mask")
+  template_kwargs = _sft_template_kwargs(tools, enable_thinking, preservation)
+
+  try:
+    encoded = tokenizer_model.apply_chat_template(
+        conversation,
+        add_generation_prompt=False,
+        tokenize=True,
+        return_dict=True,
+        return_assistant_tokens_mask=True,
+        **template_kwargs,
+    )
+  except (TypeError, ValueError) as error:
+    max_logging.log(f"Unable to apply canonical assistant-mask chat template: {error}")
+    raise
+
+  input_ids = extract_token_ids(encoded)
+  if isinstance(input_ids, np.ndarray):
+    input_ids = input_ids.tolist()
+  if input_ids and isinstance(input_ids[0], (list, tuple, np.ndarray)):
+    if len(input_ids) != 1:
+      raise ValueError(f"Canonical assistant-mask SFT expected one token stream, got batch size {len(input_ids)}.")
+    input_ids = list(input_ids[0])
+
+  if isinstance(encoded, Mapping):
+    assistant_mask = encoded.get("assistant_masks")
+  else:
+    assistant_mask = getattr(encoded, "assistant_masks", None)
+  if assistant_mask is None:
+    raise ValueError(
+        "Tokenizer did not return assistant_masks. The selected chat template must contain "
+        "{% generation %} blocks and the Transformers version must support return_assistant_tokens_mask."
+    )
+  if isinstance(assistant_mask, np.ndarray):
+    assistant_mask = assistant_mask.tolist()
+  if assistant_mask and isinstance(assistant_mask[0], (list, tuple, np.ndarray)):
+    if len(assistant_mask) != 1:
+      raise ValueError(f"Canonical assistant-mask SFT expected one ownership mask, got batch size {len(assistant_mask)}.")
+    assistant_mask = list(assistant_mask[0])
+
+  token_runs, is_prompt = split_sft_token_stream_by_assistant_mask(input_ids, assistant_mask)
+  tool_messages = [message for message in conversation if message["role"] == "tool"]
+  if tool_messages:
+    validate_tool_result_bodies(
+        tokenizer_model,
+        tool_messages,
+        [tokenizer_model.decode(run, skip_special_tokens=False) for run, prompt in zip(token_runs, is_prompt) if prompt],
+        mode="assistant_mask",
+        roles=[message["role"] for message in conversation],
+    )
+  example[data_column_name] = token_runs
+  example["is_prompt"] = is_prompt
+
+  if pin_leading_context:
+    if first_user_index is None:
+      raise ValueError("SFT leading-context pinning requires at least one user message.")
+    first_prompt_messages = conversation[: first_user_index + 1]
+    pinned_context_ids = _get_pinned_context_ids(
+        tokenizer_model,
+        leading_message,
+        first_prompt_messages,
+        tools=tools,
+        enable_thinking=enable_thinking,
+        preserve_thinking=preservation,
+    )
+    validate_pinned_context_prefix(
+        tokenizer_model,
+        pinned_context_ids,
+        [token_id for token_run in token_runs for token_id in token_run],
+        [message.get("role", "<missing>") for message in conversation],
+        "canonical-full-conversation",
+    )
+    example[SFT_PINNED_CONTEXT_IDS_KEY] = pinned_context_ids
+
+  return example
+
+
+def validate_sft_segment_ids(segment_ids, is_prompt, text_chunks):
+  """Validate the aligned token side column without coercing malformed IDs."""
+  if (
+      not isinstance(segment_ids, list)
+      or not segment_ids
+      or len(segment_ids) != len(is_prompt)
+      or len(segment_ids) != len(text_chunks)
+  ):
+    raise ValueError("sft_segment_ids must be non-empty and aligned with text chunks and is_prompt.")
+  for ids in segment_ids:
+    if (
+        not isinstance(ids, list)
+        or not ids
+        or any(
+            isinstance(token_id, (bool, np.bool_)) or not isinstance(token_id, (int, np.integer)) or token_id < 0
+            for token_id in ids
+        )
+    ):
+      raise ValueError("sft_segment_ids must contain non-empty lists of nonnegative integer token IDs.")
+  return segment_ids
+
+
 def tokenization(example, hf_tokenizer, truncation, max_length, column_names):
-  """Tokenize a HuggingFace dataset"""
+  """Tokenize a Hugging Face row or batch, preserving carried SFT token IDs."""
+  if SFT_SEGMENT_IDS_KEY in example:
+    if len(column_names) != 1:
+      raise ValueError("sft_segment_ids requires exactly one conversational text column.")
+    column_name = column_names[0]
+    rows = example[SFT_SEGMENT_IDS_KEY]
+    prompts = example["is_prompt"]
+    texts = example[column_name]
+    # Dataset.map uses batches, while direct formatter callers may pass one row.
+    # Inspect the prompt axis once; both shapes use the same ID validator.
+    if prompts and isinstance(prompts[0], (bool, np.bool_)):
+      example[column_name] = validate_sft_segment_ids(rows, prompts, texts)
+      return example
+    if len(rows) != len(prompts) or len(rows) != len(texts):
+      raise ValueError("sft_segment_ids batch must align with text and is_prompt rows.")
+    example[column_name] = [
+        validate_sft_segment_ids(ids, flags, chunks) for ids, flags, chunks in zip(rows, prompts, texts)
+    ]
+    return example
   for column_name in column_names:
     if isinstance(example[column_name], list):
       example[column_name] = [
@@ -407,6 +1030,82 @@ def tokenization(example, hf_tokenizer, truncation, max_length, column_names):
     elif isinstance(example[column_name], str):
       example[column_name] = hf_tokenizer(example[column_name], truncation=truncation, max_length=max_length)["input_ids"]
   return example
+
+
+def split_sft_token_stream_by_assistant_mask(input_ids, assistant_mask):
+  """Convert one canonical token stream and binary assistant mask into SFT token runs.
+
+  The returned ``token_runs`` / ``is_prompt`` pair is the existing input
+  contract consumed by :class:`SFTPromptMasking` and
+  :class:`SFTPromptMaskingWindows`. A mask value of 1 means the corresponding
+  token is model-owned and loss-applied, so its run receives
+  ``is_prompt=False``. A value of 0 means masked context and receives
+  ``is_prompt=True``.
+
+  This conversion is token-native by construction: it never decodes or
+  re-tokenizes, and concatenating the returned runs exactly reconstructs the
+  supplied token IDs. Adjacent spans with the same ownership are deliberately
+  coalesced because the downstream masking transforms care about token
+  ownership changes, not individual Jinja generation-block boundaries.
+
+  Args:
+    input_ids: One non-empty, one-dimensional token-ID sequence.
+    assistant_mask: A binary sequence aligned one-to-one with ``input_ids``;
+      1 selects loss and 0 selects masked context.
+
+  Returns:
+    A pair ``(token_runs, is_prompt)`` containing non-empty contiguous token
+    runs and their existing MaxText prompt/completion flags.
+
+  Raises:
+    ValueError: If the stream is empty, lengths differ, a mask value is not an
+      integer/bool 0 or 1, or the mask selects no loss-bearing tokens.
+    TypeError: If a token ID cannot be converted to an integer.
+  """
+  try:
+    token_ids = [int(token_id) for token_id in input_ids]
+  except (TypeError, ValueError) as error:
+    raise TypeError("input_ids must be a one-dimensional sequence of integer token IDs.") from error
+
+  if not token_ids:
+    raise ValueError("input_ids must contain at least one token.")
+
+  mask_values = list(assistant_mask)
+  if len(token_ids) != len(mask_values):
+    raise ValueError(
+        "input_ids and assistant_mask must have identical lengths: "
+        f"input_ids={len(token_ids)}, assistant_mask={len(mask_values)}."
+    )
+
+  normalized_mask = []
+  for index, mask_value in enumerate(mask_values):
+    if isinstance(mask_value, (bool, np.bool_)):
+      normalized_mask.append(int(mask_value))
+    elif isinstance(mask_value, (int, np.integer)) and int(mask_value) in (0, 1):
+      normalized_mask.append(int(mask_value))
+    else:
+      raise ValueError(
+          "assistant_mask must contain only integer/bool 0 or 1 values; " f"got {mask_value!r} at index {index}."
+      )
+
+  if not any(normalized_mask):
+    raise ValueError(
+        "assistant_mask contains no loss-bearing tokens; a completion-only SFT example cannot be context-only."
+    )
+
+  token_runs = []
+  is_prompt = []
+  run_start = 0
+  for index in range(1, len(token_ids)):
+    if normalized_mask[index] == normalized_mask[run_start]:
+      continue
+    token_runs.append(token_ids[run_start:index])
+    is_prompt.append(normalized_mask[run_start] == 0)
+    run_start = index
+  token_runs.append(token_ids[run_start:])
+  is_prompt.append(normalized_mask[run_start] == 0)
+
+  return token_runs, is_prompt
 
 
 @dataclasses.dataclass
@@ -444,6 +1143,30 @@ class SFTPromptMasking(grain.MapTransform):
     return out
 
 
+@dataclasses.dataclass(frozen=True)
+class SFTWindowGeometry:
+  """Effective bounded geometry shared by SFT windowing and preflight checks."""
+
+  overlap_cap: int
+  min_loss_room: int
+  context_cap: int
+
+
+def get_sft_window_geometry(max_target_length, overlap=256, context_cap=-1):
+  """Return the exact clamped overlap, minimum loss room, and context cap used by SFT windows."""
+  if max_target_length <= 0:
+    raise ValueError(f"max_target_length must be positive, got {max_target_length}.")
+  overlap_cap = max(0, min(overlap, max_target_length // 8))
+  min_loss_room = max(1, max_target_length // 8)
+  requested_cap = context_cap if (context_cap and context_cap > 0) else max_target_length // 2
+  effective_context_cap = max(1, min(requested_cap, max_target_length - overlap_cap - min_loss_room))
+  return SFTWindowGeometry(
+      overlap_cap=overlap_cap,
+      min_loss_room=min_loss_room,
+      context_cap=effective_context_cap,
+  )
+
+
 @dataclasses.dataclass
 class SFTPromptMaskingWindows(FlatMapTransform):
   """Construct SFT inputs/targets for completion-only training, splitting examples longer than
@@ -456,11 +1179,13 @@ class SFTPromptMaskingWindows(FlatMapTransform):
   the stop token never enters the loss and the model is trained on a stop-less completion prefix.
 
   This transform instead emits, per completion segment of an over-length example, a sequence of
-  windows. Each window is ``[ conversation-prefix-so-far (front-capped, masked) ] +
-  [ small completion overlap (masked) ] + [ a slice of new completion tokens (loss) ]``. The loss
-  slices tile the completion with NO overlap, so every completion token — including the terminator
-  in the final window — contributes to the loss exactly once. Examples that already fit yield a
-  single record byte-identical to :class:`SFTPromptMasking`.
+  windows. Each window is ``[ bounded conversation-prefix context (masked) ] +
+  [ small completion overlap (masked) ] + [ a slice of new completion tokens (loss) ]``. By default,
+  bounded context is the newest prefix tail. With leading-context pinning enabled, a real left cut
+  instead keeps the canonical system/developer/native-tools block plus the newest tail that fits.
+  The loss slices tile the completion with NO overlap, so every completion token — including the
+  terminator in the final window — contributes to the loss exactly once. Examples that already fit
+  yield a single record byte-identical to :class:`SFTPromptMasking`.
 
   Only completion-only SFT is supported (the context/overlap tokens are masked with ``unk_id``).
   """
@@ -476,6 +1201,9 @@ class SFTPromptMaskingWindows(FlatMapTransform):
       overlap=256,
       context_cap=-1,
       max_fan_out=32,
+      pin_leading_context=False,
+      pinned_context_overflow="error",
+      pinned_context_warn_fraction=0.5,
   ):
     self.text_column_name = text_column_name
     self.completion_only = completion_only
@@ -483,7 +1211,23 @@ class SFTPromptMaskingWindows(FlatMapTransform):
     self.unk_id = unk_id
     self.overlap = overlap
     self.context_cap = context_cap
+    if max_fan_out < 1:
+      raise ValueError(f"sft_window_max_fan_out must be at least 1, got {max_fan_out}.")
     self.max_fan_out = max_fan_out
+    self.pin_leading_context = pin_leading_context
+    if pinned_context_overflow != "error":
+      raise ValueError(
+          "Only sft_window_pinned_context_overflow='error' is supported; " f"got {pinned_context_overflow!r}."
+      )
+    if not 0.0 < pinned_context_warn_fraction < 1.0:
+      raise ValueError(
+          "sft_window_pinned_context_warn_fraction must be between 0 and 1; " f"got {pinned_context_warn_fraction}."
+      )
+    self.pinned_context_overflow = pinned_context_overflow
+    self.pinned_context_warn_fraction = pinned_context_warn_fraction
+    # Grain workers own separate transform instances. This counter only rate-limits
+    # warning logs within one instance; it is not a globally aggregatable row metric.
+    self.pinned_context_warning_count = 0
 
   def _single_record(self, segments, is_prompt):
     """Fast path identical to SFTPromptMasking.map for examples that fit in max_target_length."""
@@ -506,6 +1250,7 @@ class SFTPromptMaskingWindows(FlatMapTransform):
     return records
 
   def flat_map(self, element):
+    """Split one over-length SFT example into bounded loss-bearing windows."""
     length = self.max_target_length
     segments = element[self.text_column_name]
     is_prompt = element["is_prompt"]
@@ -514,15 +1259,14 @@ class SFTPromptMaskingWindows(FlatMapTransform):
     if total <= length:
       return self._stamp_ds([self._single_record(segments, is_prompt)], element)
 
-    # Clamp window geometry so every window always leaves room for >=1 loss token:
-    #   ctx (<= cap) + overlap (<= overlap_cap) + min_room <= length.
-    overlap_cap = max(0, min(self.overlap, length // 8))
-    min_room = max(1, length // 8)
-    auto_cap = self.context_cap if (self.context_cap and self.context_cap > 0) else length // 2
-    cap = max(1, min(auto_cap, length - overlap_cap - min_room))
+    geometry = get_sft_window_geometry(length, self.overlap, self.context_cap)
+    overlap_cap = geometry.overlap_cap
+    cap = geometry.context_cap
+    pinned = list(element.get(SFT_PINNED_CONTEXT_IDS_KEY, [])) if self.pin_leading_context else []
 
     records = []
     prefix = []  # all tokens of preceding segments, replayed (masked) as grounding context
+    warned_for_element = False
     for seg, is_p in zip(segments, is_prompt):
       seg = list(seg)
       if self.completion_only and is_p:
@@ -531,7 +1275,40 @@ class SFTPromptMaskingWindows(FlatMapTransform):
       comp = seg
       if not comp:
         continue
-      ctx = prefix[-cap:] if len(prefix) > cap else list(prefix)
+      if len(prefix) <= cap or not pinned:
+        ctx = list(prefix) if len(prefix) <= cap else prefix[-cap:]
+      else:
+        if prefix[: len(pinned)] != pinned:
+          raise ValueError(
+              "SFT pinned leading context is not an exact token prefix of the accumulated conversation. "
+              f"Pinned tokens: {len(pinned)}; accumulated prefix tokens: {len(prefix)}."
+          )
+        if len(pinned) >= cap:
+          # Overflow is intentionally fail-loud. Left-truncating can remove BOS,
+          # opening delimiters, or the start of developer instructions; right-
+          # truncating can cut tool schemas or their closing delimiters. Silently
+          # dropping the example is also a dataset-policy decision, not a safe
+          # transform default. Preflight and explicitly shorten/split the pin,
+          # increase the context budget, or drop/quarantine the row with accounting.
+          raise ValueError(
+              "SFT pinned leading context leaves no recent-conversation tail budget. "
+              f"Pinned tokens: {len(pinned)}; effective context cap: {cap}; "
+              f"max_target_length: {length}; overlap cap: {overlap_cap}."
+          )
+        if not warned_for_element and len(pinned) > cap * self.pinned_context_warn_fraction:
+          self.pinned_context_warning_count += 1
+          warned_for_element = True
+          warning_count = self.pinned_context_warning_count
+          if warning_count <= 3 or warning_count & (warning_count - 1) == 0:
+            max_logging.warning(
+                "SFT pinned leading context consumes more than the configured warning fraction of the "
+                f"effective context cap: pinned_tokens={len(pinned)}, effective_context_cap={cap}, "
+                f"remaining_tail_budget={cap - len(pinned)}, warning_fraction="
+                f"{self.pinned_context_warn_fraction}, warning_rows_seen_by_worker={warning_count}."
+            )
+        tail_budget = cap - len(pinned)
+        tail_start = max(len(pinned), len(prefix) - tail_budget)
+        ctx = pinned + prefix[tail_start:]
       i, n = 0, len(comp)
       while i < n:
         if len(records) >= self.max_fan_out:
@@ -848,9 +1625,10 @@ class ParseFeatures(grain.MapTransform):
 class NormalizeFeatures(grain.MapTransform):
   """Normalize text feature keys."""
 
-  def __init__(self, column_names, tokenize):
+  def __init__(self, column_names, tokenize, scalar_bool_columns=()):
     self.column_names = column_names
     self.tokenize = tokenize
+    self.scalar_bool_columns = frozenset(scalar_bool_columns)
 
   # Columns that may legitimately be absent from a record (e.g. datasets
   # without function-calling data). Missing optional columns are skipped
@@ -865,7 +1643,16 @@ class NormalizeFeatures(grain.MapTransform):
         if col in self.OPTIONAL_COLUMNS:
           continue  # e.g. a dataset that has no `tools` column
         raise KeyError(f"Required column '{col}' missing from record. Present columns: {sorted(element.keys())}")
-      out[col] = element[col][0].decode() if self.tokenize else element[col]
+      if col in self.scalar_bool_columns:
+        value = element[col]
+        if not isinstance(value, (list, tuple, np.ndarray)) or len(value) != 1:
+          raise ValueError(f"Boolean metadata column '{col}' must contain exactly one scalar 0/1 value.")
+        scalar = value[0]
+        if not isinstance(scalar, (int, np.integer, bool, np.bool_)) or int(scalar) not in (0, 1):
+          raise ValueError(f"Boolean metadata column '{col}' must contain exactly one scalar 0/1 value.")
+        out[col] = bool(int(scalar))
+      else:
+        out[col] = element[col][0].decode() if self.tokenize else element[col]
     if "dataset_id" in element:
       out["dataset_id"] = element["dataset_id"]
     return out
@@ -881,9 +1668,10 @@ class KeepFeatures(grain.MapTransform):
   contains string/bytes data (raw text).
   """
 
-  def __init__(self, feature_names: list[str], tokenize: bool = True):
+  def __init__(self, feature_names: list[str], tokenize: bool = True, scalar_bool_columns=()):
     self.feature_names = feature_names
     self.tokenize = tokenize
+    self.scalar_bool_columns = frozenset(scalar_bool_columns)
 
   # See ParseFeatures.OPTIONAL_COLUMNS — absent optional columns are skipped, not an error.
   OPTIONAL_COLUMNS = frozenset({"tools"})
@@ -898,6 +1686,13 @@ class KeepFeatures(grain.MapTransform):
       )
     filtered = {k: v for k, v in element.items() if k in self.feature_names}
     for col, val in filtered.items():
+      if col in self.scalar_bool_columns:
+        if type(val) is bool:  # pylint: disable=unidiomatic-typecheck
+          continue
+        if isinstance(val, np.bool_):
+          filtered[col] = bool(val)
+          continue
+        raise ValueError(f"Boolean metadata column '{col}' must contain an actual boolean, got {type(val).__name__}.")
       if self.tokenize:
         if isinstance(val, np.ndarray) and np.issubdtype(val.dtype, np.integer):
           raise ValueError(

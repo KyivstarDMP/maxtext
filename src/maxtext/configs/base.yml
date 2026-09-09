@@ -687,11 +687,17 @@ num_vocab_tiling: 1
 # Tokenizer
 vocab_size: 32_000 # powers of 2 for sharding
 tokenizer_path: ""
+# Optional Hub revision (commit, tag, or branch) passed to Hugging Face tokenizers.
+tokenizer_revision: ""
 # grain and tfds pipeline supports tokenizer_type: sentencepiece, huggingface, tiktoken
 # hf pipeline only supports huggingface type, and will ignore tokenizer_type flag
 tokenizer_type: "sentencepiece" # Currently supporting: "tiktoken", "sentencepiece", "huggingface"
 use_chat_template: false
-chat_template_path: "" # path to chat template json file
+chat_template_path: "" # path to a Jinja/text template or JSON object containing "chat_template"
+# Optional Hub revision for an hf:// chat_template_path. Keep the revision out of the URI.
+chat_template_revision: ""
+# Optional SHA-256 for the exact loaded chat-template bytes.
+chat_template_sha256: ""
 chat_template: "" # Chat template to use with HF tokenizers. It should be a valid Jinja2-formatted template.
 tokenize_train_data: true  # false if the dataset is pre-tokenized
 tokenize_eval_data: true  # false if the dataset is pre-tokenized
@@ -746,6 +752,21 @@ use_dpo: false
 use_sft: false
 # sft_train_on_completion_only=false trains on both prompt and completion tokens; trains only on completion tokens otherwise
 sft_train_on_completion_only: false
+# How Grain derives the SFT token stream and prompt/completion ownership:
+#   'segmented' (default) - preserve the legacy per-round chat-template/LCP path.
+#   'assistant_mask'      - render the full conversation once and consume token-level ownership from
+#                           {% generation %} blocks via return_assistant_tokens_mask. Requires
+#                           tokenize=true and sft_train_on_completion_only=true.
+sft_chat_template_mode: 'segmented'
+# Conversation-level reasoning mode used by every SFT chat-template render. Set
+# sft_enable_thinking_column to a required per-row boolean feature for mixed-mode
+# Grain data; otherwise the constant below applies to every row.
+sft_enable_thinking: true
+sft_enable_thinking_column: ''
+# Historical reasoning: 'auto' follows each row's thinking value in assistant_mask mode and omits
+# preserve_thinking in segmented mode. Explicit true/false is passed to every render in either mode.
+# The template determines which historical reasoning is retained.
+sft_preserve_thinking: 'auto'
 # How to handle SFT examples longer than max_target_length (grain SFT pipeline):
 #   'truncate' (default) - head-truncate to max_target_length. NOTE: this drops the tail of long
 #                examples, including the turn terminator (e.g. <end_of_turn>), from BOTH inputs and
@@ -761,12 +782,22 @@ sft_long_example_handling: 'truncate'
 # For sft_long_example_handling='window': completion tokens carried over as masked context between
 # consecutive windows (local continuity across the split). Clamped to <= max_target_length // 8.
 sft_window_overlap: 256
-# For 'window': max tokens of conversation-prefix context pinned (masked) in front of each window.
+# For 'window': max tokens of bounded conversation-prefix context (masked) in front of each window.
 # -1 = auto (max_target_length // 2). Bounds per-example fan-out for very long prompts.
 sft_window_context_cap: -1
-# For 'window': hard cap on records emitted per example (runaway guard). Loss tokens beyond the cap
+# For 'window': positive hard cap on records emitted per example (runaway guard). Loss tokens beyond the cap
 # are dropped and logged.
 sft_window_max_fan_out: 32
+# Preserve the canonical BOS + system/developer + native-tools block only when an over-length
+# example's context tail would otherwise left-cut it. Opt-in for compatibility; Grain SFT only.
+sft_window_pin_leading_context: false
+# Fail instead of silently truncating the instructions/tool declarations being protected. Left
+# truncation can remove BOS/opening instructions; right truncation can cut tool schemas/closers.
+# Explicitly shorten/split the pin, increase the context budget, or drop/quarantine the row with
+# accounting during preflight rather than silently changing it inside the training transform.
+sft_window_pinned_context_overflow: 'error'
+# Warn when the pin consumes more than this fraction of the effective context cap.
+sft_window_pinned_context_warn_fraction: 0.5
 
 # --- Per-dataset (per-mixture-component) metrics ------------------------------------------------
 # Emit per-dataset train loss/accuracy (segment-summed within each mixed batch) and per-dataset eval
@@ -846,6 +877,10 @@ olmo_apply_ngram_filter: true # mask instances with repetitive n-grams (OLMo-cor
 # Training loop
 steps: 150_001 # If set to -1 then will inherit value from learning_rate_schedule_steps
 log_period: 100 # The frequency of Tensorboard flush, gcs metrics writing, and managed profiler metrics updating.
+log_text_period: 0 # Log decoded training text samples every N steps. 0 disables text logging.
+log_text_num_samples: 1 # Number of batch rows to decode when text logging is active.
+log_text_num_docs: 1 # Max documents per packed sample. 0 logs no docs; -1 logs all.
+log_text_num_tokens: 64 # First/last N tokens per doc. 0 logs counts only; -1 logs the full document.
 
 jax_distributed_initialization_timeout: 300 # This is the default timeout in https://github.com/jax-ml/jax/blob/main/jax/_src/distributed.py
 # Note there are two separate initializations - the jax coordination service (aka jax.distributed.initialize) and the backend (e.g. PjRT), the timeout above refers
@@ -1395,4 +1430,3 @@ elastic_backup_kind: "snapshot"
 elastic_timeout_seconds: 300
 elastic_max_retries: 10
 elastic_min_slice_count: -1
-

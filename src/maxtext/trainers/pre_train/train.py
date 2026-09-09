@@ -226,7 +226,10 @@ def loss_fn(model, config, data, dropout_rng, params, sparsity_state=None, is_tr
         if "dataset_id" in data:
           xent_sum_by_ds, correct_by_ds = _pd_xent, _pd_correct
       else:
-        xent_sum, total_z_loss = vocab_tiling_linen_loss(hidden_states, data, config, model, params, is_train)
+        # The return arity is selected by config.per_dataset_metrics above.
+        xent_sum, total_z_loss = vocab_tiling_linen_loss(  # pylint: disable=unbalanced-tuple-unpacking
+            hidden_states, data, config, model, params, is_train
+        )
     else:
       one_hot_targets = jax.nn.one_hot(data["targets"], config.vocab_size)
       xent, z_loss = max_utils.cross_entropy_with_logits(logits, one_hot_targets, z_loss=config.z_loss_multiplier)
@@ -927,6 +930,7 @@ def training_loop_iteration(
     max_utils.print_mem_stats("After params initialized")
 
   metric_logger_instance.buffer_and_write_metrics(metrics, step, step_time_delta)
+  metric_logger_instance.maybe_log_text_samples(example_batch, step)
 
   # Pack mutated state back to dicts
   jax_device_state["state"] = state

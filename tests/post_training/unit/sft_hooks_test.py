@@ -74,6 +74,21 @@ class SFTHooksTest(unittest.TestCase):
     total_weights = training_hooks.get_total_weights(batch)
     self.assertEqual(total_weights, 3)
 
+  def test_sft_training_hooks_log_the_consumed_batch(self):
+    training_hooks = sft_hooks.SFTTrainingHooks.__new__(sft_hooks.SFTTrainingHooks)
+    training_hooks.metric_logger = MagicMock()
+    train_ctx = MagicMock()
+    train_ctx.data_hooks.train_batch = {"inputs": np.array([[1, 2, 3]])}
+
+    with patch("maxtext.trainers.post_train.hooks.BaseTrainingHooks.on_train_step_end") as base_step_end:
+      training_hooks.on_train_step_end(train_ctx, train_step=7, train_loss=1.5, step_time=0.25)
+
+    base_step_end.assert_called_once_with(train_ctx, 7, 1.5, 0.25)
+    training_hooks.metric_logger.maybe_log_text_samples.assert_called_once_with(
+        train_ctx.data_hooks.train_batch,
+        7,
+    )
+
 
 if __name__ == "__main__":
   unittest.main()

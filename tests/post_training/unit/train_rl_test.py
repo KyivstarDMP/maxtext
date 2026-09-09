@@ -27,6 +27,8 @@ pytestmark = [pytest.mark.post_training]
 from maxtext.configs import types
 from maxtext.utils import model_creation_utils
 
+TEST_REVISION = "01234567" * 5
+
 
 def _get_mock_devices(devices_per_slice, num_slices=1):
   mock_devices = []
@@ -80,6 +82,31 @@ class TrainRLTest(unittest.TestCase):
       self.assertEqual(len(sampler_devices), 4)
       self.assertEqual(trainer_devices, mock_devices[:4])
       self.assertEqual(sampler_devices, mock_devices[4:])
+
+  def test_rl_tokenizer_passes_revision(self):
+    trainer_config = SimpleNamespace(
+        tokenizer_path="example-org/example-model",
+        tokenizer_revision=TEST_REVISION,
+        hf_access_token="test-token",
+    )
+    setup_result = (trainer_config, mock.MagicMock(), [], [])
+
+    with (
+        mock.patch.object(model_creation_utils, "setup_configs_and_devices", return_value=setup_result),
+        mock.patch.object(
+            train_rl.AutoTokenizer,
+            "from_pretrained",
+            side_effect=RuntimeError("stop after tokenizer load"),
+        ) as mock_load,
+        self.assertRaisesRegex(RuntimeError, "stop after tokenizer load"),
+    ):
+      train_rl._rl_train_impl(["program", "config"], {})  # pylint: disable=protected-access
+
+    mock_load.assert_called_once_with(
+        "example-org/example-model",
+        token="test-token",
+        revision=TEST_REVISION,
+    )
 
   def test_setup_configs_and_devices_pathways_fractional_split(self):
     """Test setup_configs_and_devices with multiple VMs and custom fractions."""
@@ -563,10 +590,18 @@ class TokenizerChatTemplateTest(unittest.TestCase):
     trainer_config = SimpleNamespace(
         chat_template=None,
         chat_template_path="/path/to/jinja_template.json",
+        chat_template_revision=TEST_REVISION,
+        chat_template_sha256="a" * 64,
+        hf_access_token="test-token",
         tokenizer_path="dummy-base-model",
     )
     train_rl.configure_tokenizer_chat_template(mock_tokenizer, trainer_config)
-    mock_load.assert_called_once_with("/path/to/jinja_template.json")
+    mock_load.assert_called_once_with(
+        "/path/to/jinja_template.json",
+        hf_access_token="test-token",
+        revision=TEST_REVISION,
+        expected_sha256="a" * 64,
+    )
     self.assertEqual(
         mock_tokenizer.chat_template,
         "{% for message in messages %}{{ message.content }}{% endfor %}",

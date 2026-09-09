@@ -33,6 +33,7 @@ from maxtext.input_pipeline import data_processing_utils
 from maxtext.input_pipeline import input_pipeline_utils
 from maxtext.input_pipeline import grain_tokenizer
 from maxtext.input_pipeline import dpo_utils
+from maxtext.input_pipeline import instruction_data_processing
 from maxtext.input_pipeline import multihost_dataloading
 from maxtext.utils import gcs_utils
 from maxtext.utils import max_logging
@@ -373,10 +374,27 @@ def dpo_preprocessing_pipeline(
   return dataset
 
 
-def _format_chat_template_grain(element, data_columns, tokenizer_model):
+def _format_chat_template_grain(
+    element,
+    data_columns,
+    tokenizer_model,
+    pin_leading_context=False,
+    chat_template_mode="segmented",
+    sft_enable_thinking=True,
+    sft_enable_thinking_column="",
+    return_segment_ids=True,
+    sft_preserve_thinking="auto",
+):
   """Grain-compatible mapping function to format raw columns into conversational messages."""
   tools_column_name = data_processing_utils.TOOLS_COLUMN if data_processing_utils.TOOLS_COLUMN in data_columns else None
-  primary_columns = [c for c in data_columns if c != data_processing_utils.TOOLS_COLUMN]
+  primary_columns = [
+      column for column in data_columns if column not in (data_processing_utils.TOOLS_COLUMN, sft_enable_thinking_column)
+  ]
+  enable_thinking = _resolve_sft_enable_thinking(
+      element,
+      default=sft_enable_thinking,
+      column_name=sft_enable_thinking_column,
+  )
 
   # Convert raw columns to conversational messages
   if "messages" in primary_columns:
@@ -391,25 +409,123 @@ def _format_chat_template_grain(element, data_columns, tokenizer_model):
     # Fallback if it's already a single string
     messages = element[primary_columns[0]]
 
-  assert all(
-      hasattr(m, "__contains__") and "role" in m and "content" in m for m in messages
-  ), f"SFT requires a conversational format. Expected dicts with 'role' and 'content', but got: {messages}"
+  if chat_template_mode == "assistant_mask":
+    valid_messages = all(
+        hasattr(message, "__contains__")
+        and "role" in message
+        and ("content" in message or (message["role"] == "assistant" and message.get("tool_calls")))
+        for message in messages
+    )
+  else:
+    valid_messages = all(
+        hasattr(message, "__contains__") and "role" in message and "content" in message for message in messages
+    )
+  assert valid_messages, (
+      "SFT requires conversational message mappings with role/content; assistant-mask mode also "
+      f"accepts assistant tool-call messages with omitted content. Got: {messages}"
+  )
 
   # Assign the standardized messages back to the primary column
   element[primary_columns[0]] = messages
 
-  return input_pipeline_utils.apply_chat_template(
-      element, tokenizer_model=tokenizer_model,
+  formatter = input_pipeline_utils.apply_chat_template
+  if chat_template_mode == "assistant_mask":
+    formatter = input_pipeline_utils.apply_chat_template_with_assistant_mask
+
+  formatter_kwargs = {} if chat_template_mode == "assistant_mask" else {"return_segment_ids": return_segment_ids}
+  return formatter(
+      element,
+      tokenizer_model=tokenizer_model,
       data_column_name=primary_columns[0],
       tools_column_name=tools_column_name,
+      pin_leading_context=pin_leading_context,
+      enable_thinking=enable_thinking,
+      preserve_thinking=sft_preserve_thinking,
+      **formatter_kwargs,
   )
 
 
 def _tokenize_sft_chunks(element, text_column_name, tokenizer_model):
   """Tokenize each chunk individually without truncating."""
   text_chunks = element[text_column_name]
-  element[text_column_name] = [tokenizer_model.encode(chunk) for chunk in text_chunks]
+  if input_pipeline_utils.SFT_SEGMENT_IDS_KEY in element:
+    tokenized_chunks = input_pipeline_utils.validate_sft_segment_ids(
+        element.pop(input_pipeline_utils.SFT_SEGMENT_IDS_KEY), element["is_prompt"], text_chunks
+    )
+  else:
+    tokenized_chunks = [tokenizer_model.encode(chunk) for chunk in text_chunks]
+  pinned_ids = element.get(input_pipeline_utils.SFT_PINNED_CONTEXT_IDS_KEY, [])
+  if pinned_ids and tokenized_chunks:
+    input_pipeline_utils.validate_pinned_context_prefix(
+        tokenizer_model,
+        pinned_ids,
+        tokenized_chunks[0],
+        roles=["formatted-first-prompt"],
+        boundary_name="decode/encode",
+    )
+  element[text_column_name] = tokenized_chunks
   return element
+
+
+def _resolve_sft_enable_thinking(element, default, column_name):
+  """Resolve one strict conversation-level thinking-mode boolean."""
+  if type(default) is not bool:  # pylint: disable=unidiomatic-typecheck
+    raise ValueError(f"sft_enable_thinking must be an actual boolean, got {type(default).__name__}.")
+  if not column_name:
+    return default
+  if column_name not in element:
+    raise ValueError(
+        f"Configured sft_enable_thinking_column={column_name!r} is missing from the SFT record. "
+        f"Present columns: {sorted(element.keys())}"
+    )
+  value = element[column_name]
+  if type(value) is not bool:  # pylint: disable=unidiomatic-typecheck
+    raise ValueError(
+        f"SFT thinking-mode column {column_name!r} must contain an actual boolean, got {type(value).__name__}."
+    )
+  return value
+
+
+def _configure_sft_chat_template(config, data_columns, tokenizer_model, tokenize):
+  """Load an optional template file and validate the selected Grain SFT mode."""
+  chat_template = getattr(config, "chat_template", None)
+  chat_template_path = getattr(config, "chat_template_path", "")
+  if not chat_template and chat_template_path:
+    chat_template = instruction_data_processing.load_chat_template_from_file(
+        chat_template_path,
+        hf_access_token=getattr(config, "hf_access_token", None),
+        revision=getattr(config, "chat_template_revision", "") or None,
+        expected_sha256=getattr(config, "chat_template_sha256", "") or None,
+    )
+    if chat_template is None:
+      raise ValueError(f"Unable to load SFT chat template from chat_template_path={chat_template_path!r}.")
+  thinking_column = getattr(config, "sft_enable_thinking_column", "")
+  metadata_columns = (thinking_column,) if thinking_column else ()
+  data_processing_utils.validate_and_configure_sft_columns(
+      data_columns,
+      tokenizer_model,
+      chat_template,
+      metadata_columns=metadata_columns,
+  )
+
+  chat_template_mode = getattr(config, "sft_chat_template_mode", "segmented")
+  if chat_template_mode not in ("segmented", "assistant_mask"):
+    raise ValueError("sft_chat_template_mode must be 'segmented' or 'assistant_mask'; " f"got {chat_template_mode!r}.")
+  active_template = getattr(tokenizer_model, "chat_template", None)
+  data_processing_utils.validate_sft_chat_template_capabilities(active_template, chat_template_mode)
+  if chat_template_mode == "assistant_mask":
+    if not tokenize:
+      raise ValueError("sft_chat_template_mode='assistant_mask' requires tokenize=True in the Grain SFT pipeline.")
+    if not config.sft_train_on_completion_only:
+      raise ValueError(
+          "sft_chat_template_mode='assistant_mask' requires sft_train_on_completion_only=True so context remains masked."
+      )
+    if not isinstance(active_template, str) or re.search(r"{%[-+]?\s*generation\b", active_template) is None:
+      raise ValueError(
+          "sft_chat_template_mode='assistant_mask' requires an active chat template containing "
+          "{% generation %} blocks. Configure chat_template or chat_template_path."
+      )
+  return chat_template_mode
 
 
 def sft_preprocessing_pipeline(
@@ -428,24 +544,54 @@ def sft_preprocessing_pipeline(
   eval (Option B) runs one pass per dataset and needs no id — so this cannot be derived from
   ``config.per_dataset_metrics`` alone.
   """
-  dataset = data_processing_utils.parse_and_keep_features(dataset, config, data_columns, tokenize)
+  thinking_column = getattr(config, "sft_enable_thinking_column", "")
+  if thinking_column and thinking_column not in data_columns:
+    raise ValueError(
+        f"Configured sft_enable_thinking_column={thinking_column!r} must be listed in the active SFT data columns: "
+        f"{data_columns}"
+    )
+  scalar_bool_columns = (thinking_column,) if thinking_column else ()
+  dataset = data_processing_utils.parse_and_keep_features(
+      dataset,
+      config,
+      data_columns,
+      tokenize,
+      scalar_bool_columns=scalar_bool_columns,
+  )
 
   tokenizer_model, pad_id = data_processing_utils.get_tokenizer_and_pad_id(config)
   base_tokenizer_model = tokenizer_model
 
   tokenizer_model = getattr(tokenizer_model, "tokenizer", tokenizer_model)
 
-  data_processing_utils.validate_and_configure_sft_columns(
-      data_columns, tokenizer_model, getattr(config, "chat_template", None)
-  )
-
-  primary_columns = [c for c in data_columns if c != data_processing_utils.TOOLS_COLUMN]
+  primary_columns = [
+      column for column in data_columns if column not in (data_processing_utils.TOOLS_COLUMN, thinking_column)
+  ]
+  chat_template_mode = _configure_sft_chat_template(config, data_columns, tokenizer_model, tokenize)
+  long_handling = getattr(config, "sft_long_example_handling", "truncate")
+  pin_leading_context = getattr(config, "sft_window_pin_leading_context", False)
+  if pin_leading_context and long_handling != "window":
+    raise ValueError(
+        "sft_window_pin_leading_context=True requires sft_long_example_handling='window' in the Grain SFT pipeline."
+    )
+  if pin_leading_context and not tokenize:
+    raise ValueError("sft_window_pin_leading_context=True requires tokenize=True in the Grain SFT pipeline.")
 
   dataset = dataset.map(
-      functools.partial(_format_chat_template_grain, data_columns=data_columns, tokenizer_model=tokenizer_model)
+      functools.partial(
+          _format_chat_template_grain,
+          data_columns=data_columns,
+          tokenizer_model=tokenizer_model,
+          pin_leading_context=pin_leading_context,
+          chat_template_mode=chat_template_mode,
+          sft_enable_thinking=getattr(config, "sft_enable_thinking", True),
+          sft_enable_thinking_column=thinking_column,
+          return_segment_ids=tokenize,
+          sft_preserve_thinking=getattr(config, "sft_preserve_thinking", "auto"),
+      )
   )
 
-  if tokenize:
+  if tokenize and chat_template_mode == "segmented":
     dataset = dataset.map(
         functools.partial(
             _tokenize_sft_chunks,
@@ -454,7 +600,6 @@ def sft_preprocessing_pipeline(
         )
     )
 
-  long_handling = getattr(config, "sft_long_example_handling", "truncate")
   if long_handling == "window":
     assert (
         config.sft_train_on_completion_only
@@ -469,6 +614,9 @@ def sft_preprocessing_pipeline(
         overlap=config.sft_window_overlap,
         context_cap=config.sft_window_context_cap,
         max_fan_out=config.sft_window_max_fan_out,
+        pin_leading_context=pin_leading_context,
+        pinned_context_overflow=getattr(config, "sft_window_pinned_context_overflow", "error"),
+        pinned_context_warn_fraction=getattr(config, "sft_window_pinned_context_warn_fraction", 0.5),
     )
     # grain applies a FlatMapTransform via IterDataset.apply() in newer releases and via the
     # FlatMapIterDataset constructor in older ones (<=0.2.12). Support both so this works

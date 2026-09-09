@@ -122,9 +122,10 @@ Supervised Fine-Tuning in MaxText relies on tokenizing conversational datasets u
 
 ### Supported Dataset Schemas
 
-By default, MaxText SFT expects one of three conversational dataset structures:
+By default, MaxText SFT expects one of four conversational dataset structures:
 
 - `["messages"]`: A single column containing a list of dictionaries with `role` and `content` (recommended).
+- `["messages", "tools"]`: Messages plus native tool declarations passed to the chat template.
 - `["prompt", "completion"]`: Separated prompt and completion columns.
 - `["question", "answer"]`: Question and answer columns (e.g., math datasets).
 
@@ -142,8 +143,89 @@ During data processing, MaxText converts these into a unified `messages` schema 
 To customize the tokenizer's chat formatting (e.g., adding special tokens like `<start_of_turn>`, `<end_of_turn>`, etc.), you can provide a custom chat template using the `chat_template` or `chat_template_path` configs:
 
 - **`chat_template`**: Use this config to specify a custom Jinja2 template string directly.
-- **`chat_template_path`**: Path to a custom Jinja2 template file (e.g., `.jinja`) or a JSON file containing the template.
+- **`chat_template_path`**: Path to a custom Jinja2 template file (e.g., `.jinja`), a JSON file containing the template, or an `hf://<org>/<repo>/<path>` Hub URI.
+- **`tokenizer_revision`**: Optional Hugging Face revision passed when loading `tokenizer_path`.
+- **`chat_template_revision`**: Optional Hugging Face revision used for an `hf://` template path.
+- **`chat_template_sha256`**: Optional SHA-256 check over the exact loaded template bytes.
 - **`use_chat_template=True`**: Enables chat template formatting.
+
+Keep Hub revisions in the separate revision fields rather than embedding them in
+the URI. For reproducible runs, use immutable commit IDs:
+
+```yaml
+tokenizer_type: huggingface
+tokenizer_path: example-org/example-model
+tokenizer_revision: <40_HEX_COMMIT>
+chat_template_path: hf://example-org/example-model/templates/training.jinja
+chat_template_revision: <40_HEX_COMMIT>
+```
+
+### Canonical token ownership for completion-only SFT
+
+The tokenized Grain pipeline also supports an opt-in canonical mode. It renders
+the full conversation once and uses Jinja `{% generation %}` blocks to decide
+which exact tokens receive loss:
+
+```yaml
+dataset_type: grain
+use_sft: true
+tokenize_train_data: true
+sft_train_on_completion_only: true
+sft_chat_template_mode: assistant_mask
+```
+
+The default `segmented` mode remains available for compatible templates. Its
+Grain and Hugging Face paths carry the original rendered token IDs through an
+internal `sft_segment_ids` column, aligned with the decoded strings and
+`is_prompt` flags. Tokenization consumes those IDs and removes the side column;
+it does not encode the decoded chunks again. String-only (`tokenize=False`)
+paths do not expose this column. Legacy callers without the column still encode
+strings.
+
+Segmented SFT rejects rows with no nonempty assistant completion segment, even
+when `sft_train_on_completion_only=false`. This is an SFT input requirement,
+independent of whether prompt tokens also receive loss. An empty-content
+assistant remains valid when the template emits supervised closing tokens;
+empty completions are also allowed alongside a nonempty completion in the row.
+Trailing tool results must eventually be followed by an assistant or user so
+their context can be emitted. A row ending in unemitted results raises instead
+of silently discarding them. Terminal assistant calls without a recorded result
+remain supported.
+
+Segmented rendering restarts its round after an assistant followed by a new user.
+That next round replays the template's BOS and leading system/developer/tools
+context. Within one round, tool results are emitted once as a masked suffix.
+At a tool-to-user boundary, the pending result suffix and the new user prompt
+suffix are separate masked segments; earlier tokens are not replayed there.
+This per-round contract differs from rendering one full multi-turn conversation
+in `assistant_mask` mode.
+
+One existing exception remains: every emitted user generation prompt, including
+both the first user and a user after tools, can contain speculative template
+tokens absent from the canonical completed-round render. For example, a
+no-think serving template may insert an empty thought channel. An interrupted
+tool round can therefore retain two such insertions. Carrying original IDs
+prevents re-encoding drift but does not change this token selection. The existing
+longest-common-prefix completion boundary and trimming of speculative tokens in
+direct tool-to-assistant continuations remain unchanged.
+
+`sft_preserve_thinking=auto` omits the preservation argument in segmented mode
+and follows each row's thinking value in canonical mode. An explicit boolean
+is passed to every render in either mode, including prefix and pin renders.
+The template decides which historical reasoning it retains. A segmented
+tool-to-user boundary can fail if adding the user makes earlier call reasoning
+disappear; explicit preservation can resolve that seam for compatible
+templates. See the thinking-mode contract below for the exact scope.
+
+`assistant_mask` is Grain-only and requires a generation-marked template. For
+the complete ownership, tools, thinking-mode, and validation contract, see
+[Canonical Gemma 4 SFT rendering](gemma4_sft_canonical_rendering.md) and the
+[Gemma 4 SFT data contract](gemma4_sft_data_contract.md).
+
+For records longer than `max_target_length`, see
+[SFT long-example windowing](sft_long_example_windowing.md). For the difference
+between one canonical training history and online generation prefixes, see
+[Gemma 4 multi-turn SFT and serving frontiers](gemma4_sft_serving_frontiers.md).
 
 ### Advanced: Custom Dataset Formatter (e.g., ShareGPT)
 
