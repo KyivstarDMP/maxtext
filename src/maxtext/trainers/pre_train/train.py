@@ -130,7 +130,7 @@ def _total_correct_from_logits(logits, data):
   """Aggregate next-token correct-token count over the loss mask (non-tiled path only).
 
   With vocab tiling the decoder returns logits=None, so the tiled path sources this from the
-  tiled scan instead (see vocab_tiling_linen_loss).
+  tiled scan instead (in both the Linen and NNX loss functions).
   """
   return jnp.sum((jnp.argmax(logits, axis=-1) == data["targets"]) & (data["targets_segmentation"] != 0))
 
@@ -176,8 +176,6 @@ def loss_fn(model, config, data, dropout_rng, params, sparsity_state=None, is_tr
   if config.per_dataset_metrics:
     if is_block_diffusion or (config.use_indexer and not config.indexer_sparse_training):
       raise ValueError("Per-dataset metrics are not supported for block diffusion or indexer warm-up.")
-    if not isinstance(model, nn.Module) and config.num_vocab_tiling > 1:
-      raise ValueError("NNX tiled per-dataset metrics require the separate numerical metrics repair.")
   if getattr(config, "attention_type", "global") == "block_diffusion" and not is_block_diffusion:
     raise ValueError(
         "Block-diffusion attention requires target-aligned block-diffusion losses; "
@@ -287,20 +285,15 @@ def loss_fn(model, config, data, dropout_rng, params, sparsity_state=None, is_tr
     elif config.num_vocab_tiling > 1:
       hidden_state_key = ("intermediates", "decoder", "hidden_states")
       hidden_states = maxtext_utils.get_nested_value(intermediate_outputs, hidden_state_key)[0]
+      xent_sum, total_z_loss, _pd_xent, _pd_correct = vocab_tiling_linen_loss(
+          hidden_states, data, config, model, params, is_train
+      )
       if config.per_dataset_metrics:
-        xent_sum, total_z_loss, _pd_xent, _pd_correct = vocab_tiling_linen_loss(
-            hidden_states, data, config, model, params, is_train
-        )
         # No full logits exist on the tiled path, so accuracy comes from the tiled scan. Train
         # batches give per-component vectors; eval batches bucket into one slot (the aggregate).
         total_correct = jnp.sum(_pd_correct)
         if "dataset_id" in data:
           xent_sum_by_ds, correct_by_ds = _pd_xent, _pd_correct
-      else:
-        # The return arity is selected by config.per_dataset_metrics above.
-        xent_sum, total_z_loss = vocab_tiling_linen_loss(  # pylint: disable=unbalanced-tuple-unpacking
-            hidden_states, data, config, model, params, is_train
-        )
     else:
       if is_block_diffusion:
         logits = block_diffusion_target_alignment.align_logits_to_targets(
@@ -385,7 +378,11 @@ def loss_fn(model, config, data, dropout_rng, params, sparsity_state=None, is_tr
     elif config.num_vocab_tiling > 1:
       hidden_state_key = ("decoder", "hidden_states")
       hidden_states = maxtext_utils.get_nested_value(intermediate_outputs, hidden_state_key)[0]
-      xent_sum, total_z_loss = vocab_tiling_nnx_loss(model, hidden_states, data, config, is_train)
+      xent_sum, total_z_loss, _pd_xent, _pd_correct = vocab_tiling_nnx_loss(model, hidden_states, data, config, is_train)
+      if config.per_dataset_metrics:
+        total_correct = jnp.sum(_pd_correct)
+        if "dataset_id" in data:
+          xent_sum_by_ds, correct_by_ds = _pd_xent, _pd_correct
     else:
       if is_block_diffusion:
         logits = block_diffusion_target_alignment.align_logits_to_targets(

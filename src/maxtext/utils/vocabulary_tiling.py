@@ -79,7 +79,9 @@ def vocab_tiling_linen_loss(
     params: The model parameters.
     is_train: A boolean indicating if the model is in training mode.
   Returns:
-    A tuple of (total_loss, total_z_loss) computed via vocab tiling.
+    A tuple of (total_loss, total_z_loss, loss_by_dataset, correct_by_dataset).
+    Dataset vectors are non-differentiable and are None when metrics are disabled.
+    Per-dataset loss includes z-loss, matching total_loss.
   """
   labels = data["targets"]
   segmentation = data["targets_segmentation"]
@@ -173,7 +175,9 @@ def vocab_tiling_linen_loss(
           method="logits_from_hidden_states_for_vocab_tiling",
       )
       logits = _maybe_shard_with_name(logits, chunked_logits_spec)
-      chunk_xent, _ = max_utils.cross_entropy_with_logits(logits, jax.nn.one_hot(lbl, config.vocab_size), z_loss=0.0)
+      chunk_xent, _ = max_utils.cross_entropy_with_logits(
+          logits, jax.nn.one_hot(lbl, config.vocab_size), z_loss=config.z_loss_multiplier
+      )
       m = seg != 0
       xent_acc = xent_acc + jax.ops.segment_sum(chunk_xent * m, dsid, num_segments=num_seg)
       correct = (jnp.argmax(logits, axis=-1) == lbl) & m
@@ -328,9 +332,7 @@ def vocab_tiling_linen_loss(
       segmentation,
   )
 
-  if per_dataset:
-    return total_loss, total_z_loss, pd_xent_by_ds, pd_correct_by_ds
-  return total_loss, total_z_loss
+  return total_loss, total_z_loss, pd_xent_by_ds, pd_correct_by_ds
 
 
 def vocab_tiling_nnx_loss(model, hidden_states, data, config, is_train):
@@ -351,12 +353,26 @@ def vocab_tiling_nnx_loss(model, hidden_states, data, config, is_train):
     is_train: Whether the model is in training mode.
 
   Returns:
-    A tuple ``(total_loss, total_z_loss)``.
+    A tuple ``(total_loss, total_z_loss, loss_by_dataset, correct_by_dataset)``.
+    Dataset vectors are non-differentiable and are None when metrics are disabled.
+    Per-dataset loss includes z-loss, matching total_loss. Without dataset IDs,
+    metrics use two slots: slot 0 is empty and slot 1 contains this batch's totals.
   """
   labels = data["targets"]
   segmentation = data["targets_segmentation"]
   deterministic = not config.enable_dropout if is_train else True
   model_mode = "train"
+  per_dataset = config.per_dataset_metrics
+  if per_dataset:
+    if "dataset_id" in data:
+      num_dataset_slots = len([name for name in config.per_dataset_names.split(",") if name]) + 1
+      dataset_ids = data["dataset_id"]
+    else:
+      num_dataset_slots = 2
+      dataset_ids = jnp.ones_like(labels)
+  else:
+    num_dataset_slots = 0
+    dataset_ids = None
 
   hidden_spec = create_sharding(
       model.mesh,
@@ -427,14 +443,16 @@ def vocab_tiling_nnx_loss(model, hidden_states, data, config, is_train):
     return _maybe_shard_with_name(chunk_logits, chunked_logits_spec)
 
   @jax.custom_vjp
-  def chunked_cross_entropy_loss(chunk_head_params, chunk_other_params, chunk_rest, hidden_states, labels, segmentation):
-    (total_loss, total_z_loss), _ = _chunked_cross_entropy_loss_fwd(
-        chunk_head_params, chunk_other_params, chunk_rest, hidden_states, labels, segmentation
+  def chunked_cross_entropy_loss(
+      chunk_head_params, chunk_other_params, chunk_rest, hidden_states, labels, segmentation, dataset_ids
+  ):
+    outputs, _ = _chunked_cross_entropy_loss_fwd(
+        chunk_head_params, chunk_other_params, chunk_rest, hidden_states, labels, segmentation, dataset_ids
     )
-    return total_loss, total_z_loss
+    return outputs
 
   def _chunked_cross_entropy_loss_fwd(
-      chunk_head_params, chunk_other_params, chunk_rest, hidden_states, labels, segmentation
+      chunk_head_params, chunk_other_params, chunk_rest, hidden_states, labels, segmentation, dataset_ids
   ):
     batch_size, seq_len, emb_dim = hidden_states.shape
     vocab_tile_size = (batch_size * seq_len) // config.num_vocab_tiling
@@ -444,10 +462,13 @@ def vocab_tiling_nnx_loss(model, hidden_states, data, config, is_train):
     )
     reshaped_labels = _reshape(labels, (config.num_vocab_tiling, vocab_tile_size), reshaped_data_spec)
     reshaped_segmentation = _reshape(segmentation, (config.num_vocab_tiling, vocab_tile_size), reshaped_data_spec)
+    reshaped_dataset_ids = (
+        _reshape(dataset_ids, (config.num_vocab_tiling, vocab_tile_size), reshaped_data_spec) if per_dataset else None
+    )
 
     def _fwd_scan_body(accumulators, chunk_data):
-      loss_accumulator, z_loss_accumulator = accumulators
-      hidden_chunk, label_chunk, segmentation_chunk = chunk_data
+      loss_accumulator, z_loss_accumulator, loss_by_dataset, correct_by_dataset = accumulators
+      hidden_chunk, label_chunk, segmentation_chunk, dataset_id_chunk = chunk_data
       hidden_chunk = _maybe_shard_with_name(hidden_chunk, chunked_hidden_spec)
       label_chunk = _maybe_shard_with_name(label_chunk, chunked_data_spec)
       segmentation_chunk = _maybe_shard_with_name(segmentation_chunk, chunked_data_spec)
@@ -458,16 +479,35 @@ def vocab_tiling_nnx_loss(model, hidden_states, data, config, is_train):
           chunk_logits, one_hot_label_chunk, z_loss=config.z_loss_multiplier
       )
 
-      masked_xent = jnp.sum(chunk_xent * (segmentation_chunk != 0))
-      masked_z_loss = jnp.sum(chunk_z_loss * (segmentation_chunk != 0))
+      mask = segmentation_chunk != 0
+      masked_xent = chunk_xent * mask
+      if per_dataset:
+        dataset_id_chunk = _maybe_shard_with_name(dataset_id_chunk, chunked_data_spec)
+        loss_by_dataset += jax.ops.segment_sum(masked_xent, dataset_id_chunk, num_segments=num_dataset_slots)
+        correct = (jnp.argmax(chunk_logits, axis=-1) == label_chunk) & mask
+        correct_by_dataset += jax.ops.segment_sum(
+            correct.astype(jnp.int32), dataset_id_chunk, num_segments=num_dataset_slots
+        )
 
-      return (loss_accumulator + masked_xent, z_loss_accumulator + masked_z_loss), None
+      return (
+          loss_accumulator + jnp.sum(masked_xent),
+          z_loss_accumulator + jnp.sum(chunk_z_loss * mask),
+          loss_by_dataset,
+          correct_by_dataset,
+      ), None
 
     # Always accumulate in fp32 — `cross_entropy_with_logits` returns fp32 regardless of
     # logits dtype, and a bf16 carry would mismatch the body output type under lax.scan.
-    initial_acc = (jnp.zeros((), dtype=jnp.float32), jnp.zeros((), dtype=jnp.float32))
-    (total_loss, total_z_loss), _ = jax.lax.scan(
-        _fwd_scan_body, initial_acc, (reshaped_hidden_states, reshaped_labels, reshaped_segmentation)
+    initial_acc = (
+        jnp.zeros((), dtype=jnp.float32),
+        jnp.zeros((), dtype=jnp.float32),
+        jnp.zeros(num_dataset_slots, dtype=jnp.float32) if per_dataset else None,
+        jnp.zeros(num_dataset_slots, dtype=jnp.int32) if per_dataset else None,
+    )
+    outputs, _ = jax.lax.scan(
+        _fwd_scan_body,
+        initial_acc,
+        (reshaped_hidden_states, reshaped_labels, reshaped_segmentation, reshaped_dataset_ids),
     )
     residuals = (
         chunk_head_params,
@@ -480,11 +520,11 @@ def vocab_tiling_nnx_loss(model, hidden_states, data, config, is_train):
         seq_len,
         emb_dim,
     )
-    return (total_loss, total_z_loss), residuals
+    return outputs, residuals
 
   def _chunked_cross_entropy_loss_bwd(residuals, cotangents):
-    # z_loss is folded into the xent loss inside cross_entropy_with_logits.
-    loss_cotangent, _ = cotangents
+    # z_loss is folded into the xent loss; dataset vectors are reporting-only.
+    loss_cotangent, _, _, _ = cotangents
 
     (
         chunk_head_params,
@@ -542,11 +582,15 @@ def vocab_tiling_nnx_loss(model, hidden_states, data, config, is_train):
         grad_reshaped_hidden_states.astype(reshaped_hidden_states.dtype),
         None,
         None,
+        None,
     )
 
   chunked_cross_entropy_loss.defvjp(_chunked_cross_entropy_loss_fwd, _chunked_cross_entropy_loss_bwd)
 
-  total_loss, total_z_loss = chunked_cross_entropy_loss(
-      head_params, other_params, rest, hidden_states, labels, segmentation
+  total_loss, total_z_loss, loss_by_dataset, correct_by_dataset = chunked_cross_entropy_loss(
+      head_params, other_params, rest, hidden_states, labels, segmentation, dataset_ids
   )
-  return total_loss, total_z_loss
+  if per_dataset:
+    loss_by_dataset = jax.lax.stop_gradient(loss_by_dataset)
+    correct_by_dataset = jax.lax.stop_gradient(correct_by_dataset)
+  return total_loss, total_z_loss, loss_by_dataset, correct_by_dataset
