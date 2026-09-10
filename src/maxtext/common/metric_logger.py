@@ -98,6 +98,7 @@ class MetricLogger:
     self.config = config
     self.metadata = {}
     self.running_gcs_metrics = [] if config.gcs_metrics else None
+    self._gcs_eval_write_count = 0
     self.performance_metric_queue = self.get_performance_metric_queue(config)
     self.learning_rate_schedule = learning_rate_schedule
     self.cumulative_eval_metrics = {"scalar": defaultdict(float)}
@@ -428,18 +429,31 @@ class MetricLogger:
   def write_metrics_for_gcs(self, metrics, step, metric_type):
     """Writes metrics to GCS."""
     metrics_dict_step = _prepare_metrics_for_json(metrics, step, self.config.run_name)
-    self.running_gcs_metrics.append(metrics_dict_step)
-    if metric_type == "train" and (step + 1) % self.config.log_period == 0 or step == self.config.steps - 1:
+    if metric_type == "eval":
+      # Finalized eval may precede or follow the matching train flush. Give it its
+      # own object and leave the pending training window intact. Multiple eval
+      # producers at one train step must not overwrite one another either.
+      write_count = getattr(self, "_gcs_eval_write_count", 0)
+      metrics_filename = f"metrics_eval_step_{step:06}_part_{write_count:06}.txt"
+      self._gcs_eval_write_count = write_count + 1
+      metrics_to_write = [metrics_dict_step]
+    else:
+      self.running_gcs_metrics.append(metrics_dict_step)
+      if metric_type != "train" or not ((step + 1) % self.config.log_period == 0 or step == self.config.steps - 1):
+        return
       start_step = (step // self.config.log_period) * self.config.log_period
       metrics_filename = f"metrics_step_{start_step:06}_to_step_{step:06}.txt"
-      with open(metrics_filename, "wt", encoding="utf8") as metrics_for_gcs:
-        for metrics_step in self.running_gcs_metrics:
-          metrics_for_gcs.write(str(json.dumps(metrics_step)) + "\n")
+      metrics_to_write = self.running_gcs_metrics
 
-      gcs_filename = os.path.join(self.config.metrics_dir, metrics_filename)
-      max_logging.log(f"Moving file {metrics_filename} to GCS...")
-      gcs_utils.upload_blob(gcs_filename, metrics_filename)
-      max_logging.log(f"File {metrics_filename} moved successfully!")
+    with open(metrics_filename, "wt", encoding="utf8") as metrics_for_gcs:
+      for metrics_step in metrics_to_write:
+        metrics_for_gcs.write(str(json.dumps(metrics_step)) + "\n")
+
+    gcs_filename = os.path.join(self.config.metrics_dir, metrics_filename)
+    max_logging.log(f"Moving file {metrics_filename} to GCS...")
+    gcs_utils.upload_blob(gcs_filename, metrics_filename)
+    max_logging.log(f"File {metrics_filename} moved successfully!")
+    if metric_type == "train":
       self.running_gcs_metrics = []  # reset running_metrics to empty list
 
   def write_metrics_to_tensorboard(self, metrics, step, metric_type):

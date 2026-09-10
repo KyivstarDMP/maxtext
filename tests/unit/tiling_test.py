@@ -19,6 +19,9 @@ Tests for verifying losses and gradients match using/without using tiling method
 """
 
 import unittest
+from types import SimpleNamespace
+
+import numpy as np
 import pytest
 
 from flax import linen as nn
@@ -30,7 +33,7 @@ from jax.sharding import Mesh
 
 from maxtext.configs import pyconfig
 from maxtext.common.common_types import Config
-from maxtext.common.common_types import MODEL_MODE_TRAIN
+from maxtext.common.common_types import MODEL_MODE_TRAIN, ShardMode
 from maxtext.layers import quantizations
 from maxtext.models import models
 from maxtext.utils import max_utils
@@ -305,7 +308,7 @@ class LossAndGradientCorrectnessTest(unittest.TestCase):
         "targets_segmentation": jnp.ones((self.batch_size, self.seq_len)),
     }
 
-    xent_sum_tiled, _ = vocab_tiling_nnx_loss(model, hidden_states, data, cfg, is_train=True)
+    xent_sum_tiled, _, _, _ = vocab_tiling_nnx_loss(model, hidden_states, data, cfg, is_train=True)
 
     # Reference: full logits with no tiling, same masking as the tiled path.
     logits = model.logits_from_hidden_states_for_vocab_tiling(hidden_states, True, MODEL_MODE_TRAIN)
@@ -780,7 +783,7 @@ class VocabTilingNNXTest(unittest.TestCase):
 
     def loss_fn(p, h):
       local_model = nnx.merge(graphdef, p, rest, copy=True)
-      total_loss, _ = vocab_tiling_nnx_loss(local_model, h, data, cfg, is_train=True)
+      total_loss, _, _, _ = vocab_tiling_nnx_loss(local_model, h, data, cfg, is_train=True)
       return total_loss
 
     return loss_fn
@@ -872,7 +875,7 @@ class VocabTilingNNXTest(unittest.TestCase):
 
     with nn_partitioning.axis_rules(cfg.logical_axis_rules):
       ref_total_loss, ref_total_z_loss = jax.jit(_ref)(params, hidden_states)
-      tile_total_loss, tile_total_z_loss = jax.jit(_tile)(params, hidden_states)
+      tile_total_loss, tile_total_z_loss, _, _ = jax.jit(_tile)(params, hidden_states)
 
     assert jnp.allclose(ref_total_loss, tile_total_loss, rtol=self.rtol, atol=self.atol)
     assert jnp.allclose(
@@ -891,7 +894,7 @@ class VocabTilingNNXTest(unittest.TestCase):
 
     def _tile_loss_only(p, h, seg):
       local_model = nnx.merge(graphdef, p, rest, copy=True)
-      total, _ = vocab_tiling_nnx_loss(
+      total, _, _, _ = vocab_tiling_nnx_loss(
           local_model, h, {"targets": labels, "targets_segmentation": seg}, cfg, is_train=True
       )
       return total
@@ -983,7 +986,7 @@ class VocabTilingNNXTest(unittest.TestCase):
       return vocab_tiling_nnx_loss(local_model, h, data, cfg, is_train=True)
 
     with nn_partitioning.axis_rules(cfg.logical_axis_rules):
-      total_loss, total_z_loss = jax.jit(_tile_fn)(params, hidden_states)
+      total_loss, total_z_loss, _, _ = jax.jit(_tile_fn)(params, hidden_states)
     assert float(total_z_loss) == 0.0, f"z_loss=0 but tile path returned {total_z_loss}"
     assert float(total_loss) > 0.0  # cross-entropy on random logits should be positive
 
@@ -1045,3 +1048,329 @@ class VocabTilingNNXTest(unittest.TestCase):
           loss, base_loss, rtol=self.rtol, atol=self.atol
       ), f"num_vocab_tiling={n}: loss diverges from n=2 baseline ({loss} vs {base_loss})"
       self._assert_pytrees_close(base_grads, grads, f"num_vocab_tiling={n}: grads diverge from n=2 baseline.")
+
+
+def _metrics_kernel_init(_key, shape, dtype=jnp.float32):
+  return 1.5 * jnp.eye(shape[0], shape[1], dtype=dtype)
+
+
+class _MetricsLinenHead(nn.Module):
+  mesh: Mesh
+
+  @nn.compact
+  def __call__(self, hidden, deterministic=True):
+    del deterministic
+    return nn.Dense(4, use_bias=False, kernel_init=_metrics_kernel_init, name="logits_dense")(hidden)
+
+  def logits_from_hidden_states_for_vocab_tiling(self, hidden, deterministic):
+    return self(hidden, deterministic)
+
+
+class _MetricsNNXHead(nnx.Module):
+
+  def __init__(self, mesh):
+    self.mesh = mesh
+    self.logits_dense = nnx.Linear(4, 4, use_bias=False, kernel_init=_metrics_kernel_init, rngs=nnx.Rngs(0))
+    self.unused_backbone = nnx.Param(jnp.array(2.0))
+
+  def logits_from_hidden_states_for_vocab_tiling(self, hidden, deterministic, model_mode):
+    del deterministic, model_mode
+    return self.logits_dense(hidden)
+
+
+def _per_dataset_tiling_fixture(
+    backend, *, with_ids=True, metrics=True, names="a,b,absent", tiles=4, is_train=True, return_total_correct=False
+):
+  """Small real output heads; all sharding and tiled-loss functions remain unmocked."""
+  cfg = SimpleNamespace(
+      per_dataset_metrics=metrics,
+      per_dataset_names=names,
+      num_vocab_tiling=tiles,
+      vocab_size=4,
+      z_loss_multiplier=0.1,
+      enable_dropout=False,
+      shard_mode=ShardMode.AUTO,
+      debug_sharding=False,
+      vocab_tiling_ag_once=False,
+  )
+  mesh = jax.make_mesh(
+      (1, 1, 1, 1, 1), ("data", "fsdp", "fsdp_transpose", "expert", "context"), devices=jax.devices()[:1]
+  )
+  hidden = jnp.asarray(np.random.default_rng(123).normal(size=(2, 8, 4)), dtype=jnp.float32)
+  ids = jnp.array([[1, 2, 1, 1, 2, 1, 1, 0], [2, 1, 2, 1, 1, 2, 0, 0]], dtype=jnp.int32)
+  mask = (ids != 0).at[:, 3].set(False)
+  predicted = jnp.argmax(hidden, axis=-1)
+  labels = jnp.where(ids == 2, (predicted + 1) % cfg.vocab_size, predicted).astype(jnp.int32)
+  data = {"targets": labels, "targets_segmentation": mask.astype(jnp.int32)}
+  if with_ids:
+    data["dataset_id"] = ids
+
+  if backend == "nnx":
+    model = _MetricsNNXHead(mesh)
+    graphdef, params, rest = nnx.split(model, nnx.Param, ...)
+
+    def tiled(p, h):
+      return vocab_tiling_nnx_loss(
+          nnx.merge(graphdef, p, rest, copy=True), h, data, cfg, is_train, return_total_correct=return_total_correct
+      )
+
+    def logits(p, h):
+      return nnx.merge(graphdef, p, rest, copy=True).logits_from_hidden_states_for_vocab_tiling(h, True, "train")
+
+  else:
+    model = _MetricsLinenHead(mesh)
+    params = model.init(jax.random.key(0), hidden)
+
+    def tiled(p, h):
+      return vocab_tiling_linen_loss(h, data, cfg, model, p, is_train, return_total_correct=return_total_correct)
+
+    def logits(p, h):
+      return model.apply(p, h)
+
+  return cfg, data, params, hidden, tiled, logits
+
+
+def _independent_loss(logits, data, z_loss):
+  """Reference objective independent of MaxText's custom cross-entropy/VJP helper."""
+  log_z = jax.scipy.special.logsumexp(logits.astype(jnp.float32), axis=-1)
+  gold = jnp.take_along_axis(logits, data["targets"][..., None], axis=-1)[..., 0]
+  per_token = log_z - gold + z_loss * log_z**2
+  return jnp.sum(per_token * (data["targets_segmentation"] != 0))
+
+
+def _independent_dataset_sums(logits, data, cfg):
+  """CPU NumPy reference with explicit per-dataset selection instead of segment_sum."""
+  logits = np.asarray(logits, dtype=np.float64)
+  labels = np.asarray(data["targets"])
+  mask = np.asarray(data["targets_segmentation"]) != 0
+  shift = logits.max(axis=-1)
+  log_z = shift + np.log(np.exp(logits - shift[..., None]).sum(axis=-1))
+  xent = log_z - np.take_along_axis(logits, labels[..., None], axis=-1)[..., 0] + cfg.z_loss_multiplier * log_z**2
+  ids = np.asarray(data.get("dataset_id", np.ones_like(labels)))
+  slots = len([name for name in cfg.per_dataset_names.split(",") if name]) + 1 if "dataset_id" in data else 2
+  losses, correct, tokens = [], [], []
+  for dataset_id in range(slots):
+    selected = (ids == dataset_id) & mask
+    losses.append(xent[selected].sum())
+    correct.append(((logits.argmax(axis=-1) == labels) & selected).sum())
+    tokens.append(selected.sum())
+  return np.asarray(losses), np.asarray(correct), np.asarray(tokens), (cfg.z_loss_multiplier * log_z[mask] ** 2).sum()
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("backend", ["linen", "nnx"])
+@pytest.mark.parametrize("is_train", [False, True])
+@pytest.mark.parametrize("tiles", [2, 4])
+def test_per_dataset_tiling_known_answers_and_z_loss(backend, is_train, tiles):
+  cfg, data, params, hidden, tiled, logits = _per_dataset_tiling_fixture(backend, tiles=tiles, is_train=is_train)
+  total, z_loss, losses, correct = jax.jit(tiled)(params, hidden)
+  expected_loss, expected_correct, tokens, expected_z = _independent_dataset_sums(logits(params, hidden), data, cfg)
+  np.testing.assert_allclose(losses, expected_loss, rtol=2e-5, atol=2e-6)
+  np.testing.assert_array_equal(correct, expected_correct)
+  np.testing.assert_allclose(total, expected_loss.sum(), rtol=2e-5, atol=2e-6)
+  np.testing.assert_allclose(z_loss, expected_z, rtol=2e-5, atol=2e-6)
+  assert float(z_loss) > 0
+  assert int(correct[1]) == int(tokens[1]) > 0
+  assert int(correct[2]) == 0 and tokens[2] > 0
+  assert losses[0] == losses[3] == correct[0] == correct[3] == 0
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("backend", ["linen", "nnx"])
+@pytest.mark.parametrize("names", ["", "a,b,absent"])
+def test_per_dataset_tiling_no_id_eval_uses_two_slots(backend, names):
+  cfg, data, params, hidden, tiled, logits = _per_dataset_tiling_fixture(
+      backend, with_ids=False, names=names, is_train=False
+  )
+  total, _, losses, correct = jax.jit(tiled)(params, hidden)
+  expected_loss, expected_correct, _, _ = _independent_dataset_sums(logits(params, hidden), data, cfg)
+  assert losses.shape == correct.shape == (2,)
+  np.testing.assert_allclose(losses, expected_loss, rtol=2e-5, atol=2e-6)
+  np.testing.assert_array_equal(correct, expected_correct)
+  np.testing.assert_allclose(losses[1], total, rtol=2e-5, atol=2e-6)
+  assert losses[0] == correct[0] == 0
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("backend", ["linen", "nnx"])
+@pytest.mark.parametrize("with_ids", [False, True])
+@pytest.mark.parametrize("is_train", [False, True])
+def test_per_dataset_tiling_disabled_returns_none(backend, with_ids, is_train):
+  cfg, data, params, hidden, tiled, logits = _per_dataset_tiling_fixture(
+      backend, with_ids=with_ids, metrics=False, is_train=is_train
+  )
+  total, _, losses, correct = jax.jit(tiled)(params, hidden)
+  assert losses is None and correct is None
+  np.testing.assert_allclose(total, _independent_loss(logits(params, hidden), data, cfg.z_loss_multiplier), rtol=2e-5)
+  assert "argmax[" not in str(jax.make_jaxpr(tiled)(params, hidden))
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("backend", ["linen", "nnx"])
+@pytest.mark.parametrize("is_train", [False, True])
+def test_per_dataset_tiling_gradients_match_normalized_reference(backend, is_train):
+  cfg, data, params, hidden, tiled, logits = _per_dataset_tiling_fixture(backend, is_train=is_train)
+  _, _, off_params, _, tiled_off, _ = _per_dataset_tiling_fixture(backend, metrics=False, is_train=is_train)
+  scale = 1.0 / jnp.sum(data["targets_segmentation"] != 0)
+
+  def reference(p, h):
+    return scale * _independent_loss(logits(p, h), data, cfg.z_loss_multiplier)
+
+  def with_metrics(p, h):
+    total, _, losses, _ = tiled(p, h)
+    # Reporting vectors must not contribute gradients, even if accidentally used in an objective.
+    return scale * total + 7.0 * jnp.sum(losses)
+
+  reference_grad = jax.jit(jax.grad(reference, argnums=(0, 1)))(params, hidden)
+  actual_grad = jax.jit(jax.grad(with_metrics, argnums=(0, 1)))(params, hidden)
+  disabled_grad = jax.jit(jax.grad(lambda p, h: scale * tiled_off(p, h)[0], argnums=(0, 1)))(off_params, hidden)
+  for expected, actual, disabled in zip(
+      jax.tree_util.tree_leaves(reference_grad),
+      jax.tree_util.tree_leaves(actual_grad),
+      jax.tree_util.tree_leaves(disabled_grad),
+      strict=True,
+  ):
+    np.testing.assert_allclose(actual, expected, rtol=3e-5, atol=2e-6)
+    np.testing.assert_allclose(disabled, expected, rtol=3e-5, atol=2e-6)
+  assert np.any(np.asarray(reference_grad[1]) != 0)
+
+
+def _small_metrics_transformer_config(tiles, metrics, tied):
+  return pyconfig.initialize(
+      [None, get_test_config_path()],
+      run_name="cpu_dataset_metrics",
+      enable_checkpointing=False,
+      enable_dropout=False,
+      max_target_length=8,
+      per_device_batch_size=2,
+      base_emb_dim=8,
+      base_num_query_heads=2,
+      base_num_kv_heads=2,
+      head_dim=4,
+      base_mlp_dim=16,
+      base_num_decoder_layers=1,
+      scan_layers=False,
+      attention="dot_product",
+      vocab_size=8,
+      dtype="float32",
+      matmul_precision="high",
+      num_vocab_tiling=tiles,
+      per_dataset_metrics=metrics,
+      per_dataset_names="a,b,absent",
+      z_loss_multiplier=0.1,
+      logits_via_embedding=tied,
+      pure_nnx=True,
+      enable_nnx=True,
+      pure_nnx_decoder=True,
+  )
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("tied", [False, True])
+@pytest.mark.parametrize("with_ids", [False, True])
+@pytest.mark.parametrize("is_train", [False, True])
+def test_per_dataset_tiling_nnx_trainer_loss_and_gradients(tied, with_ids, is_train):
+  """Exercise real NNX embedding/head parameters through the full trainer loss_fn."""
+  from maxtext.trainers.pre_train import train  # pylint: disable=import-outside-toplevel
+
+  mask = jnp.array([[1, 1, 1, 1, 1, 1, 0, 0], [1, 1, 1, 1, 1, 1, 1, 0]], dtype=jnp.int32)
+  data = {
+      "inputs": jnp.arange(16, dtype=jnp.int32).reshape(2, 8) % 8,
+      "inputs_position": jnp.broadcast_to(jnp.arange(8, dtype=jnp.int32), (2, 8)),
+      "inputs_segmentation": jnp.ones((2, 8), dtype=jnp.int32),
+      "targets": (jnp.arange(16, dtype=jnp.int32).reshape(2, 8) + 1) % 8,
+      "targets_segmentation": mask,
+  }
+  if with_ids:
+    data["dataset_id"] = jnp.where(mask, jnp.array([[1], [2]], dtype=jnp.int32), 0)
+  results = []
+  parameter_snapshots = []
+  for tiles, metrics in ((1, True), (4, True), (4, False)):
+    cfg = _small_metrics_transformer_config(tiles, metrics, tied)
+    mesh = maxtext_utils.get_mesh_from_config(cfg)
+    rngs = maxtext_utils_nnx.create_nnx_rngs(cfg, rng_key=jax.random.key(17))
+    with nn_partitioning.axis_rules(cfg.logical_axis_rules):
+      model = model_creation_utils.from_config(cfg, mesh=mesh, rngs=rngs, model_mode=MODEL_MODE_TRAIN)
+    graphdef, params, rest = nnx.split(model, nnx.Param, ...)
+    parameter_snapshots.append(params)
+
+    def objective(p, graphdef=graphdef, rest=rest, cfg=cfg):
+      local = nnx.merge(graphdef, p, rest, copy=True)
+      return train.loss_fn(local, cfg, dict(data), None, None, is_train=is_train)
+
+    with nn_partitioning.axis_rules(cfg.logical_axis_rules):
+      results.append(jax.jit(jax.value_and_grad(objective, has_aux=True))(params))
+  for first, second, third in zip(*(jax.tree_util.tree_leaves(p) for p in parameter_snapshots), strict=True):
+    np.testing.assert_array_equal(first, second)
+    np.testing.assert_array_equal(first, third)
+  (reference_loss, reference_aux), reference_grads = results[0]
+  for (loss, aux), grads in results[1:]:
+    np.testing.assert_allclose(loss, reference_loss, rtol=3e-5, atol=2e-6)
+    for (path, actual), expected in zip(
+        jax.tree_util.tree_leaves_with_path(grads), jax.tree_util.tree_leaves(reference_grads), strict=True
+    ):
+      if tied and "token_embedder" in jax.tree_util.keystr(path):
+        # attend_on_embedding casts its table to bf16 even with dtype=float32.
+        # Tiling rounds each chunk's table gradient before summation; the full
+        # projection rounds once. Restrict that allowance to this table only.
+        np.testing.assert_allclose(actual, expected, rtol=1e-2, atol=1e-3)
+        assert np.linalg.norm(np.asarray(actual - expected)) <= 0.01 * np.linalg.norm(np.asarray(expected))
+      else:
+        np.testing.assert_allclose(actual, expected, rtol=4e-5, atol=3e-6)
+    assert int(aux["total_weights"]) == int(mask.sum())
+  for enabled, disabled in zip(
+      jax.tree_util.tree_leaves(results[1][1]), jax.tree_util.tree_leaves(results[2][1]), strict=True
+  ):
+    np.testing.assert_allclose(enabled, disabled, rtol=4e-5, atol=3e-6)
+  tiled_aux = results[1][0][1]
+  np.testing.assert_array_equal(tiled_aux["total_correct"], reference_aux["total_correct"])
+  assert "total_correct" not in results[2][0][1]
+  assert "per_dataset" not in results[2][0][1]
+  if with_ids:
+    for name in ("xent_sum_by_ds", "correct_by_ds", "token_count_by_ds"):
+      np.testing.assert_allclose(tiled_aux["per_dataset"][name], reference_aux["per_dataset"][name], rtol=3e-5, atol=2e-6)
+    assert np.all(np.asarray(tiled_aux["per_dataset"]["xent_sum_by_ds"])[1:3] > 0)
+    assert int(tiled_aux["per_dataset"]["token_count_by_ds"].sum()) == int(mask.sum())
+    np.testing.assert_allclose(tiled_aux["per_dataset"]["xent_sum_by_ds"].sum(), tiled_aux["xent_sum"], rtol=3e-5)
+  else:
+    assert "per_dataset" not in tiled_aux
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("backend", ["linen", "nnx"])
+@pytest.mark.parametrize("with_ids", [False, True])
+@pytest.mark.parametrize("corrupt", [False, True])
+def test_per_dataset_tiling_independent_accuracy(backend, with_ids, corrupt, monkeypatch):
+  """Known-answer scalar survives a deliberately broken grouped integer reduction."""
+  from maxtext.utils import vocabulary_tiling  # pylint: disable=import-outside-toplevel
+
+  original = vocabulary_tiling._sum_by_dataset  # pylint: disable=protected-access
+  if corrupt:
+
+    def drop_correct_counts(values, ids, slots):
+      result = original(values, ids, slots)
+      return jnp.zeros_like(result) if jnp.issubdtype(values.dtype, jnp.integer) else result
+
+    monkeypatch.setattr(vocabulary_tiling, "_sum_by_dataset", drop_correct_counts)
+  cfg, data, params, hidden, tiled, logits = _per_dataset_tiling_fixture(
+      backend, with_ids=with_ids, is_train=with_ids, return_total_correct=True
+  )
+  total, _, grouped_loss, grouped_correct, correct_scalar = jax.jit(tiled)(params, hidden)
+  expected_loss, expected_correct, _, _ = _independent_dataset_sums(logits(params, hidden), data, cfg)
+  assert int(correct_scalar) == int(expected_correct.sum()) > 0
+  np.testing.assert_allclose(grouped_loss, expected_loss, rtol=2e-5, atol=2e-6)
+  np.testing.assert_allclose(total, expected_loss.sum(), rtol=2e-5, atol=2e-6)
+  if corrupt:
+    assert int(grouped_correct.sum()) == 0
+    assert int(grouped_correct.sum()) != int(correct_scalar)
+  else:
+    assert int(grouped_correct.sum()) == int(correct_scalar)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("backend", ["linen", "nnx"])
+def test_per_dataset_tiling_independent_accuracy_disabled(backend):
+  _, _, params, hidden, tiled, _ = _per_dataset_tiling_fixture(backend, metrics=False, return_total_correct=True)
+  outputs = jax.jit(tiled)(params, hidden)
+  assert len(outputs) == 5 and outputs[2:] == (None, None, None)
+  assert "argmax[" not in str(jax.make_jaxpr(tiled)(params, hidden))

@@ -227,6 +227,29 @@ For records longer than `max_target_length`, see
 between one canonical training history and online generation prefixes, see
 [Gemma 4 multi-turn SFT and serving frontiers](gemma4_sft_serving_frontiers.md).
 
+### Per-dataset metrics with the pre-training trainer
+
+When training formatted SFT data through `maxtext.trainers.pre_train.train`,
+`per_dataset_metrics=true` reports loss and next-token accuracy over the
+supervised tokens. Linen and NNX support these metrics with and without
+vocabulary tiling. Per-dataset loss includes the configured z-loss, matching
+`learning/lm_loss`; this also applies to the Linen tiled path.
+
+The tiled helpers return loss, z-loss, per-dataset loss sums, and correct-token
+counts. With metrics disabled, both vectors are `None`. Without `dataset_id`
+(as in separate evaluation passes), the helpers use two slots: an empty slot 0
+and the batch totals in slot 1. With IDs, slot 0 is reserved for padding and the
+remaining slots follow `per_dataset_names`. A dataset with supervised tokens
+and no correct predictions has valid zero accuracy; a dataset with no
+supervised tokens emits only its token count.
+
+The NNX tiled path accumulates metrics from the logits already computed in
+each chunk. It adds an argmax and segment reductions without an additional
+output-head projection. Its reporting vectors do not contribute gradients or
+add tensors to the backward residuals. Peak memory and throughput still need
+measurement on the target hardware. Per-dataset metrics remain unsupported
+for block diffusion and dense indexer warm-up and raise an error there.
+
 ### Advanced: Custom Dataset Formatter (e.g., ShareGPT)
 
 If your dataset is in a format not natively supported—such as **ShareGPT** (which uses a `conversations` column with `from` and `value` keys)—you can write a custom Python formatting function to convert it on-the-fly.

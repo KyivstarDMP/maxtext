@@ -80,7 +80,7 @@ from maxtext.utils import sharding
 from maxtext.utils import maxtext_utils_nnx
 from maxtext.utils import train_utils
 from maxtext.utils.gradient_accumulation import gradient_accumulation_loss_and_grad
-from maxtext.utils.vocabulary_tiling import vocab_tiling_linen_loss, vocab_tiling_nnx_loss
+from maxtext.utils.vocabulary_tiling import _sum_by_dataset, vocab_tiling_linen_loss, vocab_tiling_nnx_loss
 
 
 class EncoderKwargs(TypedDict, total=False):
@@ -114,15 +114,15 @@ def _per_dataset_from_logits(logits, masked_xent, data, config):
   """Non-tiled per-dataset (xent_sum, correct_count) vectors of shape [num_datasets+1].
 
   `masked_xent` is the per-token cross-entropy already multiplied by the completion mask, so a
-  segment-sum by `dataset_id` gives each component's summed loss. `correct` is next-token accuracy
+  selection sum by `dataset_id` gives each component's summed loss. `correct` is next-token accuracy
   over the same mask. Both emit an SPMD all-reduce over the DP-sharded batch inside pjit.
   """
   num_seg = _num_datasets_plus1(config)
   ids = data["dataset_id"].reshape(-1)
   mask = data["targets_segmentation"] != 0
-  xent_sum_by_ds = jax.ops.segment_sum(masked_xent.reshape(-1), ids, num_segments=num_seg)
+  xent_sum_by_ds = _sum_by_dataset(masked_xent.reshape(-1), ids, num_seg)
   correct = (jnp.argmax(logits, axis=-1) == data["targets"]) & mask
-  correct_by_ds = jax.ops.segment_sum(correct.reshape(-1).astype(jnp.int32), ids, num_segments=num_seg)
+  correct_by_ds = _sum_by_dataset(correct.reshape(-1).astype(jnp.int32), ids, num_seg)
   return xent_sum_by_ds, correct_by_ds
 
 
@@ -130,7 +130,7 @@ def _total_correct_from_logits(logits, data):
   """Aggregate next-token correct-token count over the loss mask (non-tiled path only).
 
   With vocab tiling the decoder returns logits=None, so the tiled path sources this from the
-  tiled scan instead (see vocab_tiling_linen_loss).
+  tiled scan instead (in both the Linen and NNX loss functions).
   """
   return jnp.sum((jnp.argmax(logits, axis=-1) == data["targets"]) & (data["targets_segmentation"] != 0))
 
@@ -145,9 +145,7 @@ def _assemble_per_dataset_aux(config, data, xent_sum_by_ds, correct_by_ds):
     return None
   num_seg = _num_datasets_plus1(config)
   ids = data["dataset_id"].reshape(-1)
-  token_count_by_ds = jax.ops.segment_sum(
-      (data["targets_segmentation"] != 0).reshape(-1).astype(jnp.int32), ids, num_segments=num_seg
-  )
+  token_count_by_ds = _sum_by_dataset((data["targets_segmentation"] != 0).reshape(-1).astype(jnp.int32), ids, num_seg)
   if xent_sum_by_ds is None or correct_by_ds is None:
     raise ValueError("Per-dataset metrics require loss and correct-token sums; this loss path does not provide them.")
   return {
@@ -176,8 +174,6 @@ def loss_fn(model, config, data, dropout_rng, params, sparsity_state=None, is_tr
   if config.per_dataset_metrics:
     if is_block_diffusion or (config.use_indexer and not config.indexer_sparse_training):
       raise ValueError("Per-dataset metrics are not supported for block diffusion or indexer warm-up.")
-    if not isinstance(model, nn.Module) and config.num_vocab_tiling > 1:
-      raise ValueError("NNX tiled per-dataset metrics require the separate numerical metrics repair.")
   if getattr(config, "attention_type", "global") == "block_diffusion" and not is_block_diffusion:
     raise ValueError(
         "Block-diffusion attention requires target-aligned block-diffusion losses; "
@@ -287,20 +283,12 @@ def loss_fn(model, config, data, dropout_rng, params, sparsity_state=None, is_tr
     elif config.num_vocab_tiling > 1:
       hidden_state_key = ("intermediates", "decoder", "hidden_states")
       hidden_states = maxtext_utils.get_nested_value(intermediate_outputs, hidden_state_key)[0]
+      xent_sum, total_z_loss, _pd_xent, _pd_correct, total_correct = vocab_tiling_linen_loss(
+          hidden_states, data, config, model, params, is_train, return_total_correct=True
+      )
       if config.per_dataset_metrics:
-        xent_sum, total_z_loss, _pd_xent, _pd_correct = vocab_tiling_linen_loss(
-            hidden_states, data, config, model, params, is_train
-        )
-        # No full logits exist on the tiled path, so accuracy comes from the tiled scan. Train
-        # batches give per-component vectors; eval batches bucket into one slot (the aggregate).
-        total_correct = jnp.sum(_pd_correct)
         if "dataset_id" in data:
           xent_sum_by_ds, correct_by_ds = _pd_xent, _pd_correct
-      else:
-        # The return arity is selected by config.per_dataset_metrics above.
-        xent_sum, total_z_loss = vocab_tiling_linen_loss(  # pylint: disable=unbalanced-tuple-unpacking
-            hidden_states, data, config, model, params, is_train
-        )
     else:
       if is_block_diffusion:
         logits = block_diffusion_target_alignment.align_logits_to_targets(
@@ -385,7 +373,12 @@ def loss_fn(model, config, data, dropout_rng, params, sparsity_state=None, is_tr
     elif config.num_vocab_tiling > 1:
       hidden_state_key = ("decoder", "hidden_states")
       hidden_states = maxtext_utils.get_nested_value(intermediate_outputs, hidden_state_key)[0]
-      xent_sum, total_z_loss = vocab_tiling_nnx_loss(model, hidden_states, data, config, is_train)
+      xent_sum, total_z_loss, _pd_xent, _pd_correct, total_correct = vocab_tiling_nnx_loss(
+          model, hidden_states, data, config, is_train, return_total_correct=True
+      )
+      if config.per_dataset_metrics:
+        if "dataset_id" in data:
+          xent_sum_by_ds, correct_by_ds = _pd_xent, _pd_correct
     else:
       if is_block_diffusion:
         logits = block_diffusion_target_alignment.align_logits_to_targets(
@@ -895,6 +888,8 @@ def train_step(model, config, state_mesh_shardings, params_shardings, state, dat
 
   if per_dataset is not None:
     metrics["per_dataset"] = per_dataset
+    # Independent scalar reduction, never reconstructed from the grouped vector.
+    metrics["scalar"]["learning/total_correct"] = aux["total_correct"].astype(jnp.float32)
   if getattr(config, "record_internal_nn_metrics", False):
     record_activation_metrics(metrics, intermediate_outputs, config)
 

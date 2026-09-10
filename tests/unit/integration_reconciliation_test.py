@@ -95,7 +95,6 @@ def test_metrics_reject_sources_that_do_not_stamp_dataset_ids(file_type):
     [
         ("block_diffusion", False, 1, "block diffusion"),
         ("causal_lm", True, 1, "indexer warm-up"),
-        ("causal_lm", False, 2, "NNX tiled"),
     ],
 )
 def test_unsupported_metrics_fail_before_forward(objective, indexer, tiling, diagnostic):
@@ -112,10 +111,50 @@ def test_unsupported_metrics_fail_before_forward(objective, indexer, tiling, dia
     train.loss_fn(object(), config, {}, None, None)
 
 
-def test_missing_metric_numerators_do_not_become_successful_zeros():
+@pytest.mark.parametrize("missing", ["loss", "correct", "both"])
+def test_missing_metric_numerators_do_not_become_successful_zeros(missing):
   from maxtext.trainers.pre_train import train  # pylint: disable=import-outside-toplevel
 
   config = SimpleNamespace(per_dataset_metrics=True, per_dataset_names="a,b")
   data = {"dataset_id": np.array([[1, 2]]), "targets_segmentation": np.array([[1, 1]])}
+  loss = None if missing in ("loss", "both") else np.array([0.0, 1.0, 2.0])
+  correct = None if missing in ("correct", "both") else np.array([0, 1, 0])
   with pytest.raises(ValueError, match="loss and correct-token sums"):
-    train._assemble_per_dataset_aux(config, data, None, None)  # pylint: disable=protected-access
+    train._assemble_per_dataset_aux(config, data, loss, correct)  # pylint: disable=protected-access
+
+
+def test_dataset_logger_uses_token_weighted_sums_and_omits_absent_values():
+  from maxtext.common.metric_logger import MetricLogger  # pylint: disable=import-outside-toplevel
+
+  logger = MetricLogger.__new__(MetricLogger)
+  logger.config = SimpleNamespace(per_dataset_log_period=2, log_period=1, steps=3, per_dataset_names="a,b,absent")
+  logger._per_dataset_accum = None  # pylint: disable=protected-access
+  first = {
+      "scalar": {},
+      "per_dataset": {
+          "xent_sum_by_ds": np.array([0.0, 2.0, 9.0, 0.0]),
+          "correct_by_ds": np.array([0, 1, 0, 0]),
+          "token_count_by_ds": np.array([0, 1, 3, 0]),
+      },
+  }
+  second = {
+      "scalar": {},
+      "per_dataset": {
+          "xent_sum_by_ds": np.array([0.0, 18.0, 3.0, 0.0]),
+          "correct_by_ds": np.array([0, 1, 0, 0]),
+          "token_count_by_ds": np.array([0, 3, 1, 0]),
+      },
+  }
+  logger._expand_per_dataset_train(first, 0)  # pylint: disable=protected-access
+  assert not first["scalar"]
+  logger._expand_per_dataset_train(second, 1)  # pylint: disable=protected-access
+  assert second["scalar"] == {
+      "per_dataset_train_tokens/a": 4.0,
+      "per_dataset_train_loss/a": 5.0,
+      "per_dataset_train_accuracy/a": 0.5,
+      "per_dataset_train_tokens/b": 4.0,
+      "per_dataset_train_loss/b": 3.0,
+      "per_dataset_train_accuracy/b": 0.0,
+      "per_dataset_train_tokens/absent": 0.0,
+  }
+  assert logger._per_dataset_accum is None  # pylint: disable=protected-access
