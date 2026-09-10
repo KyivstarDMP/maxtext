@@ -14,6 +14,7 @@
 
 """Input pipeline using Huggingface datasets."""
 
+import json
 from typing import Optional
 
 import ml_collections
@@ -30,6 +31,7 @@ from maxtext.input_pipeline import input_pipeline_utils
 from maxtext.input_pipeline import instruction_data_processing
 from maxtext.input_pipeline import multihost_dataloading
 from maxtext.utils import elastic_utils
+from maxtext.utils import max_logging
 
 
 def _get_pad_id(tokenizer):
@@ -310,7 +312,10 @@ def preprocessing_pipeline(
     max_target_length,
     shuffle,
     data_shuffle_seed,
+    tokenizer_revision="",
     chat_template_path="",
+    chat_template_revision="",
+    chat_template_sha256="",
     add_bos=True,
     add_eos=True,
     packing=True,
@@ -323,14 +328,40 @@ def preprocessing_pipeline(
     use_tunix_gradient_accumulation=False,
     num_microbatches=1,
     sft_train_on_completion_only=True,
+    sft_chat_template_mode="segmented",
+    sft_enable_thinking=True,
+    sft_enable_thinking_column="",
     grain_worker_count=1,  # only support 0 or 1
     max_segments_per_seq=None,
     num_epoch=1,
     chat_template: Optional[str] = None,
     formatting_func_path: Optional[str] = None,
     formatting_func_kwargs: Optional[dict] = None,
+    sft_preserve_thinking="auto",
 ):
   """pipeline for preprocessing HF dataset"""
+  if use_sft and sft_chat_template_mode != "segmented":
+    raise ValueError(
+        "sft_chat_template_mode='assistant_mask' is currently supported only by the Grain SFT pipeline; "
+        "use dataset_type=grain or keep the HF pipeline in segmented mode."
+    )
+  if use_sft and sft_enable_thinking_column:
+    raise ValueError(
+        "sft_enable_thinking_column is currently supported only by the Grain SFT pipeline; "
+        "use the constant sft_enable_thinking setting for HF SFT."
+    )
+  if use_sft and not chat_template and chat_template_path:
+    chat_template = instruction_data_processing.load_chat_template_from_file(
+        chat_template_path,
+        hf_access_token=hf_access_token,
+        revision=chat_template_revision or None,
+        expected_sha256=chat_template_sha256 or None,
+    )
+    if chat_template is None:
+      raise ValueError(f"Unable to load SFT chat template from chat_template_path={chat_template_path!r}.")
+  if use_sft:
+    data_processing_utils.validate_sft_chat_template_capabilities(chat_template, sft_chat_template_mode)
+
   import datasets  # pylint: disable=import-outside-toplevel
 
   assert global_batch_size % global_mesh.size == 0, "Batch size should be divisible by number of global devices."
@@ -354,22 +385,32 @@ def preprocessing_pipeline(
   elif num_epoch > 1:
     dataset = dataset.repeat(num_epoch)
 
+  requested_tokenizer_revision = tokenizer_revision or None
+  max_logging.log(f"tokenizer path={tokenizer_path} revision={requested_tokenizer_revision}")
   tokenizer = transformers.AutoTokenizer.from_pretrained(
       tokenizer_path,
       add_bos_token=add_bos if not use_sft else False,
       add_eos_token=add_eos if not use_sft else False,
       legacy=False,
       token=hf_access_token,
+      revision=requested_tokenizer_revision,
       extra_special_tokens={},
   )
 
   dataset = dataset.select_columns(data_column_names)
 
   if use_sft:
-    if not chat_template:
-      chat_template = instruction_data_processing.load_chat_template_from_file(chat_template_path)
-
     data_processing_utils.validate_and_configure_sft_columns(data_column_names, tokenizer, chat_template)
+    data_processing_utils.validate_sft_chat_template_capabilities(
+        getattr(tokenizer, "chat_template", None), sft_chat_template_mode
+    )
+
+    # Separate auxiliary "tools" column from primary data columns
+    tools_column_name = (
+        data_processing_utils.TOOLS_COLUMN if data_processing_utils.TOOLS_COLUMN in data_column_names else None
+    )
+    if tools_column_name:
+      data_column_names = [c for c in data_column_names if c != tools_column_name]
 
     # convert instruction dataset to conversational format
     dataset, data_column_names = instruction_data_processing.convert_to_conversational_format(
@@ -378,10 +419,17 @@ def preprocessing_pipeline(
         formatting_func_path=formatting_func_path,
         formatting_func_kwargs=formatting_func_kwargs,
     )
+    # Deserialize JSON string columns if needed
+    _json_deserialized = False
+    for col in data_column_names:
+      if isinstance(dataset.features.get(col), datasets.Value) and dataset.features[col].dtype == "string":
+        dataset = dataset.map(lambda x, c=col: {c: json.loads(x[c]) if isinstance(x[c], str) else x[c]})
+        _json_deserialized = True
 
-    assert input_pipeline_utils.is_conversational(
-        dataset.features, data_column_names
-    ), "Dataset is not in conversational format."
+    if not _json_deserialized:
+      assert input_pipeline_utils.is_conversational(
+          dataset.features, data_column_names
+      ), "Dataset is not in conversational format."
 
     if len(data_column_names) > 1:
       combined_column_name = "messages"
@@ -394,12 +442,21 @@ def preprocessing_pipeline(
           remove_columns=data_column_names,
           features=dataset_features,
       )
+      data_column_names = [combined_column_name]
 
-    data_column_names = list(dataset.features.keys())
     dataset = dataset.map(
         input_pipeline_utils.apply_chat_template,
-        fn_kwargs={"tokenizer_model": tokenizer, "data_column_name": data_column_names[0]},
+        fn_kwargs={
+            "tokenizer_model": tokenizer,
+            "data_column_name": data_column_names[0],
+            "tools_column_name": tools_column_name,
+            "enable_thinking": sft_enable_thinking,
+            "preserve_thinking": sft_preserve_thinking,
+            "return_segment_ids": tokenize,
+        },
     )
+    if tools_column_name:
+      dataset = dataset.remove_columns([tools_column_name])
 
   pad_id = _get_pad_id(tokenizer)
 
@@ -414,6 +471,8 @@ def preprocessing_pipeline(
             "column_names": data_column_names,
         },
     )
+    if use_sft:
+      dataset = dataset.remove_columns([input_pipeline_utils.SFT_SEGMENT_IDS_KEY])
 
   dataset = input_pipeline_utils.HFDataSource(
       dataset,
@@ -539,6 +598,7 @@ def make_hf_train_iterator(
         data_column_names=config.train_data_columns,
         tokenize=config.tokenize_train_data,
         tokenizer_path=config.tokenizer_path,
+        tokenizer_revision=getattr(config, "tokenizer_revision", "") or None,
         hf_access_token=config.hf_access_token,
         global_batch_size=config.global_batch_size_to_load,
         max_target_length=config.max_target_length,
@@ -553,7 +613,13 @@ def make_hf_train_iterator(
         use_tunix_gradient_accumulation=config.use_tunix_gradient_accumulation,
         num_microbatches=config.gradient_accumulation_steps,
         sft_train_on_completion_only=config.sft_train_on_completion_only,
+        sft_chat_template_mode=config.sft_chat_template_mode,
+        sft_enable_thinking=config.sft_enable_thinking,
+        sft_enable_thinking_column=config.sft_enable_thinking_column,
+        sft_preserve_thinking=getattr(config, "sft_preserve_thinking", "auto"),
         chat_template_path=config.chat_template_path,
+        chat_template_revision=getattr(config, "chat_template_revision", "") or None,
+        chat_template_sha256=getattr(config, "chat_template_sha256", "") or None,
         max_segments_per_seq=config.max_segments_per_seq,
         num_epoch=config.num_epoch,
         chat_template=config.chat_template,
@@ -602,6 +668,7 @@ def make_hf_eval_iterator(
         data_column_names=config.eval_data_columns,
         tokenize=config.tokenize_eval_data,
         tokenizer_path=config.tokenizer_path,
+        tokenizer_revision=getattr(config, "tokenizer_revision", "") or None,
         hf_access_token=config.hf_access_token,
         global_batch_size=config.global_batch_size_to_load_eval,
         max_target_length=config.max_target_length,
@@ -615,7 +682,13 @@ def make_hf_eval_iterator(
         use_sft=config.use_sft,
         num_microbatches=config.gradient_accumulation_steps,
         sft_train_on_completion_only=config.sft_train_on_completion_only,
+        sft_chat_template_mode=config.sft_chat_template_mode,
+        sft_enable_thinking=config.sft_enable_thinking,
+        sft_enable_thinking_column=config.sft_enable_thinking_column,
+        sft_preserve_thinking=getattr(config, "sft_preserve_thinking", "auto"),
         chat_template_path=config.chat_template_path,
+        chat_template_revision=getattr(config, "chat_template_revision", "") or None,
+        chat_template_sha256=getattr(config, "chat_template_sha256", "") or None,
         max_segments_per_seq=config.max_segments_per_seq,
         chat_template=config.chat_template,
         formatting_func_path=config.formatting_func_path,

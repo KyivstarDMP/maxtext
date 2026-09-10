@@ -49,7 +49,7 @@ def compute_loss_linen(intermediate_outputs, logits, data, config, model, params
   if config.num_vocab_tiling > 1:
     hidden_state_key = ("intermediates", "decoder", "hidden_states")
     hidden_states = maxtext_utils.get_nested_value(intermediate_outputs, hidden_state_key)[0]
-    total_loss, _ = vocab_tiling_linen_loss(hidden_states, data, config, model, params, is_train)
+    total_loss = vocab_tiling_linen_loss(hidden_states, data, config, model, params, is_train)[0]
   else:
     one_hot_targets = jax.nn.one_hot(data["targets"], config.vocab_size)
     xent, _ = max_utils.cross_entropy_with_logits(logits, one_hot_targets, z_loss=config.z_loss_multiplier)
@@ -350,7 +350,7 @@ class LossAndGradientCorrectnessTest(unittest.TestCase):
     }
 
     def scaled_loss(h, outer_loss_scale):
-      total_loss, _ = vocab_tiling_linen_loss(h, data, cfg, model, params, is_train=True)
+      total_loss = vocab_tiling_linen_loss(h, data, cfg, model, params, is_train=True)[0]
       return outer_loss_scale * total_loss
 
     grad_with_scale = jax.jit(jax.grad(scaled_loss, argnums=0))

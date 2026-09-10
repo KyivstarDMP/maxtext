@@ -223,14 +223,23 @@ class HFTokenizer:
   Tokenizing using huggingface tokenizer
   """
 
-  def __init__(self, model_path: str, add_bos: bool, add_eos: bool, hf_access_token: str):
-    max_logging.log(f"Loading HF tokenizer: {model_path}")
+  def __init__(
+      self,
+      model_path: str,
+      add_bos: bool,
+      add_eos: bool,
+      hf_access_token: str,
+      tokenizer_revision: str | None = None,
+  ):
+    requested_revision = tokenizer_revision or None
+    max_logging.log(f"tokenizer path={model_path} revision={requested_revision}")
     try:
       self.tokenizer = transformers.AutoTokenizer.from_pretrained(
           model_path,
           add_bos_token=add_bos,
           add_eos_token=add_eos,
           token=hf_access_token,
+          revision=requested_revision,
       )
     except Exception as e:
       raise ValueError(f"Failed to load Hugging Face tokenizer from {model_path}: {e}") from e
@@ -246,14 +255,21 @@ class HFTokenizer:
     return self.tokenizer.decode(t)
 
 
-def build_tokenizer(tokenizer_path, tokenizer_type, add_bos, add_eos, hf_access_token):
+def build_tokenizer(
+    tokenizer_path,
+    tokenizer_type,
+    add_bos,
+    add_eos,
+    hf_access_token,
+    tokenizer_revision=None,
+):
   """Loads the tokenizer at `tokenizer_path`"""
   max_logging.log(f"Tokenizer path: {tokenizer_path}")
   if tokenizer_type == "tiktoken":
     assert "tiktoken" in tokenizer_path, f"Invalid tokenizer type: {tokenizer_type} chosen for {tokenizer_path}"
     return TikTokenTokenizer(tokenizer_path, add_bos, add_eos)
   elif tokenizer_type == "huggingface":
-    return HFTokenizer(tokenizer_path, add_bos, add_eos, hf_access_token)
+    return HFTokenizer(tokenizer_path, add_bos, add_eos, hf_access_token, tokenizer_revision)
   elif tokenizer_type == "sentencepiece":
     return SentencePieceTokenizer(tokenizer_path, add_bos, add_eos)
   else:

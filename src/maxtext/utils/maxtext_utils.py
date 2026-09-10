@@ -165,6 +165,9 @@ def get_shaped_batch(config, batch_sharding=None):
   if getattr(config, "training_objective", "causal_lm") == "block_diffusion":
     shaped_batch["corruption_mask"] = jax.ShapeDtypeStruct(batch_shape, jnp.int32, sharding=batch_sharding)
     shaped_batch["targets_loss_mask"] = jax.ShapeDtypeStruct(batch_shape, jnp.int32, sharding=batch_sharding)
+
+  if config.per_dataset_metrics:
+    shaped_batch["dataset_id"] = jax.ShapeDtypeStruct(batch_shape, jnp.int32, sharding=batch_sharding)
   if config.use_multimodal:
     is_video = getattr(config, "video_max_grid_t", None) is not None
     if is_video:
@@ -2113,6 +2116,8 @@ def add_config_to_summary_writer(config, summary_writer):
     else:
       config_dict = dict(config)
     for key, value in config_dict.items():
+      if key in pyconfig.KEYS_NO_LOGGING:
+        continue
       max_utils.add_text_to_summary_writer(key, str(value), summary_writer)
 
 

@@ -101,22 +101,27 @@ class MetricLogger:
     self.performance_metric_queue = self.get_performance_metric_queue(config)
     self.learning_rate_schedule = learning_rate_schedule
     self.cumulative_eval_metrics = {"scalar": defaultdict(float)}
-    # self.buffered_metrics is a polymorphic deferred-write queue. Entries are one of:
+    # Running [xent_sum, token_count, correct] per dataset, summed across the current log_period
+    # window; flushed as one token-weighted point per window by _expand_per_dataset_train.
+    self._per_dataset_accum = None
+    # self.buffered_metrics is a mixed-type deferred-write queue. Entries are one of:
     #   ("train", train_step, metrics, step_time_delta)
     #   ("eval", eval_step, metrics, step_time_delta)
     self.buffered_metrics = []
     # Number of eval steps accumulated since the last reset_eval_metrics(). Used by
     # buffer_and_write_metrics to detect the eval→train transition and trigger finalization.
     self._pending_eval_step_count = 0
+    self.enable_wandb = bool(self.config.enable_wandb and jax.process_index() == 0)
+    self.wandb_run = None
     if self.config.managed_mldiagnostics:
       ManagedMLDiagnostics(config)  # Initialize the MLRun instance.
 
-    if self.config.enable_wandb and jax.process_index() == 0:
+    if self.enable_wandb:
       import wandb  # pylint: disable=import-outside-toplevel # pytype: disable=import-error # lazy import: wandb is an optional dependency
 
-      wandb.init(
+      self.wandb_run = wandb.init(
           project=config.wandb_project_name,
-          name=config.wandb_run_name,
+          name=config.wandb_run_name or None,
           resume="allow",
       )  # Initialize wandb logger.
 
@@ -125,9 +130,11 @@ class MetricLogger:
     self.cumulative_eval_metrics = {"scalar": defaultdict(float)}
     self._pending_eval_step_count = 0
 
-  def write_metrics(self, metrics, step, metric_type="train"):
-    """Entry point for all metrics writing. metric_type is one of 'train', 'eval', 'running_eval'."""
+  def write_metrics(self, metrics, step, metric_type="train", wandb_commit=None):
+    """Write metrics to configured sinks; ``wandb_commit`` controls same-step W&B aggregation."""
     if metrics:
+      if metric_type == "train" and "per_dataset" in metrics:
+        self._expand_per_dataset_train(metrics, step)
       self.log_metrics(metrics, step, metric_type)
 
       if self.config.enable_tensorboard and metric_type != "running_eval":
@@ -142,11 +149,119 @@ class MetricLogger:
       if self.config.managed_mldiagnostics:
         self.write_metrics_to_managed_mldiagnostics(metrics, step)
 
-      if self.config.enable_wandb and jax.process_index() == 0:
-        self.write_metrics_to_wandb(metrics, step)
+      # running_eval uses an eval-local counter, not the monotonically increasing train step.
+      # Its console snapshot is intentionally excluded from W&B; the finalized eval aggregate is
+      # logged at the matching train step instead.
+      if self.enable_wandb and metric_type != "running_eval":
+        self.write_metrics_to_wandb(metrics, step, commit=wandb_commit)
 
       if metric_type == "train":
         self._maybe_abort_after_write_metrics(metrics)
+
+  def _expand_per_dataset_train(self, metrics, step):
+    """Accumulate per-dataset train metrics and emit one aggregate point per window.
+
+    Window length is `per_dataset_log_period` steps, or `log_period` when that is <= 0.
+
+    A single packed batch covers only a handful of the mixture's components, so a per-step
+    per-dataset curve is extremely noisy (a few sequences per dataset per step) and costs one
+    scalar write per dataset per step. Instead we sum the raw [num_datasets+1] vectors across the
+    window and emit a single token-weighted point when it closes:
+
+        loss     = sum(xent)    / sum(tokens)      over the window
+        accuracy = sum(correct) / sum(tokens)      over the window
+        tokens   = sum(tokens)                     over the window (coverage)
+
+    Summing first and dividing once is a ratio-of-sums, i.e. exactly the token-weighted mean —
+    never a mean-of-ratios — so it stays consistent with the aggregate `learning/lm_loss`.
+
+    Slot 0 (pad/unknown) is dropped; index i (1-based) maps to per_dataset_names[i-1]. Datasets
+    with no tokens in the whole window report only `tokens = 0`; their loss/accuracy keys are
+    omitted rather than written as NaN (writing NaN makes the summary writer log
+    "NaN or Inf found in input tensor" once per absent dataset).
+    """
+    pd = metrics.pop("per_dataset")
+    xs = np.asarray(pd["xent_sum_by_ds"], dtype=np.float64)
+    tk = np.asarray(pd["token_count_by_ds"], dtype=np.float64)
+    ok = np.asarray(pd["correct_by_ds"], dtype=np.float64)
+    if self._per_dataset_accum is None:
+      self._per_dataset_accum = [xs.copy(), tk.copy(), ok.copy()]
+    else:
+      self._per_dataset_accum[0] += xs
+      self._per_dataset_accum[1] += tk
+      self._per_dataset_accum[2] += ok
+
+    # Window length: per_dataset_log_period when set, else fall back to the general log_period.
+    period = int(self.config.per_dataset_log_period)
+    if period <= 0:
+      period = int(self.config.log_period)
+    period = max(1, period)
+    if (step + 1) % period != 0 and step != self.config.steps - 1:
+      return  # window still open — nothing written this step
+
+    xs_w, tk_w, ok_w = self._per_dataset_accum
+    self._per_dataset_accum = None
+    names = [n for n in self.config.per_dataset_names.split(",") if n]
+    scalar = metrics["scalar"]
+    # Key layout is `per_dataset_train_<type>/<name>`: W&B groups panels into sections by the FIRST '/'
+    # segment (default "group by first prefix"), so putting the metric type in that segment gives one
+    # section per (split, type) — per_dataset_train_loss / _accuracy / _tokens — each holding one panel
+    # per dataset. TensorBoard groups on the same prefix. See docs/012.
+    for i, name in enumerate(names, start=1):
+      t = float(tk_w[i])
+      scalar[f"per_dataset_train_tokens/{name}"] = t
+      if t > 0:
+        scalar[f"per_dataset_train_loss/{name}"] = float(xs_w[i]) / t
+        scalar[f"per_dataset_train_accuracy/{name}"] = float(ok_w[i]) / t
+
+  def write_per_dataset_eval(self, per_dataset_eval, step):
+    """Write per-dataset eval metrics (Option B): {name: (xent_sum, tokens, correct)} -> named scalars.
+
+    Each dataset's aggregate over its own eval pass becomes
+    per_dataset_eval_{loss,perplexity,accuracy,tokens}/<name>. Written straight to the TB/JSON/GCS
+    sinks (bypassing the eval-aggregation path, which is keyed on the single-pass evaluation/* keys).
+
+    The metric type is the FIRST '/' segment (`per_dataset_eval_loss/<name>`, not
+    `per_dataset_eval/loss/<name>`) so W&B — which groups panels into sections by the first prefix —
+    puts one section per (split, type), each holding one panel per dataset. See docs/012.
+    """
+    scalar = {}
+    for name, (xent_sum, tokens, correct) in per_dataset_eval.items():
+      if tokens > 0:
+        loss = xent_sum / tokens
+        scalar[f"per_dataset_eval_loss/{name}"] = loss
+        scalar[f"per_dataset_eval_perplexity/{name}"] = float(np.exp(loss))
+        if correct is not None:  # accuracy is optional (see the eval loop)
+          scalar[f"per_dataset_eval_accuracy/{name}"] = correct / tokens
+      scalar[f"per_dataset_eval_tokens/{name}"] = tokens
+    metrics = {"scalar": scalar, "scalars": {}}
+    if self.config.enable_tensorboard:
+      self.write_metrics_to_tensorboard(metrics, step, "eval")
+    if self.config.metrics_file:
+      self.write_metrics_locally(metrics, step)
+    if self.config.gcs_metrics and jax.process_index() == 0:
+      self.write_metrics_for_gcs(metrics, step, "eval")
+    # This method runs before the matching train step's buffered flush. Defer W&B emission until the
+    # previous train point is flushed, then accumulate these scalars at the current train step with
+    # commit=False; the train metrics commit the combined W&B history row. TB/local/GCS are
+    # order-independent, so they stay here. See docs/012.
+    if scalar:
+      self._pending_per_dataset_eval_wandb = (dict(scalar), step)
+
+  def _flush_pending_per_dataset_eval_wandb(self):
+    """Emit any deferred per-dataset eval scalars to W&B at their eval step.
+
+    Called from buffer_and_write_metrics (train) after the previous train step has been flushed, so the
+    eval step is >= the last W&B step and nothing is dropped. The write stays uncommitted so the matching
+    train metrics can be merged into the same W&B history row.
+    """
+    pending = getattr(self, "_pending_per_dataset_eval_wandb", None)
+    if pending is None:
+      return
+    scalar, eval_step = pending
+    self._pending_per_dataset_eval_wandb = None
+    if self.enable_wandb:
+      self.write_metrics_to_wandb({"scalar": scalar, "scalars": {}}, eval_step, commit=False)
 
   def log_metrics(self, metrics, step, metric_type):
     """Logs metrics via max_logging."""
@@ -354,17 +469,18 @@ class MetricLogger:
         mapped_metric_name = _METRICS_TO_MANAGED.get(metric_name, metric_name)
         mldiag.metrics.record(mapped_metric_name, value, step=int(step))
 
-  def write_metrics_to_wandb(self, metrics, step):
+  def write_metrics_to_wandb(self, metrics, step, commit=None):
     """Write metrics to weights and biases (wandb)."""
-    import wandb  # pylint: disable=import-outside-toplevel # pytype: disable=import-error # lazy import: wandb is an optional dependency
-
     flat_metrics = {}
     for key, val in metrics.get("scalar", {}).items():
       flat_metrics[key] = float(val)
     for key, val in metrics.get("scalars", {}).items():
       for subkey, subval in val.items():
         flat_metrics[f"{key}/{subkey}"] = float(subval)
-    wandb.log(flat_metrics, step=step)
+    log_kwargs = {"step": step}
+    if commit is not None:
+      log_kwargs["commit"] = commit
+    self.wandb_run.log(flat_metrics, **log_kwargs)
 
   def write_setup_info_to_tensorboard(self, params):
     """Writes setup information like train config params, num model params, and XLA flags to TensorBoard."""
@@ -420,6 +536,9 @@ class MetricLogger:
       self.buffered_metrics.append(("train", step, metrics, step_time_delta))
       if self._pending_eval_step_count > 0:
         self._finalize_eval_metrics(step)
+      # Emit deferred per-dataset eval scalars now: the previous train step was flushed above, so the
+      # eval step is monotonically safe for W&B (see write_per_dataset_eval).
+      self._flush_pending_per_dataset_eval_wandb()
     else:
       self._pending_eval_step_count += 1
       self.buffered_metrics.append(("eval", step, metrics, step_time_delta))
@@ -429,7 +548,9 @@ class MetricLogger:
     kind = entry[0]
     if kind == "train":
       _, step, metrics, _ = entry
-      self.write_metrics(metrics, step)
+      # Any finalized eval/per-dataset eval metrics for this step were written with commit=False.
+      # Training is the final producer for the step and commits the combined W&B history row.
+      self.write_metrics(metrics, step, wandb_commit=True)
     elif kind == "eval":
       _, eval_step, raw_metrics, step_time_delta = entry
       # _accumulate_eval_metrics calls float() that materialize the metrics, deferred to here
@@ -462,6 +583,113 @@ class MetricLogger:
     )
     self.cumulative_eval_metrics["scalar"]["eval/z_loss"] += float(scalar.get("evaluation/z_loss", 0.0))
 
+  def _get_tokenizer(self):
+    """Lazily build and cache the tokenizer used to decode text samples."""
+    if not hasattr(self, "_text_tokenizer"):
+      from maxtext.input_pipeline import data_processing_utils  # pylint: disable=import-outside-toplevel
+
+      self._text_tokenizer, _ = data_processing_utils.get_tokenizer_and_pad_id(self.config)
+    return self._text_tokenizer
+
+  @staticmethod
+  def _format_token_view(tokens, num_tokens):
+    """Format token IDs, optionally retaining only the head and tail."""
+    total = len(tokens)
+    if num_tokens < 0 or total <= 2 * num_tokens:
+      return f"[{', '.join(str(token) for token in tokens)}]", str(total)
+    if num_tokens == 0:
+      return "[]", f"{total}, hidden"
+    parts = [str(token) for token in tokens[:num_tokens]]
+    parts.extend(["...", *(str(token) for token in tokens[-num_tokens:])])
+    return f"[{', '.join(parts)}]", f"{total}, first {num_tokens} + last {num_tokens}"
+
+  @staticmethod
+  def _decode_trimmed(tokenizer, tokens, num_tokens):
+    """Decode tokens, optionally retaining only the head and tail."""
+    if num_tokens < 0 or len(tokens) <= 2 * num_tokens:
+      return tokenizer.decode(tokens)
+    if num_tokens == 0:
+      return ""
+    return f"{tokenizer.decode(tokens[:num_tokens])} ... {tokenizer.decode(tokens[-num_tokens:])}"
+
+  def maybe_log_text_samples(self, batch, step):
+    """Decode selected training rows to console and TensorBoard without interrupting training."""
+    if self.config.log_text_period <= 0:
+      return
+    if step != 0 and step % self.config.log_text_period != 0:
+      return
+    if jax.process_index() != 0:
+      return
+
+    max_logging.log(f"[TextSample] Logging text samples at step {step} (period={self.config.log_text_period})...")
+
+    try:
+      tokenizer = self._get_tokenizer()
+      num_tokens = self.config.log_text_num_tokens
+
+      def _to_numpy(array):
+        try:
+          return np.asarray(array)
+        except RuntimeError:
+          # A multi-host jax.Array is not fully addressable. Text logging needs only one local row,
+          # so use the first addressable device shard instead of gathering the global batch.
+          return np.asarray(array.addressable_shards[0].data)
+
+      inputs = _to_numpy(batch["inputs"])
+      targets = _to_numpy(batch["targets"])
+      inputs_segmentation = _to_numpy(batch["inputs_segmentation"])
+      targets_segmentation = _to_numpy(batch["targets_segmentation"])
+      num_samples = min(self.config.log_text_num_samples, inputs.shape[0])
+      tensorboard_parts = []
+
+      for sample_index in range(num_samples):
+        input_segment_ids = {int(segment_id) for segment_id in inputs_segmentation[sample_index] if segment_id > 0}
+        target_segment_ids = {int(segment_id) for segment_id in targets_segmentation[sample_index] if segment_id > 0}
+        segment_ids = sorted(input_segment_ids | target_segment_ids)
+        total_documents = len(segment_ids)
+        if self.config.log_text_num_docs >= 0:
+          segment_ids = segment_ids[: self.config.log_text_num_docs]
+        is_packed = total_documents > 1
+
+        for document_index, segment_id in enumerate(segment_ids):
+          input_tokens = inputs[sample_index][inputs_segmentation[sample_index] == segment_id].tolist()
+          target_tokens = targets[sample_index][targets_segmentation[sample_index] == segment_id].tolist()
+          if is_packed:
+            label = f"Step {step} | sample {sample_index} | doc {document_index + 1}/{total_documents}"
+            heading = f"### Sample {sample_index} | Doc {document_index + 1}/{total_documents}"
+          else:
+            label = f"Step {step} | sample {sample_index}"
+            heading = f"### Sample {sample_index}"
+
+          input_token_view, input_token_description = self._format_token_view(input_tokens, num_tokens)
+          target_token_view, target_token_description = self._format_token_view(target_tokens, num_tokens)
+          input_text = self._decode_trimmed(tokenizer, input_tokens, num_tokens) if input_tokens else ""
+          target_text = self._decode_trimmed(tokenizer, target_tokens, num_tokens) if target_tokens else ""
+
+          max_logging.log(f"[TextSample] {label}")
+          max_logging.log(f"  input tokens ({input_token_description}): {input_token_view}")
+          max_logging.log(f"  input text: {input_text}")
+          max_logging.log(f"  target tokens ({target_token_description}): {target_token_view}")
+          max_logging.log(f"  target text: {target_text}")
+
+          tensorboard_parts.extend(
+              [
+                  heading,
+                  f"**Input tokens** ({input_token_description}): `{input_token_view}`  ",
+                  f"**Input text**: {input_text}  ",
+                  f"**Target tokens** ({target_token_description}): `{target_token_view}`  ",
+                  f"**Target text**: {target_text}  ",
+                  "",
+              ]
+          )
+
+      if self.config.enable_tensorboard and self.writer is not None and tensorboard_parts:
+        self.writer.add_text("text_samples", "\n".join(tensorboard_parts), step)
+    except Exception as error:  # pylint: disable=broad-exception-caught
+      # Observability must not terminate an expensive training job. The warning remains visible in
+      # the same console stream (and any experiment tracker that captures stdout/stderr).
+      max_logging.log(f"[TextSample] WARNING: Failed to log text samples at step {step}: {error}")
+
   def record_train_metrics(self, metrics, step, step_time):
     """Records training metrics for the current step."""
     metrics["scalar"].update({"perf/step_time_seconds": step_time})
@@ -491,7 +719,12 @@ class MetricLogger:
     cumulative["eval/avg_mtp_acceptance_rate_percent"] = cumulative["eval/mtp_acceptance_rate_percent"] / eval_step_count
     cumulative["eval/avg_z_loss"] = cumulative["eval/z_loss"] / eval_step_count
 
-    self.write_metrics(self.cumulative_eval_metrics, train_step, metric_type="eval")
+    self.write_metrics(
+        self.cumulative_eval_metrics,
+        train_step,
+        metric_type="eval",
+        wandb_commit=False,
+    )
     self._pending_eval_step_count = 0
     if self.config.target_eval_loss and eval_loss <= self.config.target_eval_loss:
       raise exceptions.StopTraining(f"Target loss {self.config.target_eval_loss=} is achieved.")
@@ -503,8 +736,16 @@ class MetricLogger:
     logger instance should not be used to add or write more metrics as the
     underlying writer objects (e.g., TensorBoard SummaryWriter) will be closed.
     """
-    for entry in self.buffered_metrics:
-      self._flush_one_buffered_entry(entry)
-    self.buffered_metrics = []
-
-    max_utils.close_summary_writer(self.writer)
+    try:
+      for entry in self.buffered_metrics:
+        self._flush_one_buffered_entry(entry)
+      self.buffered_metrics = []
+      # Safety net for the rare case where eval fires on the final step and no train flush follows.
+      self._flush_pending_per_dataset_eval_wandb()
+    finally:
+      try:
+        max_utils.close_summary_writer(self.writer)
+      finally:
+        if self.wandb_run is not None:
+          self.wandb_run.finish()
+          self.wandb_run = None

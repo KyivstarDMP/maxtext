@@ -26,6 +26,10 @@ MaxText was co-designed with key Google led innovations to provide a unified pos
 - **SFT (Supervised Fine-Tuning)**
   - [SFT on Single-Host TPUs](./posttraining/sft.md)
   - [SFT on Multi-Host TPUs](./posttraining/sft_on_multi_host.md)
+  - [Canonical Gemma 4 SFT Rendering](./posttraining/gemma4_sft_canonical_rendering.md)
+  - [Gemma 4 SFT Data Contract](./posttraining/gemma4_sft_data_contract.md)
+  - [Gemma 4 Multi-Turn Serving Frontiers](./posttraining/gemma4_sft_serving_frontiers.md)
+  - [SFT Long-Example Windowing](./posttraining/sft_long_example_windowing.md)
 - **LoRA (Low-Rank Adaptation)**
   - [Native LoRA/QLoRA on Single-Host TPUs](./posttraining/native_lora.md)
   - [LoRA on Single-Host TPUs](./posttraining/lora.md)
@@ -73,6 +77,10 @@ maxdepth: 1
 ---
 posttraining/sft.md
 posttraining/sft_on_multi_host.md
+posttraining/gemma4_sft_canonical_rendering.md
+posttraining/gemma4_sft_data_contract.md
+posttraining/gemma4_sft_serving_frontiers.md
+posttraining/sft_long_example_windowing.md
 posttraining/dpo.md
 posttraining/rl.md
 posttraining/rl_on_multi_host.md

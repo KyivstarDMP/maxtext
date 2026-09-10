@@ -85,6 +85,7 @@ class MultiHostDataLoadIterator:
       global_mesh: Mesh,
       generate_padding_batch: bool = False,
       expansion_loading_factor_for_grain: int = -1,
+      padding_batch_template: dict | None = None,
   ):
     self.global_mesh = global_mesh
     self.dataloader = dataloader
@@ -98,6 +99,9 @@ class MultiHostDataLoadIterator:
     self.last_local_data = None
     self.generate_padding_batch = generate_padding_batch
     self.expansion_loading_factor_for_grain = expansion_loading_factor_for_grain
+    # Zero-batch template used when a host receives NO real batch at all (e.g. an eval split with fewer
+    # records than dataloading hosts). Not cleared by reset(), so it survives per-dataset ds_iter.reset().
+    self.padding_batch_template = padding_batch_template
 
   def reset(self):
     if hasattr(self.dataloader, "as_numpy_iterator"):
@@ -162,9 +166,17 @@ class MultiHostDataLoadIterator:
     return input_gdas
 
   def _make_padding_batch(self):
-    if self.last_local_data is None:
-      raise ValueError("last_local_data is None, cannot make padding batch.")
-    return jtu.tree_map(lambda x: jnp.full_like(x, 0), self.last_local_data)
+    """Return a zero batch from recent data or the empty-host shape template."""
+    # Fast path: clone the shape/dtype of the host's most recent REAL batch and zero it. Covers a host that
+    # loaded >=1 batch then exhausted (the confirmed E0200 mechanism).
+    if self.last_local_data is not None:
+      return jtu.tree_map(lambda x: jnp.full_like(x, 0), self.last_local_data)
+    # Host received zero real batches (empty strided shard). Seed an all-zero local batch of the known column
+    # shapes so this host still issues a collective in lockstep with its peers. Zero targets_segmentation =>
+    # contributes 0 to loss and token weights (see docs/012).
+    if self.padding_batch_template is not None:
+      return jtu.tree_map(lambda x: np.zeros(x.shape, x.dtype), self.padding_batch_template)
+    raise ValueError("last_local_data is None and no padding_batch_template provided, cannot make padding batch.")
 
 
 def _colocated_cpu_devices(

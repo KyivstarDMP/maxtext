@@ -736,11 +736,17 @@ vocab_tiling_ag_once: false
 # Tokenizer
 vocab_size: 32_000 # powers of 2 for sharding
 tokenizer_path: ""
+# Optional Hub revision (commit, tag, or branch) passed to Hugging Face tokenizers.
+tokenizer_revision: ""
 # grain and tfds pipeline supports tokenizer_type: sentencepiece, huggingface, tiktoken
 # hf pipeline only supports huggingface type, and will ignore tokenizer_type flag
 tokenizer_type: "sentencepiece" # Currently supporting: "tiktoken", "sentencepiece", "huggingface"
 use_chat_template: false
-chat_template_path: "" # path to chat template json file
+chat_template_path: "" # path to a Jinja/text template or JSON object containing "chat_template"
+# Optional Hub revision for an hf:// chat_template_path. Keep the revision out of the URI.
+chat_template_revision: ""
+# Optional SHA-256 for the exact loaded chat-template bytes.
+chat_template_sha256: ""
 chat_template: "" # Chat template to use with HF tokenizers. It should be a valid Jinja2-formatted template.
 tokenize_train_data: true  # false if the dataset is pre-tokenized
 tokenize_eval_data: true  # false if the dataset is pre-tokenized
@@ -796,6 +802,71 @@ use_dpo: false
 use_sft: false
 # sft_train_on_completion_only=false trains on both prompt and completion tokens; trains only on completion tokens otherwise
 sft_train_on_completion_only: false
+# How Grain derives the SFT token stream and prompt/completion ownership:
+#   'segmented' (default) - preserve the legacy per-round chat-template/LCP path.
+#   'assistant_mask'      - render the full conversation once and consume token-level ownership from
+#                           {% generation %} blocks via return_assistant_tokens_mask. Requires
+#                           tokenize=true and sft_train_on_completion_only=true.
+sft_chat_template_mode: 'segmented'
+# Conversation-level reasoning mode used by every SFT chat-template render. Set
+# sft_enable_thinking_column to a required per-row boolean feature for mixed-mode
+# Grain data; otherwise the constant below applies to every row.
+sft_enable_thinking: true
+sft_enable_thinking_column: ''
+# Historical reasoning: 'auto' follows each row's thinking value in assistant_mask mode and omits
+# preserve_thinking in segmented mode. Explicit true/false is passed to every render in either mode.
+# The template determines which historical reasoning is retained.
+sft_preserve_thinking: 'auto'
+# How to handle SFT examples longer than max_target_length (grain SFT pipeline):
+#   'truncate' (default) - head-truncate to max_target_length. NOTE: this drops the tail of long
+#                examples, including the turn terminator (e.g. <end_of_turn>), from BOTH inputs and
+#                targets, so the stop token never enters the loss for long examples and the model is
+#                trained on a stop-less completion prefix (learns to never stop on long generations).
+#   'window'   - split a long example into multiple <=max_target_length records via a prompt-pinned
+#                sliding window: the conversation-prefix-so-far is replayed as masked (context-only)
+#                tokens in front of each window, the completion is tiled across windows with DISJOINT
+#                loss (every completion token trained exactly once), and the final window retains the
+#                turn terminator. Requires sft_train_on_completion_only=True. Examples that already fit
+#                yield a single record identical to 'truncate'.
+sft_long_example_handling: 'truncate'
+# For sft_long_example_handling='window': completion tokens carried over as masked context between
+# consecutive windows (local continuity across the split). Clamped to <= max_target_length // 8.
+sft_window_overlap: 256
+# For 'window': max tokens of bounded conversation-prefix context (masked) in front of each window.
+# -1 = auto (max_target_length // 2). Bounds per-example fan-out for very long prompts.
+sft_window_context_cap: -1
+# For 'window': positive hard cap on records emitted per example (runaway guard). Loss tokens beyond the cap
+# are dropped and logged.
+sft_window_max_fan_out: 32
+# Preserve the canonical BOS + system/developer + native-tools block only when an over-length
+# example's context tail would otherwise left-cut it. Opt-in for compatibility; Grain SFT only.
+sft_window_pin_leading_context: false
+# Fail instead of silently truncating the instructions/tool declarations being protected. Left
+# truncation can remove BOS/opening instructions; right truncation can cut tool schemas/closers.
+# Explicitly shorten/split the pin, increase the context budget, or drop/quarantine the row with
+# accounting during preflight rather than silently changing it inside the training transform.
+sft_window_pinned_context_overflow: 'error'
+# Warn when the pin consumes more than this fraction of the effective context cap.
+sft_window_pinned_context_warn_fraction: 0.5
+
+# --- Per-dataset (per-mixture-component) metrics ------------------------------------------------
+# Emit per-dataset train loss/accuracy (segment-summed within each mixed batch) and per-dataset eval
+# loss/accuracy (one eval pass per dataset). Opt-in; zero-overhead when false. Requires packing=true.
+per_dataset_metrics: false
+# Comma-joined, ordered names of the train mixture components (runner fills this from the blend
+# manifest, in the same order as grain_train_files). Index i (1-based) maps to names[i-1].
+per_dataset_names: ''
+# Comma-joined, ordered names of the eval datasets; one separate eval pass is run per name.
+per_dataset_eval_names: ''
+# Semicolon-joined eval file globs, aligned 1:1 with per_dataset_eval_names (runner-filled from the
+# eval manifest). Each becomes its own single-dataset eval iterator (Option B: N separate passes).
+per_dataset_eval_files: ''
+# How many train steps to accumulate per-dataset train metrics over before emitting one
+# token-weighted point (loss = sum(xent)/sum(tokens) across the window). A single packed batch
+# covers only a few mixture components, so a per-step curve is mostly sampling noise; a larger
+# window means smoother curves, fewer scalar writes, and better per-dataset coverage per point.
+# <= 0 means "follow log_period". Set to 1 to emit every step.
+per_dataset_log_period: 0
 
 # dataset_type must be synthetic, hf, grain, tfds
 # details in: https://github.com/AI-Hypercomputer/maxtext/blob/main/docs/guides/data_input_pipeline.md
@@ -876,6 +947,10 @@ block_diffusion_mask_id: -1 # Tokenizer mask-token id; required for training_obj
 block_diffusion_min_noise: 0.001 # Minimum per-block corruption probability for block-diffusion training
 block_diffusion_logit_alignment: 'same_position' # Supported alignments: same_position, shifted
 block_diffusion_canvas_policy: 'all_masked' # Supported canvases: all_masked, seed_and_mask
+log_text_period: 0 # Log decoded training text samples every N steps. 0 disables text logging.
+log_text_num_samples: 1 # Number of batch rows to decode when text logging is active.
+log_text_num_docs: 1 # Max documents per packed sample. 0 logs no docs; -1 logs all.
+log_text_num_tokens: 64 # First/last N tokens per doc. 0 logs counts only; -1 logs the full document.
 
 jax_distributed_initialization_timeout: 300 # This is the default timeout in https://github.com/jax-ml/jax/blob/main/jax/_src/distributed.py
 # Note there are two separate initializations - the jax coordination service (aka jax.distributed.initialize) and the backend (e.g. PjRT), the timeout above refers
