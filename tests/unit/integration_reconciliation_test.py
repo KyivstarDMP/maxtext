@@ -20,7 +20,12 @@ from unittest import mock
 import numpy as np
 import pytest
 
-from maxtext.input_pipeline import data_processing_utils, grain_data_processing, input_pipeline_utils
+from maxtext.input_pipeline import (
+    data_processing_utils,
+    grain_data_processing,
+    input_pipeline_interface,
+    input_pipeline_utils,
+)
 from maxtext.input_pipeline.protos import example_pb2
 
 
@@ -88,6 +93,38 @@ def test_metrics_reject_sources_that_do_not_stamp_dataset_ids(file_type):
   )
   with pytest.raises(ValueError, match="stamps source dataset IDs"):
     grain_data_processing.make_grain_train_iterator(config, SimpleNamespace(size=1), [0])
+
+
+def test_pretraining_metrics_fail_before_data_loading():
+  config = SimpleNamespace(per_dataset_metrics=True, dataset_type="grain", use_sft=False)
+  with mock.patch.object(input_pipeline_interface, "make_grain_train_iterator") as load_data:
+    with pytest.raises(ValueError, match="pretraining does not preserve dataset IDs"):
+      input_pipeline_interface.create_data_iterator(config, object())
+  load_data.assert_not_called()
+
+
+def test_pretraining_without_dataset_metrics_still_creates_iterator():
+  config = SimpleNamespace(
+      per_dataset_metrics=False,
+      dataset_type="grain",
+      use_sft=False,
+      data_sharding=["data"],
+      global_batch_size_to_load=1,
+      global_batch_size_to_train_on=1,
+      max_target_length=8,
+      expansion_factor_real_data=1,
+      eval_interval=0,
+  )
+  with (
+      mock.patch.object(input_pipeline_interface, "get_process_loading_real_data", return_value=[0]),
+      mock.patch.object(input_pipeline_interface.jax, "process_index", return_value=0),
+      mock.patch.object(input_pipeline_interface, "make_grain_train_iterator") as load_data,
+  ):
+    mesh = object()
+    train_iterator, eval_iterator = input_pipeline_interface.create_data_iterator(config, mesh)
+  load_data.assert_called_once_with(config, mesh, [0])
+  assert train_iterator is load_data.return_value
+  assert eval_iterator is None
 
 
 @pytest.mark.parametrize(
