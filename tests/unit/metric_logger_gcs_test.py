@@ -23,12 +23,20 @@ import pytest
 from maxtext.common import metric_logger
 
 
-def make_logger(monkeypatch, tmp_path, log_period=1):
+def make_logger(monkeypatch, tmp_path, log_period=1, objects=None):
   """Capture uploads in memory while preserving the writer's naming behavior."""
   logger = metric_logger.MetricLogger.__new__(metric_logger.MetricLogger)
-  logger.config = SimpleNamespace(run_name="test", steps=80, log_period=log_period, metrics_dir="gs://unused/test")
+  logger.config = SimpleNamespace(
+      run_name="test",
+      steps=80,
+      log_period=log_period,
+      metrics_dir="gs://unused/test",
+      enable_tensorboard=False,
+      metrics_file=False,
+      gcs_metrics=True,
+  )
   logger.running_gcs_metrics = []
-  objects = {}
+  objects = {} if objects is None else objects
 
   def upload(destination, source):
     objects[destination] = [json.loads(line) for line in Path(source).read_text(encoding="utf-8").splitlines()]
@@ -65,10 +73,43 @@ def test_eval_does_not_flush_or_erase_pending_training(monkeypatch, tmp_path):
 def test_distinct_eval_producers_at_same_step_both_survive(monkeypatch, tmp_path):
   logger, objects = make_logger(monkeypatch, tmp_path)
   logger.write_metrics_for_gcs({"scalar": {"eval/avg_loss": 2}}, 79, "eval")
-  logger.write_metrics_for_gcs({"scalar": {"per_dataset_eval_loss/a": 3}}, 79, "eval")
+  monkeypatch.setattr(metric_logger.jax, "process_index", lambda: 0)
+  logger.write_per_dataset_eval({"a": (6, 2, 1)}, 79)
   rows = [row for records in objects.values() for row in records]
   assert len(rows) == 2
   assert {k for row in rows for k in row if "loss" in k} == {"eval/avg_loss", "per_dataset_eval_loss/a"}
+  assert {Path(name).name for name in objects} == {
+      "metrics_eval_step_000079_aggregate.txt",
+      "metrics_eval_step_000079_per_dataset.txt",
+  }
+
+
+@pytest.mark.parametrize("producer", ["aggregate", "per_dataset"])
+def test_replayed_eval_after_restart_overwrites_same_step(monkeypatch, tmp_path, producer):
+  logger, objects = make_logger(monkeypatch, tmp_path)
+  for step in (9, 19):
+    logger.write_metrics_for_gcs({"scalar": {"eval/avg_loss": 2}}, step, "eval", producer=producer)
+  restarted, _ = make_logger(monkeypatch, tmp_path, objects=objects)
+  restarted.write_metrics_for_gcs({"scalar": {"eval/avg_loss": 3}}, 19, "eval", producer=producer)
+  rows = [row for records in objects.values() for row in records]
+  assert len(objects) == 2
+  assert [row["eval/avg_loss"] for row in rows if row["step"] == 19] == [3]
+  assert [row["eval/avg_loss"] for row in rows if row["step"] == 9] == [2]
+
+
+def test_running_eval_appends_but_never_flushes(monkeypatch, tmp_path):
+  logger, objects = make_logger(monkeypatch, tmp_path, log_period=10)
+  logger.write_metrics_for_gcs({"scalar": {"learning/lm_loss": 1}}, 78, "train")
+  # Even an eval-local step matching the final train step cannot flush.
+  logger.write_metrics_for_gcs({"scalar": {"evaluation/loss": 2}}, 79, "running_eval")
+  assert not objects
+  assert len(logger.running_gcs_metrics) == 2
+  logger.write_metrics_for_gcs({"scalar": {"learning/lm_loss": 3}}, 79, "train")
+  assert len(objects) == 1
+  rows = next(iter(objects.values()))
+  assert [row["learning/lm_loss"] for row in rows if "learning/lm_loss" in row] == [1, 3]
+  assert [row["evaluation/loss"] for row in rows if "evaluation/loss" in row] == [2]
+  assert logger.running_gcs_metrics == []
 
 
 def test_midrun_eval_is_durable_without_following_train(monkeypatch, tmp_path):

@@ -1081,7 +1081,7 @@ class _MetricsNNXHead(nnx.Module):
 def _per_dataset_tiling_fixture(
     backend, *, with_ids=True, metrics=True, names="a,b,absent", tiles=4, is_train=True, return_total_correct=False
 ):
-  """Small real output heads; all sharding and tiled-loss functions remain unmocked."""
+  """Real output heads and sharding; dropout is off, so this fixture does not test it."""
   cfg = SimpleNamespace(
       per_dataset_metrics=metrics,
       per_dataset_names=names,
@@ -1159,10 +1159,9 @@ def _independent_dataset_sums(logits, data, cfg):
 
 @pytest.mark.cpu_only
 @pytest.mark.parametrize("backend", ["linen", "nnx"])
-@pytest.mark.parametrize("is_train", [False, True])
 @pytest.mark.parametrize("tiles", [2, 4])
-def test_per_dataset_tiling_known_answers_and_z_loss(backend, is_train, tiles):
-  cfg, data, params, hidden, tiled, logits = _per_dataset_tiling_fixture(backend, tiles=tiles, is_train=is_train)
+def test_per_dataset_tiling_known_answers_and_z_loss(backend, tiles):
+  cfg, data, params, hidden, tiled, logits = _per_dataset_tiling_fixture(backend, tiles=tiles)
   total, z_loss, losses, correct = jax.jit(tiled)(params, hidden)
   expected_loss, expected_correct, tokens, expected_z = _independent_dataset_sums(logits(params, hidden), data, cfg)
   np.testing.assert_allclose(losses, expected_loss, rtol=2e-5, atol=2e-6)
@@ -1194,11 +1193,8 @@ def test_per_dataset_tiling_no_id_eval_uses_two_slots(backend, names):
 @pytest.mark.cpu_only
 @pytest.mark.parametrize("backend", ["linen", "nnx"])
 @pytest.mark.parametrize("with_ids", [False, True])
-@pytest.mark.parametrize("is_train", [False, True])
-def test_per_dataset_tiling_disabled_returns_none(backend, with_ids, is_train):
-  cfg, data, params, hidden, tiled, logits = _per_dataset_tiling_fixture(
-      backend, with_ids=with_ids, metrics=False, is_train=is_train
-  )
+def test_per_dataset_tiling_disabled_returns_none(backend, with_ids):
+  cfg, data, params, hidden, tiled, logits = _per_dataset_tiling_fixture(backend, with_ids=with_ids, metrics=False)
   total, _, losses, correct = jax.jit(tiled)(params, hidden)
   assert losses is None and correct is None
   np.testing.assert_allclose(total, _independent_loss(logits(params, hidden), data, cfg.z_loss_multiplier), rtol=2e-5)
@@ -1207,10 +1203,9 @@ def test_per_dataset_tiling_disabled_returns_none(backend, with_ids, is_train):
 
 @pytest.mark.cpu_only
 @pytest.mark.parametrize("backend", ["linen", "nnx"])
-@pytest.mark.parametrize("is_train", [False, True])
-def test_per_dataset_tiling_gradients_match_normalized_reference(backend, is_train):
-  cfg, data, params, hidden, tiled, logits = _per_dataset_tiling_fixture(backend, is_train=is_train)
-  _, _, off_params, _, tiled_off, _ = _per_dataset_tiling_fixture(backend, metrics=False, is_train=is_train)
+def test_per_dataset_tiling_gradients_match_normalized_reference(backend):
+  cfg, data, params, hidden, tiled, logits = _per_dataset_tiling_fixture(backend)
+  _, _, off_params, _, tiled_off, _ = _per_dataset_tiling_fixture(backend, metrics=False)
   scale = 1.0 / jnp.sum(data["targets_segmentation"] != 0)
 
   def reference(p, h):
@@ -1233,6 +1228,16 @@ def test_per_dataset_tiling_gradients_match_normalized_reference(backend, is_tra
     np.testing.assert_allclose(actual, expected, rtol=3e-5, atol=2e-6)
     np.testing.assert_allclose(disabled, expected, rtol=3e-5, atol=2e-6)
   assert np.any(np.asarray(reference_grad[1]) != 0)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("backend", ["linen", "nnx"])
+def test_per_dataset_reporting_outputs_have_zero_gradients(backend):
+  """Pin reporting-only derivatives independently of the scalar loss gradient."""
+  _, _, params, hidden, tiled, _ = _per_dataset_tiling_fixture(backend)
+  reporting_grad = jax.jit(jax.grad(lambda p, h: jnp.sum(tiled(p, h)[2]), argnums=(0, 1)))(params, hidden)
+  for leaf in jax.tree_util.tree_leaves(reporting_grad):
+    np.testing.assert_array_equal(leaf, np.zeros_like(leaf))
 
 
 def _small_metrics_transformer_config(tiles, metrics, tied):

@@ -98,7 +98,6 @@ class MetricLogger:
     self.config = config
     self.metadata = {}
     self.running_gcs_metrics = [] if config.gcs_metrics else None
-    self._gcs_eval_write_count = 0
     self.performance_metric_queue = self.get_performance_metric_queue(config)
     self.learning_rate_schedule = learning_rate_schedule
     self.cumulative_eval_metrics = {"scalar": defaultdict(float)}
@@ -241,7 +240,7 @@ class MetricLogger:
     if self.config.metrics_file:
       self.write_metrics_locally(metrics, step)
     if self.config.gcs_metrics and jax.process_index() == 0:
-      self.write_metrics_for_gcs(metrics, step, "eval")
+      self.write_metrics_for_gcs(metrics, step, "eval", producer="per_dataset")
     # This method runs before the matching train step's buffered flush. Defer W&B emission until the
     # previous train point is flushed, then accumulate these scalars at the current train step with
     # commit=False; the train metrics commit the combined W&B history row. TB/local/GCS are
@@ -426,16 +425,15 @@ class MetricLogger:
       metrics_dict = _prepare_metrics_for_json(metrics, step, self.config.run_name)
       local_metrics_file.write(str(json.dumps(metrics_dict)) + "\n")
 
-  def write_metrics_for_gcs(self, metrics, step, metric_type):
+  def write_metrics_for_gcs(self, metrics, step, metric_type, *, producer="aggregate"):
     """Writes metrics to GCS."""
     metrics_dict_step = _prepare_metrics_for_json(metrics, step, self.config.run_name)
     if metric_type == "eval":
       # Finalized eval may precede or follow the matching train flush. Give it its
-      # own object and leave the pending training window intact. Multiple eval
-      # producers at one train step must not overwrite one another either.
-      write_count = getattr(self, "_gcs_eval_write_count", 0)
-      metrics_filename = f"metrics_eval_step_{step:06}_part_{write_count:06}.txt"
-      self._gcs_eval_write_count = write_count + 1
+      # own object and leave the pending training window intact. Stable names
+      # overwrite a replayed step after restart and distinguish producers if
+      # both are ever used at the same step (today they are mutually exclusive).
+      metrics_filename = f"metrics_eval_step_{step:06}_{producer}.txt"
       metrics_to_write = [metrics_dict_step]
     else:
       self.running_gcs_metrics.append(metrics_dict_step)

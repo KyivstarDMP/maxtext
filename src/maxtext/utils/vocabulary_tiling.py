@@ -39,12 +39,18 @@ _OUTPUT_HEAD_PATH_KEYS = ("token_embedder", "shared_embedding", "decoder_norm", 
 
 
 def _sum_by_dataset(values: jax.Array, dataset_ids: jax.Array, num_slots: int) -> jax.Array:
-  """Sum each dataset with reductions that remain correct inside a tiled scan.
+  """Sum each dataset with separate per-slot reductions followed by a stack.
 
-  A TPU compiler can fold segment_sum into the scan carry and move its
-  all-reduce outside the loop while retaining a per-partition carry reset.
-  Selection reductions avoid that scatter pattern. IDs outside [0, num_slots)
-  contribute to no slot, matching segment_sum's default behavior.
+  In the pinned TPU compiler, the segment_sum form's all-reduce was moved out
+  of the tiled loop while a partition-dependent carry reset remained inside.
+  With multiple slots, this selection-and-stack form was observed to keep a
+  tuple all-reduce inside the loop body, feeding the concatenated slot vector.
+  This is an observed compiler behavior, not a guarantee across versions or
+  shapes. Do not replace it with segment_sum or a one-hot matmul inside the
+  scan without TPU re-validation; being scatter-free alone is insufficient.
+
+  Program size and selection work grow as O(num_slots). IDs outside
+  [0, num_slots) contribute to no slot, matching segment_sum's default behavior.
   """
   return jnp.stack([jnp.sum(jnp.where(dataset_ids == slot, values, 0)) for slot in range(num_slots)])
 
@@ -91,7 +97,7 @@ def vocab_tiling_linen_loss(
     params: The model parameters.
     is_train: A boolean indicating if the model is in training mode.
     return_total_correct: Append an independently accumulated scalar correct count.
-      It is None when metrics are disabled; the default preserves the four-value API.
+      It is None when metrics are disabled. The default returns a uniform four-tuple.
   Returns:
     A tuple of (total_loss, total_z_loss, loss_by_dataset, correct_by_dataset).
     Dataset vectors are non-differentiable and are None when metrics are disabled.
@@ -160,9 +166,9 @@ def vocab_tiling_linen_loss(
 
     Train batches carry ``dataset_id`` -> [num_datasets+1] per-component vectors. Eval batches
     (Option B: one pass per dataset) carry none, so everything is bucketed into slot 1 and the
-    result is simply this pass's AGGREGATE xent/correct - which is what the caller needs, since
-    with vocab tiling the decoder returns ``logits=None`` (decoders.py: num_vocab_tiling > 1 and
-    model_mode == MODEL_MODE_TRAIN, which eval's teacher-forced forward also uses).
+    aggregate vectors are retained for the helper's return contract. The named eval caller
+    consumes the independent scalar correct count, not the slot-1 vector, because the tiled
+    decoder does not return full logits.
     """
     has_ids = "dataset_id" in data
     if has_ids:
@@ -370,13 +376,15 @@ def vocab_tiling_nnx_loss(model, hidden_states, data, config, is_train, *, retur
     config: Model and training config.
     is_train: Whether the model is in training mode.
     return_total_correct: Append an independently accumulated scalar correct count.
-      It is None when metrics are disabled; the default preserves the four-value API.
+      It is None when metrics are disabled. The default returns a uniform four-tuple.
 
   Returns:
     A tuple ``(total_loss, total_z_loss, loss_by_dataset, correct_by_dataset)``.
     Dataset vectors are non-differentiable and are None when metrics are disabled.
     Per-dataset loss includes z-loss, matching total_loss. Without dataset IDs,
     metrics use two slots: slot 0 is empty and slot 1 contains this batch's totals.
+    The custom VJP backward consumes only the scalar loss cotangent and discards
+    reporting cotangents; the outer stop_gradient calls also document this contract.
   """
   labels = data["targets"]
   segmentation = data["targets_segmentation"]

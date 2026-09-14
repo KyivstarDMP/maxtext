@@ -935,9 +935,9 @@ def eval_step(model, config, state, data, dropout_rng=None):
       "evaluation/mtp_loss": mtp_loss,
       "evaluation/mtp_acceptance_rate_percent": mtp_acceptance_rate,
   }
-  # Aggregate correct-token count for per-dataset eval accuracy. loss_fn supplies it from whichever
-  # path applies (tiled scan or full logits); it is simply absent if neither could produce one
-  # (e.g. the NNX tiled path), and the eval loop degrades to loss/perplexity only.
+  # loss_fn supplies an independent correct-token count when per_dataset_metrics is enabled,
+  # for both tiled and full-logit paths. Named per-dataset eval (Option B) consumes it;
+  # the ordinary aggregate eval logger does not report accuracy.
   eval_total_correct = aux.get("total_correct")
   if eval_total_correct is not None:
     eval_scalar["evaluation/total_correct"] = eval_total_correct.astype(jnp.float32)

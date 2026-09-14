@@ -233,12 +233,20 @@ between one canonical training history and online generation prefixes, see
 
 When training formatted SFT data through `maxtext.trainers.pre_train.train`,
 `per_dataset_metrics=true` reports loss and next-token accuracy over the
-supervised tokens. Linen and NNX support these metrics with and without
-vocabulary tiling. Per-dataset loss includes the configured z-loss, matching
-`learning/lm_loss`; this also applies to the Linen tiled path.
+supervised tokens. NNX supports these metrics with and without vocabulary
+tiling. The retained Linen path is covered by CPU tests only. Per-dataset loss
+includes the configured z-loss, matching `learning/lm_loss` on both paths.
+
+Use text SFT with `use_sft=true`, `dataset_type=grain`, and
+`grain_file_type=arrayrecord`. Set nonempty, unique `per_dataset_names` in the
+same order and count as the training mixture; names must match
+`[A-Za-z0-9][A-Za-z0-9_.-]*`. Separate named evaluation passes additionally need
+aligned `per_dataset_eval_names` and `grain_eval_files`.
 
 The tiled helpers return loss, z-loss, per-dataset loss sums, and correct-token
-counts. With metrics disabled, both vectors are `None`. Without `dataset_id`
+counts as a uniform four-tuple; callers can opt into a fifth, independently
+accumulated scalar correct count. With metrics disabled, both vectors and the
+optional scalar are `None`. Without `dataset_id`
 (as in separate evaluation passes), the helpers use two slots: an empty slot 0
 and the batch totals in slot 1. With IDs, slot 0 is reserved for padding and the
 remaining slots follow `per_dataset_names`. A dataset with supervised tokens
@@ -246,11 +254,26 @@ and no correct predictions has valid zero accuracy; a dataset with no
 supervised tokens emits only its token count.
 
 The NNX tiled path accumulates metrics from the logits already computed in
-each chunk. It adds an argmax and segment reductions without an additional
+each chunk. It adds an argmax and per-slot selection sums without an additional
 output-head projection. Its reporting vectors do not contribute gradients or
-add tensors to the backward residuals. Peak memory and throughput still need
-measurement on the target hardware. Per-dataset metrics remain unsupported
-for block diffusion and dense indexer warm-up and raise an error there.
+add tensors to the backward residuals. In one matched 40-step measurement
+window on 128 TPU chips across 32 hosts with 16 vocabulary tiles, metrics on
+increased step time by 2.29% relative to metrics off. This is not an old-versus-new
+reducer comparison or a general performance guarantee; selection work and
+program size grow with the number of dataset slots. Per-dataset metrics remain
+unsupported for block diffusion and dense indexer warm-up and raise an error there.
+
+`learning/total_correct` counts correct supervised training tokens independently
+of dataset IDs; it is a numerator, not an accuracy ratio. Named per-dataset
+evaluation (Option B) also consumes the independent count. Ordinary aggregate
+evaluation does not currently report accuracy.
+
+Finalized GCS evaluation records use `metrics_eval_step_<step>_aggregate.txt`
+or `metrics_eval_step_<step>_per_dataset.txt`, with a six-digit, zero-padded step.
+Re-evaluating a step after restart overwrites that producer's record. These
+finalized rows are separate from `metrics_step_*` training-window objects.
+Intermediate `running_eval` rows retain the existing behavior: they append to
+the training window but cannot trigger its upload.
 
 ### Advanced: Custom Dataset Formatter (e.g., ShareGPT)
 

@@ -18,6 +18,13 @@ The TPU test requires an already initialized distributed runtime when used on
 multiple hosts. CPU success does not substitute for this backend regression.
 """
 
+import json
+import os
+from pathlib import Path
+import re
+import subprocess
+import sys
+
 import jax
 import jax.numpy as jnp
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
@@ -76,11 +83,40 @@ def _check_tiled_sums(dtype, pattern):
   assert float(total) == values.sum(dtype=np.float64)
 
 
+@pytest.fixture(name="eight_device_cpu_results", scope="module")
+def _eight_device_cpu_results(tmp_path_factory):
+  """Run all six cases in one worker whose device count is set before JAX starts."""
+  output = tmp_path_factory.mktemp("reducer") / "results.json"
+  source_root = Path(__file__).resolve().parents[2]
+  env = os.environ.copy()
+  flags = re.sub(r"--xla_force_host_platform_device_count(?:=|\s+)\d+", "", env.get("XLA_FLAGS", ""))
+  env.update(
+      JAX_PLATFORMS="cpu",
+      JAX_PLATFORM_NAME="cpu",
+      XLA_FLAGS=f"{flags} --xla_force_host_platform_device_count=8",
+      PYTHONPATH=os.pathsep.join((str(source_root / "src"), str(source_root), env.get("PYTHONPATH", ""))),
+  )
+  result = subprocess.run(
+      [sys.executable, str(Path(__file__).resolve()), str(output)],
+      cwd=source_root,
+      env=env,
+      capture_output=True,
+      text=True,
+      timeout=300,
+      check=False,
+  )
+  assert result.returncode == 0, result.stdout + result.stderr
+  report = json.loads(output.read_text(encoding="utf-8"))
+  assert report["device_count"] == 8
+  assert len(report["passed"]) == 6
+  return report["passed"]
+
+
 @pytest.mark.cpu_only
 @pytest.mark.parametrize("dtype", [np.float32, np.int32])
 @pytest.mark.parametrize("pattern", ["all_ones", "tile_markers", "masks_and_invalid_ids"])
-def test_tiled_dataset_sums_cpu(dtype, pattern):
-  _check_tiled_sums(dtype, pattern)
+def test_tiled_dataset_sums_cpu(dtype, pattern, eight_device_cpu_results):
+  assert f"{np.dtype(dtype).name}/{pattern}" in eight_device_cpu_results
 
 
 @pytest.mark.tpu_only
@@ -90,3 +126,19 @@ def test_tiled_dataset_sums_tpu(dtype, pattern):
   if jax.device_count() < 2:
     pytest.skip("The carry-reset regression requires at least two TPU partitions")
   _check_tiled_sums(dtype, pattern)
+
+
+def _run_cpu_worker(output):
+  """Fail rather than skip when the required CPU partitions are unavailable."""
+  assert jax.default_backend() == "cpu"
+  assert jax.device_count() == 8
+  passed = []
+  for dtype in (np.float32, np.int32):
+    for pattern in ("all_ones", "tile_markers", "masks_and_invalid_ids"):
+      _check_tiled_sums(dtype, pattern)
+      passed.append(f"{np.dtype(dtype).name}/{pattern}")
+  Path(output).write_text(json.dumps({"device_count": jax.device_count(), "passed": passed}), encoding="utf-8")
+
+
+if __name__ == "__main__":
+  _run_cpu_worker(sys.argv[1])

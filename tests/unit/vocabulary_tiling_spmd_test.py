@@ -14,8 +14,9 @@
 
 """Compare batch-sharded NNX tiled metrics with a separate single-device reference.
 
-Both workers use CPU devices, including on a TPU host. This covers fsdp_transpose
-batch sharding, not tensor-parallel vocabulary sharding.
+Both workers use CPU devices. Pytest marks this test cpu_only and skips it on
+TPU hosts. This covers fsdp_transpose batch sharding, not tensor-parallel vocabulary
+sharding.
 """
 
 import json
