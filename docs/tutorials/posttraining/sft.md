@@ -192,9 +192,11 @@ their context can be emitted. A row ending in unemitted results raises instead
 of silently discarding them. Terminal assistant calls without a recorded result
 remain supported.
 
-Segmented rendering restarts its round after an assistant followed by a new user.
-That next round replays the template's BOS and leading system/developer/tools
-context. Within one round, tool results are emitted once as a masked suffix.
+Segmented rendering starts a new round after an assistant followed by a new user.
+The explicit leading system/developer message is emitted in the first round and
+is not automatically reinserted into later rounds. Template-generated BOS and
+tool declarations may recur. Within one round, tool results are emitted once as
+a masked suffix.
 At a tool-to-user boundary, the pending result suffix and the new user prompt
 suffix are separate masked segments; earlier tokens are not replayed there.
 This per-round contract differs from rendering one full multi-turn conversation
