@@ -14,6 +14,8 @@
 
 """Input pipeline"""
 import functools
+import json
+import re
 
 import jax
 from jax.sharding import PartitionSpec as P
@@ -59,12 +61,55 @@ def create_process_specific_iterator(config: pyconfig.HyperParameters, mesh, pro
   return output_iterator
 
 
+def _parse_dataset_names(value: str, field: str) -> list[str]:
+  """Require unambiguous labels without changing the source order."""
+  names = value.split(",")
+  if any(not name or name != name.strip() for name in names):
+    raise ValueError(f"{field} must contain nonempty names without surrounding whitespace.")
+  if len(set(names)) != len(names):
+    raise ValueError(f"{field} must contain unique names.")
+  if any(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", name) is None for name in names):
+    raise ValueError(f"{field} names must match [A-Za-z0-9][A-Za-z0-9_.-]*.")
+  return names
+
+
+def _validate_per_dataset_names(config: pyconfig.HyperParameters) -> None:
+  """Validate source-to-label alignment before any dataset iterator is created."""
+  names = _parse_dataset_names(config.per_dataset_names, "per_dataset_names")
+  if config.grain_train_mixture_config_path:
+    with open(config.grain_train_mixture_config_path, "r", encoding="utf-8") as mixture_file:
+      mixture = json.load(mixture_file)
+    if not isinstance(mixture, dict) or not mixture:
+      raise ValueError("grain_train_mixture_config_path must contain a nonempty JSON object.")
+    if names != list(mixture):
+      raise ValueError("per_dataset_names must match the JSON training mixture keys in their original order.")
+  else:
+    sources = config.grain_train_files.split(";")
+    if any(not source.strip() for source in sources):
+      raise ValueError("Per-dataset metrics require nonempty grain_train_files components.")
+    if len(names) != len(sources):
+      raise ValueError(
+          f"per_dataset_names ({len(names)}) must provide one name per training mixture component ({len(sources)}), "
+          "in grain_train_files order."
+      )
+
+  if config.per_dataset_eval_names or config.per_dataset_eval_files:
+    eval_names = _parse_dataset_names(config.per_dataset_eval_names, "per_dataset_eval_names")
+    eval_files = config.per_dataset_eval_files.split(";")
+    if any(not source.strip() for source in eval_files):
+      raise ValueError("per_dataset_eval_files must contain nonempty file patterns.")
+    if len(eval_names) != len(eval_files):
+      raise ValueError("per_dataset_eval_names and per_dataset_eval_files must align one-to-one in order.")
+
+
 def create_data_iterator(config: pyconfig.HyperParameters, mesh):
   """Create train and eval data iterators given configs and mesh."""
   if config.per_dataset_metrics and config.dataset_type != "grain":
     raise ValueError("Per-dataset metrics require the Grain ArrayRecord pipeline.")
   if config.per_dataset_metrics and not config.use_sft:
     raise ValueError("Per-dataset metrics require use_sft=true; pretraining does not preserve dataset IDs.")
+  if config.per_dataset_metrics:
+    _validate_per_dataset_names(config)
 
   if (
       config.dataset_type == "hf"
@@ -133,11 +178,8 @@ def create_data_iterator(config: pyconfig.HyperParameters, mesh):
     if config.per_dataset_metrics and config.per_dataset_eval_files:
       # Option B: one single-dataset eval iterator per component, keyed by name. jit_eval_step is
       # shape-based, so a dict here is fine; the eval loop runs one pass per entry.
-      names = [n for n in config.per_dataset_eval_names.split(",") if n]
-      globs = [g for g in config.per_dataset_eval_files.split(";") if g]
-      assert len(names) == len(
-          globs
-      ), f"per_dataset_eval_names ({len(names)}) and per_dataset_eval_files ({len(globs)}) must align"
+      names = config.per_dataset_eval_names.split(",")
+      globs = config.per_dataset_eval_files.split(";")
       # force_padding_batch=True (per-dataset iterators ONLY): these small single-dataset splits do not
       # divide evenly across hosts, so without padding a short host raises StopIteration and exits the eval
       # loop early -> unequal jit_eval_step launch counts -> E0200 SPMD desync. Padding keeps every host in

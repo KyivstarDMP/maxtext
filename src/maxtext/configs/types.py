@@ -1925,12 +1925,17 @@ class FineTuning(BaseModel):
       "",
       description=(
           "Comma-joined, ordered names of the train mixture components (runner-supplied from the "
-          "blend manifest, same order as grain_train_files). Index i (1-based) maps to names[i-1]."
+          "blend manifest, same order as grain_train_files). Index i (1-based) maps to names[i-1]. "
+          "Require one unique name per source, matching [A-Za-z0-9][A-Za-z0-9_.-]*. "
+          "For a JSON training mixture, names must equal its keys in their original order."
       ),
   )
   per_dataset_eval_names: str = Field(
       "",
-      description="Comma-joined, ordered names of eval datasets; one separate eval pass is run per name.",
+      description=(
+          "Comma-joined, ordered names of eval datasets; one separate eval pass is run per name. "
+          "Names must be unique and match [A-Za-z0-9][A-Za-z0-9_.-]*."
+      ),
   )
   per_dataset_eval_files: str = Field(
       "",
