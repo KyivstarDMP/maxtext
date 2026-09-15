@@ -14,13 +14,19 @@
 
 """Behavioral checks at the upstream/input/metrics integration boundaries."""
 
+import json
 from types import SimpleNamespace
 from unittest import mock
 
 import numpy as np
 import pytest
 
-from maxtext.input_pipeline import data_processing_utils, grain_data_processing, input_pipeline_utils
+from maxtext.input_pipeline import (
+    data_processing_utils,
+    grain_data_processing,
+    input_pipeline_interface,
+    input_pipeline_utils,
+)
 from maxtext.input_pipeline.protos import example_pb2
 
 
@@ -90,12 +96,183 @@ def test_metrics_reject_sources_that_do_not_stamp_dataset_ids(file_type):
     grain_data_processing.make_grain_train_iterator(config, SimpleNamespace(size=1), [0])
 
 
+def test_pretraining_metrics_fail_before_data_loading():
+  config = SimpleNamespace(per_dataset_metrics=True, dataset_type="grain", use_sft=False)
+  with mock.patch.object(input_pipeline_interface, "make_grain_train_iterator") as load_data:
+    with pytest.raises(ValueError, match="pretraining does not preserve dataset IDs"):
+      input_pipeline_interface.create_data_iterator(config, object())
+  load_data.assert_not_called()
+
+
+def test_pretraining_without_dataset_metrics_still_creates_iterator():
+  config = SimpleNamespace(
+      per_dataset_metrics=False,
+      dataset_type="grain",
+      use_sft=False,
+      data_sharding=["data"],
+      global_batch_size_to_load=1,
+      global_batch_size_to_train_on=1,
+      max_target_length=8,
+      expansion_factor_real_data=1,
+      eval_interval=0,
+  )
+  with (
+      mock.patch.object(input_pipeline_interface, "get_process_loading_real_data", return_value=[0]),
+      mock.patch.object(input_pipeline_interface.jax, "process_index", return_value=0),
+      mock.patch.object(input_pipeline_interface, "make_grain_train_iterator") as load_data,
+  ):
+    mesh = object()
+    train_iterator, eval_iterator = input_pipeline_interface.create_data_iterator(config, mesh)
+  load_data.assert_called_once_with(config, mesh, [0])
+  assert train_iterator is load_data.return_value
+  assert eval_iterator is None
+
+
+def _dataset_metrics_config(**overrides):
+  """Build a two-source configuration for input validation checks."""
+  values = {
+      "per_dataset_metrics": True,
+      "dataset_type": "grain",
+      "use_sft": True,
+      "packing": True,
+      "per_dataset_names": "first,second",
+      "grain_train_files": "first/*.array_record,0.5;second/*.array_record,0.5",
+      "grain_train_mixture_config_path": "",
+      "per_dataset_eval_names": "",
+      "per_dataset_eval_files": "",
+      "data_sharding": ["data"],
+      "global_batch_size_to_load": 1,
+      "global_batch_size_to_train_on": 1,
+      "global_batch_size_to_load_eval": 1,
+      "global_batch_size_to_eval_on": 1,
+      "max_target_length": 8,
+      "expansion_factor_real_data": 1,
+      "eval_interval": 1,
+      "eval_steps": 1,
+      "target_eval_loss": 0.0,
+  }
+  values.update(overrides)
+  return SimpleNamespace(**values)
+
+
+@pytest.mark.parametrize(
+    "overrides,diagnostic",
+    [
+        ({"per_dataset_names": ""}, "nonempty"),
+        ({"per_dataset_names": "  "}, "nonempty"),
+        ({"per_dataset_names": "first,,second"}, "nonempty"),
+        ({"per_dataset_names": "first,second,"}, "nonempty"),
+        ({"per_dataset_names": "first, second"}, "whitespace"),
+        ({"per_dataset_names": "first,first"}, "unique"),
+        ({"per_dataset_names": "first"}, "one name per training mixture component"),
+        ({"per_dataset_names": "first,second,third"}, "one name per training mixture component"),
+        ({"grain_train_files": ""}, "nonempty grain_train_files"),
+        ({"grain_train_files": "first,1;"}, "nonempty grain_train_files"),
+        ({"per_dataset_eval_names": "eval,eval", "per_dataset_eval_files": "a*;b*"}, "unique"),
+        ({"per_dataset_eval_names": "eval,", "per_dataset_eval_files": "a*;b*"}, "nonempty"),
+        ({"per_dataset_eval_names": " eval", "per_dataset_eval_files": "a*"}, "whitespace"),
+        ({"per_dataset_eval_names": "eval", "per_dataset_eval_files": "a*;b*"}, "one-to-one"),
+        ({"per_dataset_eval_names": "eval"}, "nonempty file patterns"),
+        ({"per_dataset_eval_files": "a*"}, "nonempty names"),
+        ({"per_dataset_eval_names": "a,b", "per_dataset_eval_files": "a*;"}, "nonempty file patterns"),
+    ],
+)
+def test_invalid_dataset_labels_fail_before_train_or_eval_loading(overrides, diagnostic):
+  with (
+      mock.patch.object(input_pipeline_interface, "make_grain_train_iterator") as train_data,
+      mock.patch.object(input_pipeline_interface, "make_grain_eval_iterator") as eval_data,
+  ):
+    with pytest.raises(ValueError, match=diagnostic):
+      input_pipeline_interface.create_data_iterator(_dataset_metrics_config(**overrides), object())
+  train_data.assert_not_called()
+  eval_data.assert_not_called()
+
+
+@pytest.mark.parametrize("field", ["per_dataset_names", "per_dataset_eval_names"])
+@pytest.mark.parametrize(
+    "name,valid",
+    [
+        ("a/b", False),
+        ("a b", False),
+        ("a\tb", False),
+        ("_a", False),
+        (".a", False),
+        ("-a", False),
+        ("a:b", False),
+        ("é", False),
+        ("A0-v1.2_test", True),
+        ("0", True),
+    ],
+)
+def test_dataset_name_characters_are_validated_before_loading(field, name, valid):
+  config = _dataset_metrics_config(
+      grain_train_files="first*", per_dataset_names="first", per_dataset_eval_names="eval", per_dataset_eval_files="eval*"
+  )
+  setattr(config, field, name)
+  with (
+      mock.patch.object(input_pipeline_interface, "get_process_loading_real_data", return_value=[0]),
+      mock.patch.object(input_pipeline_interface.jax, "process_index", return_value=0),
+      mock.patch.object(input_pipeline_interface, "make_grain_train_iterator") as train_data,
+      mock.patch.object(input_pipeline_interface, "make_grain_eval_iterator") as eval_data,
+  ):
+    if valid:
+      input_pipeline_interface.create_data_iterator(config, object())
+      train_data.assert_called_once()
+      eval_data.assert_called_once()
+    else:
+      with pytest.raises(ValueError, match=f"{field} names must match"):
+        input_pipeline_interface.create_data_iterator(config, object())
+      train_data.assert_not_called()
+      eval_data.assert_not_called()
+
+
+@pytest.mark.parametrize("mixture", [{"second": {}, "first": {}}, {"first": {}}, {}, []])
+def test_dataset_labels_reject_mismatched_json_mixture_order(tmp_path, mixture):
+  path = tmp_path / "mixture.json"
+  path.write_text(json.dumps(mixture), encoding="utf-8")
+  config = _dataset_metrics_config(grain_train_mixture_config_path=str(path))
+  with mock.patch.object(input_pipeline_interface, "make_grain_train_iterator") as load_data:
+    with pytest.raises(ValueError, match="JSON"):
+      input_pipeline_interface.create_data_iterator(config, object())
+  load_data.assert_not_called()
+
+
+@pytest.mark.parametrize("source_kind", ["single", "weighted", "json"])
+def test_valid_dataset_mapping_preserves_training_and_eval_order(tmp_path, source_kind):
+  config = _dataset_metrics_config(per_dataset_eval_names="second,first", per_dataset_eval_files="second*;first*")
+  if source_kind == "single":
+    config.per_dataset_names = "first"
+    config.grain_train_files = "first/*.array_record"
+  elif source_kind == "json":
+    path = tmp_path / "mixture.json"
+    path.write_text(
+        json.dumps({"first": {"path": "first*", "weight": 0.5}, "second": {"path": "second*", "weight": 0.5}}),
+        encoding="utf-8",
+    )
+    config.grain_train_mixture_config_path = str(path)
+    config.grain_train_files = ""  # The JSON mixture takes precedence.
+  with (
+      mock.patch.object(input_pipeline_interface, "get_process_loading_real_data", return_value=[0]),
+      mock.patch.object(input_pipeline_interface.jax, "process_index", return_value=0),
+      mock.patch.object(input_pipeline_interface, "make_grain_train_iterator") as train_data,
+      mock.patch.object(input_pipeline_interface, "make_grain_eval_iterator") as eval_data,
+  ):
+    mesh = object()
+    train_iterator, eval_iterators = input_pipeline_interface.create_data_iterator(config, mesh)
+  train_data.assert_called_once_with(config, mesh, [0])
+  assert train_iterator is train_data.return_value
+  assert list(eval_iterators) == ["second", "first"]
+  assert eval_data.call_args_list == [
+      mock.call(config, mesh, [0], eval_files_override="second*", force_padding_batch=True),
+      mock.call(config, mesh, [0], eval_files_override="first*", force_padding_batch=True),
+  ]
+
+
 @pytest.mark.parametrize(
     "objective,indexer,tiling,diagnostic",
     [
         ("block_diffusion", False, 1, "block diffusion"),
         ("causal_lm", True, 1, "indexer warm-up"),
-        ("causal_lm", False, 2, "NNX tiled"),
     ],
 )
 def test_unsupported_metrics_fail_before_forward(objective, indexer, tiling, diagnostic):
@@ -112,10 +289,91 @@ def test_unsupported_metrics_fail_before_forward(objective, indexer, tiling, dia
     train.loss_fn(object(), config, {}, None, None)
 
 
-def test_missing_metric_numerators_do_not_become_successful_zeros():
+@pytest.mark.parametrize("missing", ["loss", "correct", "both"])
+def test_missing_metric_numerators_do_not_become_successful_zeros(missing):
   from maxtext.trainers.pre_train import train  # pylint: disable=import-outside-toplevel
 
   config = SimpleNamespace(per_dataset_metrics=True, per_dataset_names="a,b")
   data = {"dataset_id": np.array([[1, 2]]), "targets_segmentation": np.array([[1, 1]])}
+  loss = None if missing in ("loss", "both") else np.array([0.0, 1.0, 2.0])
+  correct = None if missing in ("correct", "both") else np.array([0, 1, 0])
   with pytest.raises(ValueError, match="loss and correct-token sums"):
-    train._assemble_per_dataset_aux(config, data, None, None)  # pylint: disable=protected-access
+    train._assemble_per_dataset_aux(config, data, loss, correct)  # pylint: disable=protected-access
+
+
+@pytest.mark.parametrize("period", [2, 0, -1])
+def test_dataset_logger_uses_token_weighted_sums_and_omits_absent_values(period):
+  from maxtext.common.metric_logger import MetricLogger  # pylint: disable=import-outside-toplevel
+
+  logger = MetricLogger.__new__(MetricLogger)
+  logger.config = SimpleNamespace(per_dataset_log_period=period, log_period=2, steps=3, per_dataset_names="a,b,absent")
+  logger._per_dataset_accum = None  # pylint: disable=protected-access
+  first = {
+      "scalar": {},
+      "per_dataset": {
+          "xent_sum_by_ds": np.array([0.0, 2.0, 9.0, 0.0]),
+          "correct_by_ds": np.array([0, 1, 0, 0]),
+          "token_count_by_ds": np.array([0, 1, 3, 0]),
+      },
+  }
+  second = {
+      "scalar": {},
+      "per_dataset": {
+          "xent_sum_by_ds": np.array([0.0, 18.0, 3.0, 0.0]),
+          "correct_by_ds": np.array([0, 1, 0, 0]),
+          "token_count_by_ds": np.array([0, 3, 1, 0]),
+      },
+  }
+  logger._expand_per_dataset_train(first, 0)  # pylint: disable=protected-access
+  assert not first["scalar"]
+  logger._expand_per_dataset_train(second, 1)  # pylint: disable=protected-access
+  assert second["scalar"] == {
+      "per_dataset_train_tokens/a": 4.0,
+      "per_dataset_train_loss/a": 5.0,
+      "per_dataset_train_accuracy/a": 0.5,
+      "per_dataset_train_tokens/b": 4.0,
+      "per_dataset_train_loss/b": 3.0,
+      "per_dataset_train_accuracy/b": 0.0,
+      "per_dataset_train_tokens/absent": 0.0,
+  }
+  assert logger._per_dataset_accum is None  # pylint: disable=protected-access
+  final = {
+      "scalar": {},
+      "per_dataset": {
+          "xent_sum_by_ds": np.array([999.0, 14.0, 0.0, 0.0]),
+          "correct_by_ds": np.array([999, 1, 0, 0]),
+          "token_count_by_ds": np.array([999, 2, 0, 0]),
+      },
+  }
+  logger._expand_per_dataset_train(final, 2)  # pylint: disable=protected-access
+  assert final["scalar"] == {
+      "per_dataset_train_tokens/a": 2.0,
+      "per_dataset_train_loss/a": 7.0,
+      "per_dataset_train_accuracy/a": 0.5,
+      "per_dataset_train_tokens/b": 0.0,
+      "per_dataset_train_tokens/absent": 0.0,
+  }
+  assert logger._per_dataset_accum is None  # pylint: disable=protected-access
+
+
+def test_named_eval_reports_literal_loss_accuracy_and_perplexity():
+  from maxtext.common.metric_logger import MetricLogger  # pylint: disable=import-outside-toplevel
+
+  logger = MetricLogger.__new__(MetricLogger)
+  logger.config = SimpleNamespace(enable_tensorboard=True, metrics_file="", gcs_metrics=False)
+  with mock.patch.object(logger, "write_metrics_to_tensorboard") as write:
+    logger.write_per_dataset_eval({"first": (6.0, 3, 2), "absent": (0.0, 0, 0), "no_accuracy": (3.0, 2, None)}, 9)
+  write.assert_called_once()
+  assert write.call_args.args[1:] == (9, "eval")
+  assert write.call_args.args[0]["scalar"] == pytest.approx(
+      {
+          "per_dataset_eval_tokens/first": 3.0,
+          "per_dataset_eval_loss/first": 2.0,
+          "per_dataset_eval_accuracy/first": 0.6666666666666666,
+          "per_dataset_eval_perplexity/first": 7.38905609893065,
+          "per_dataset_eval_tokens/absent": 0.0,
+          "per_dataset_eval_tokens/no_accuracy": 2.0,
+          "per_dataset_eval_loss/no_accuracy": 1.5,
+          "per_dataset_eval_perplexity/no_accuracy": 4.4816890703380645,
+      }
+  )

@@ -206,7 +206,7 @@ class MetricLogger:
     # Key layout is `per_dataset_train_<type>/<name>`: W&B groups panels into sections by the FIRST '/'
     # segment (default "group by first prefix"), so putting the metric type in that segment gives one
     # section per (split, type) — per_dataset_train_loss / _accuracy / _tokens — each holding one panel
-    # per dataset. TensorBoard groups on the same prefix. See docs/012.
+    # per dataset. TensorBoard groups on the same prefix.
     for i, name in enumerate(names, start=1):
       t = float(tk_w[i])
       scalar[f"per_dataset_train_tokens/{name}"] = t
@@ -223,7 +223,7 @@ class MetricLogger:
 
     The metric type is the FIRST '/' segment (`per_dataset_eval_loss/<name>`, not
     `per_dataset_eval/loss/<name>`) so W&B — which groups panels into sections by the first prefix —
-    puts one section per (split, type), each holding one panel per dataset. See docs/012.
+    puts one section per (split, type), each holding one panel per dataset.
     """
     scalar = {}
     for name, (xent_sum, tokens, correct) in per_dataset_eval.items():
@@ -240,11 +240,11 @@ class MetricLogger:
     if self.config.metrics_file:
       self.write_metrics_locally(metrics, step)
     if self.config.gcs_metrics and jax.process_index() == 0:
-      self.write_metrics_for_gcs(metrics, step, "eval")
+      self.write_metrics_for_gcs(metrics, step, "eval", producer="per_dataset")
     # This method runs before the matching train step's buffered flush. Defer W&B emission until the
     # previous train point is flushed, then accumulate these scalars at the current train step with
     # commit=False; the train metrics commit the combined W&B history row. TB/local/GCS are
-    # order-independent, so they stay here. See docs/012.
+    # order-independent, so they stay here.
     if scalar:
       self._pending_per_dataset_eval_wandb = (dict(scalar), step)
 
@@ -425,21 +425,33 @@ class MetricLogger:
       metrics_dict = _prepare_metrics_for_json(metrics, step, self.config.run_name)
       local_metrics_file.write(str(json.dumps(metrics_dict)) + "\n")
 
-  def write_metrics_for_gcs(self, metrics, step, metric_type):
+  def write_metrics_for_gcs(self, metrics, step, metric_type, *, producer="aggregate"):
     """Writes metrics to GCS."""
     metrics_dict_step = _prepare_metrics_for_json(metrics, step, self.config.run_name)
-    self.running_gcs_metrics.append(metrics_dict_step)
-    if metric_type == "train" and (step + 1) % self.config.log_period == 0 or step == self.config.steps - 1:
+    if metric_type == "eval":
+      # Finalized eval may precede or follow the matching train flush. Give it its
+      # own object and leave the pending training window intact. Stable names
+      # overwrite a replayed step after restart and distinguish producers if
+      # both are ever used at the same step (today they are mutually exclusive).
+      metrics_filename = f"metrics_eval_step_{step:06}_{producer}.txt"
+      metrics_to_write = [metrics_dict_step]
+    else:
+      self.running_gcs_metrics.append(metrics_dict_step)
+      if metric_type != "train" or not ((step + 1) % self.config.log_period == 0 or step == self.config.steps - 1):
+        return
       start_step = (step // self.config.log_period) * self.config.log_period
       metrics_filename = f"metrics_step_{start_step:06}_to_step_{step:06}.txt"
-      with open(metrics_filename, "wt", encoding="utf8") as metrics_for_gcs:
-        for metrics_step in self.running_gcs_metrics:
-          metrics_for_gcs.write(str(json.dumps(metrics_step)) + "\n")
+      metrics_to_write = self.running_gcs_metrics
 
-      gcs_filename = os.path.join(self.config.metrics_dir, metrics_filename)
-      max_logging.log(f"Moving file {metrics_filename} to GCS...")
-      gcs_utils.upload_blob(gcs_filename, metrics_filename)
-      max_logging.log(f"File {metrics_filename} moved successfully!")
+    with open(metrics_filename, "wt", encoding="utf8") as metrics_for_gcs:
+      for metrics_step in metrics_to_write:
+        metrics_for_gcs.write(str(json.dumps(metrics_step)) + "\n")
+
+    gcs_filename = os.path.join(self.config.metrics_dir, metrics_filename)
+    max_logging.log(f"Moving file {metrics_filename} to GCS...")
+    gcs_utils.upload_blob(gcs_filename, metrics_filename)
+    max_logging.log(f"File {metrics_filename} moved successfully!")
+    if metric_type == "train":
       self.running_gcs_metrics = []  # reset running_metrics to empty list
 
   def write_metrics_to_tensorboard(self, metrics, step, metric_type):
@@ -588,7 +600,17 @@ class MetricLogger:
     if not hasattr(self, "_text_tokenizer"):
       from maxtext.input_pipeline import data_processing_utils  # pylint: disable=import-outside-toplevel
 
-      self._text_tokenizer, _ = data_processing_utils.get_tokenizer_and_pad_id(self.config)
+      # Cache failure as None so an unavailable tokenizer is reported once.
+      self._text_tokenizer = None
+      if getattr(self.config, "dataset_type", "") == "hf":
+        # The HF input pipeline always selects AutoTokenizer, including configs
+        # whose tokenizer_type still has the SentencePiece default.
+        overrides = {"tokenizer_type": "huggingface"}
+        if getattr(self.config, "use_sft", False):
+          overrides.update(add_bos=False, add_eos=False)
+        self._text_tokenizer, _ = data_processing_utils.get_tokenizer_and_pad_id(self.config, **overrides)
+      else:
+        self._text_tokenizer, _ = data_processing_utils.get_tokenizer_and_pad_id(self.config)
     return self._text_tokenizer
 
   @staticmethod
@@ -621,10 +643,11 @@ class MetricLogger:
     if jax.process_index() != 0:
       return
 
-    max_logging.log(f"[TextSample] Logging text samples at step {step} (period={self.config.log_text_period})...")
-
     try:
       tokenizer = self._get_tokenizer()
+      if tokenizer is None:
+        return
+      max_logging.log(f"[TextSample] Logging text samples at step {step} (period={self.config.log_text_period})...")
       num_tokens = self.config.log_text_num_tokens
 
       def _to_numpy(array):
@@ -639,6 +662,9 @@ class MetricLogger:
       targets = _to_numpy(batch["targets"])
       inputs_segmentation = _to_numpy(batch["inputs_segmentation"])
       targets_segmentation = _to_numpy(batch["targets_segmentation"])
+      local_length = inputs.shape[-1]
+      global_length = batch["inputs"].shape[-1]
+      fragment = local_length < global_length
       num_samples = min(self.config.log_text_num_samples, inputs.shape[0])
       tensorboard_parts = []
 
@@ -660,6 +686,10 @@ class MetricLogger:
           else:
             label = f"Step {step} | sample {sample_index}"
             heading = f"### Sample {sample_index}"
+          if fragment:
+            scope = f"local sequence fragment ({local_length} of {global_length} sequence positions)"
+            label += f" | {scope}"
+            heading += f" | {scope}"
 
           input_token_view, input_token_description = self._format_token_view(input_tokens, num_tokens)
           target_token_view, target_token_description = self._format_token_view(target_tokens, num_tokens)

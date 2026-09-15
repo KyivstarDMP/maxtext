@@ -44,6 +44,44 @@ def _get_pad_id(tokenizer):
   return pad_id
 
 
+def _decode_and_validate_sft_columns(example: dict, data_columns: list[str]) -> dict:
+  """Decode conversational columns and validate every row before Arrow infers its schema."""
+  decoded = {}
+  for column in data_columns:
+    messages = example.get(column)
+    diagnostic = (
+        f"Invalid HF SFT column {column!r}: expected a nonempty list of message objects "
+        "or a JSON-encoded message list. Plain-text prompt/completion columns require a custom formatter."
+    )
+    if isinstance(messages, str):
+      try:
+        messages = json.loads(messages)
+      except json.JSONDecodeError as error:
+        raise ValueError(diagnostic) from error
+    if not isinstance(messages, list) or not messages:
+      raise ValueError(diagnostic)
+    for index, message in enumerate(messages):
+      if (
+          not isinstance(message, dict)
+          or not isinstance(message.get("role"), str)
+          or not message["role"]
+          or not (
+              "content" in message
+              or (
+                  message["role"] == "assistant" and isinstance(message.get("tool_calls"), list) and message["tool_calls"]
+              )
+          )
+          or (message.get("content") is not None and not isinstance(message["content"], str))
+      ):
+        raise ValueError(
+            f"{diagnostic} Message {index} must have a nonempty string role and text/null content "
+            "(content may be omitted for assistant tool calls)."
+        )
+    # Keep native tool_calls, reasoning and other template-specific fields intact.
+    decoded[column] = messages
+  return decoded
+
+
 def _get_training_objective_transform(
     config: ml_collections.ConfigDict,
     *,
@@ -212,6 +250,7 @@ def vision_sft_preprocessing_pipeline(
       add_eos_token=False,
       legacy=False,
       token=config.hf_access_token,
+      revision=getattr(config, "tokenizer_revision", "") or None,
       extra_special_tokens={},
   )
   pad_id = _get_pad_id(tokenizer)
@@ -350,6 +389,10 @@ def preprocessing_pipeline(
         "sft_enable_thinking_column is currently supported only by the Grain SFT pipeline; "
         "use the constant sft_enable_thinking setting for HF SFT."
     )
+  if use_sft:
+    instruction_data_processing.validate_chat_template_pins(
+        chat_template, chat_template_path, chat_template_revision, chat_template_sha256
+    )
   if use_sft and not chat_template and chat_template_path:
     chat_template = instruction_data_processing.load_chat_template_from_file(
         chat_template_path,
@@ -419,28 +462,18 @@ def preprocessing_pipeline(
         formatting_func_path=formatting_func_path,
         formatting_func_kwargs=formatting_func_kwargs,
     )
-    # Deserialize JSON string columns if needed
-    _json_deserialized = False
-    for col in data_column_names:
-      if isinstance(dataset.features.get(col), datasets.Value) and dataset.features[col].dtype == "string":
-        dataset = dataset.map(lambda x, c=col: {c: json.loads(x[c]) if isinstance(x[c], str) else x[c]})
-        _json_deserialized = True
-
-    if not _json_deserialized:
-      assert input_pipeline_utils.is_conversational(
-          dataset.features, data_column_names
-      ), "Dataset is not in conversational format."
+    # Validate every primary column, including decoded values and streaming rows
+    # whose feature metadata may be absent. Auxiliary tools stay separate.
+    dataset = dataset.map(_decode_and_validate_sft_columns, fn_kwargs={"data_columns": data_column_names})
 
     if len(data_column_names) > 1:
       combined_column_name = "messages"
-      dataset_features = datasets.Features(
-          {combined_column_name: [{"content": datasets.Value(dtype="string"), "role": datasets.Value(dtype="string")}]}
-      )
+      # Let Arrow infer the combined schema: narrowing it to role/content drops
+      # native tool_calls, reasoning fields and auxiliary tools declarations.
       dataset = dataset.map(
           input_pipeline_utils.combine_columns,
           fn_kwargs={"columns": data_column_names, "data_column": combined_column_name},
           remove_columns=data_column_names,
-          features=dataset_features,
       )
       data_column_names = [combined_column_name]
 

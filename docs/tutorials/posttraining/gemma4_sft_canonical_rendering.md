@@ -126,7 +126,10 @@ template not to preserve historical reasoning.
 The template defines which reasoning this flag affects. A template may retain
 historical tool-call reasoning while still removing reasoning from ordinary
 historical answers. The flag does not make segmented and canonical token
-streams equivalent.
+streams equivalent. Segmented mode renders separate rounds after an assistant
+followed by a new user, so later renders cannot remove reasoning already emitted
+in a previous round. Use canonical full-conversation rendering for templates
+whose reasoning policy depends on positions across rounds.
 
 In segmented mode, a reasoning-bearing call followed by a tool result and a
 new user can fail the tool-to-user prefix check if the template removes that
@@ -134,6 +137,17 @@ call's now-historical reasoning. `auto` retains this fail-loud behavior for
 templates whose default removes it. Explicit `true` can make that boundary
 prefix-stable when the template supports preserving the call reasoning; this
 is not a guarantee for every template or conversation shape.
+
+This limit also applies within a tool round: a template can rewrite earlier
+reasoning when the following assistant is added, before any new user appears.
+Such a render fails the context-prefix check. Support must be verified against
+the exact template and row shape, rather than inferred from a tokenizer family.
+
+A generation prefill shared with the actual response is masked in segmented
+mode. A masked thinking opener alone does not establish an ownership error:
+loss-bearing runs need not be standalone balanced markup. Ensure row thinking
+settings agree with the intended template policy and test the expected token
+ownership; use template-owned canonical masks when prefix inference is unsuitable.
 
 Do not use the per-row column with the Hugging Face SFT pipeline; that pipeline
 supports only the constant thinking setting. It supports

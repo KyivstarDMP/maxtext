@@ -1136,6 +1136,7 @@ class TestGetShapedBatch(unittest.TestCase):
       use_mrope=False,
       model_name="llama3.1-8b",
       training_objective="causal_lm",
+      per_dataset_metrics=False,
   ):
     """Builds the config subset consumed by get_shaped_batch."""
     cfg = MagicMock()
@@ -1147,6 +1148,7 @@ class TestGetShapedBatch(unittest.TestCase):
     cfg.use_mrope = use_mrope
     cfg.model_name = model_name
     cfg.training_objective = training_objective
+    cfg.per_dataset_metrics = per_dataset_metrics
     cfg.video_max_grid_t = None
     cfg.video_max_grid_h = None
     cfg.video_max_grid_w = None
@@ -1165,6 +1167,23 @@ class TestGetShapedBatch(unittest.TestCase):
         "targets_segmentation",
     ):
       self.assertIn(key, batch)
+
+  def test_dataset_id_is_present_only_when_metrics_are_enabled(self):
+    expected_keys = {
+        "inputs",
+        "inputs_position",
+        "inputs_segmentation",
+        "targets",
+        "targets_position",
+        "targets_segmentation",
+    }
+    for enabled in (False, True):
+      with self.subTest(per_dataset_metrics=enabled):
+        batch = maxtext_utils.get_shaped_batch(self._make_cfg(per_dataset_metrics=enabled))
+        self.assertEqual(set(batch), expected_keys | ({"dataset_id"} if enabled else set()))
+        if enabled:
+          self.assertEqual(batch["dataset_id"].shape, (4, 16))
+          self.assertEqual(batch["dataset_id"].dtype, jnp.int32)
 
   def test_standard_shape(self):
     cfg = self._make_cfg()

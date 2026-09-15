@@ -65,6 +65,8 @@ from flax import nnx
 from orbax import checkpoint as ocp
 from pprint import pprint
 from transformers import AutoTokenizer
+
+from maxtext.input_pipeline.instruction_data_processing import configure_tokenizer_chat_template
 import maxtext.integration.vllm.maxtext_vllm_adapter as adapter
 
 adapter.register()
@@ -608,33 +610,6 @@ def create_rl_components(  # pylint: disable=too-many-positional-arguments
     )
 
   return rl_cluster, rl_trainer, optimizer, reward_fns
-
-
-def configure_tokenizer_chat_template(model_tokenizer: Any, trainer_config: Any) -> None:
-  """Populates the tokenizer's chat_template from config if missing."""
-  if getattr(model_tokenizer, "chat_template", None) is None:
-    if getattr(trainer_config, "chat_template", None):
-      model_tokenizer.chat_template = trainer_config.chat_template
-    elif getattr(trainer_config, "chat_template_path", None):
-      from maxtext.input_pipeline.instruction_data_processing import (  # pylint: disable=import-outside-toplevel
-          load_chat_template_from_file,
-      )
-
-      model_tokenizer.chat_template = load_chat_template_from_file(
-          trainer_config.chat_template_path,
-          hf_access_token=getattr(trainer_config, "hf_access_token", None),
-          revision=getattr(trainer_config, "chat_template_revision", "") or None,
-          expected_sha256=getattr(trainer_config, "chat_template_sha256", "") or None,
-      )
-    else:
-      raise ValueError(
-          f"Tokenizer {getattr(trainer_config, 'tokenizer_path', None)!r} has no chat_template "
-          "and config.chat_template / config.chat_template_path "
-          "are both empty. Either pick an instruction-tuned tokenizer that "
-          "ships with a chat_template, set config.chat_template to a Jinja "
-          "string, or set config.chat_template_path to a JSON file "
-          "with a 'chat_template' key."
-      )
 
 
 def rl_train(argv: Sequence[str], kwargs: dict):

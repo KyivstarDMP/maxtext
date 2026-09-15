@@ -48,6 +48,46 @@ def load_data_template_from_file(template_path):
   return None
 
 
+def validate_chat_template_pins(chat_template, template_path, revision=None, expected_sha256=None):
+  """Reject explicit pins that do not apply to the selected template asset."""
+  if (revision or expected_sha256) and (chat_template or not template_path):
+    raise ValueError(
+        "chat_template_revision/chat_template_sha256 require a selected chat_template_path, without an inline template."
+    )
+  if revision and template_path and not template_path.startswith("hf://"):
+    raise ValueError(
+        "chat_template_revision applies only to a Hub template path; use chat_template_sha256 for local files."
+    )
+
+
+def configure_tokenizer_chat_template(model_tokenizer, trainer_config):
+  """Apply the post-training fallback policy without silently ignoring explicit pins."""
+  inline = getattr(trainer_config, "chat_template", None)
+  path = getattr(trainer_config, "chat_template_path", None)
+  revision = getattr(trainer_config, "chat_template_revision", "") or None
+  digest = getattr(trainer_config, "chat_template_sha256", "") or None
+  if getattr(model_tokenizer, "chat_template", None) is not None:
+    if revision or digest:
+      raise ValueError("Configured chat-template pins are unused because the tokenizer already has a chat_template.")
+    return
+  validate_chat_template_pins(inline, path, revision, digest)
+  if inline:
+    model_tokenizer.chat_template = inline
+  elif path:
+    template = load_chat_template_from_file(
+        path, hf_access_token=getattr(trainer_config, "hf_access_token", None), revision=revision, expected_sha256=digest
+    )
+    if template is None:
+      raise ValueError(f"Unable to load chat template from chat_template_path={path!r}.")
+    model_tokenizer.chat_template = template
+  else:
+    raise ValueError(
+        f"Tokenizer {getattr(trainer_config, 'tokenizer_path', None)!r} has no chat_template "
+        "and config.chat_template / config.chat_template_path are both empty. Select an instruction-tuned tokenizer "
+        "or configure a Jinja template string or template file."
+    )
+
+
 def load_chat_template_from_file(
     template_path,
     hf_access_token=None,
@@ -61,6 +101,7 @@ def load_chat_template_from_file(
   paths. An optional SHA-256 check applies to the exact bytes read from either
   source.
   """
+  validate_chat_template_pins(None, template_path, revision, expected_sha256)
   if not template_path:
     return None
 
@@ -89,6 +130,8 @@ def load_chat_template_from_file(
     asset_path = template_path
 
   if not os.path.isfile(template_full_path):
+    if requested_revision or expected_sha256:
+      raise FileNotFoundError(f"Pinned chat template file does not exist: {template_path!r}.")
     return None
 
   with open(template_full_path, "rb") as template_file:

@@ -122,6 +122,7 @@ def setup_trainer_state(mt_config, goodput_recorder=None, test_only_training_hoo
         False,
         False,
         mt_config.hf_access_token,
+        tokenizer_revision=getattr(mt_config, "tokenizer_revision", "") or None,
     )
     model, mesh = model_creation_utils.from_pretrained(
         mt_config,

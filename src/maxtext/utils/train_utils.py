@@ -224,7 +224,9 @@ class _ReorderedDataIterator:
 
 
 def _reorder_data_iterator_for_loader(reorder_fn, data_iterator):
-  """Wraps the data iterator, or each element of an iterator list, with the reorder view."""
+  """Wrap each batch-producing iterator while preserving list or named-eval structure."""
+  if isinstance(data_iterator, dict):
+    return {name: _ReorderedDataIterator(reorder_fn, iterator) for name, iterator in data_iterator.items()}
   if isinstance(data_iterator, list):
     return [_ReorderedDataIterator(reorder_fn, iterator) for iterator in data_iterator]
   return _ReorderedDataIterator(reorder_fn, data_iterator)
@@ -327,7 +329,7 @@ def setup_train_loop(config, recorder, devices=None):
         # its concrete type; only batch consumers receive the reordered view.
         data_iterator_for_loader = _reorder_data_iterator_for_loader(reorder_fn, data_iterator)
         if eval_data_iterator:
-          eval_data_iterator = _ReorderedDataIterator(reorder_fn, eval_data_iterator)
+          eval_data_iterator = _reorder_data_iterator_for_loader(reorder_fn, eval_data_iterator)
 
     # Create data_loader AFTER reordering wrapper is applied
     data_loader = create_dataloader(config, mesh, data_iterator_for_loader, recorder, rampup_manager)

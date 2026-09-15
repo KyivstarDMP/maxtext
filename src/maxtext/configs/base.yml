@@ -852,11 +852,15 @@ sft_window_pinned_context_warn_fraction: 0.5
 # --- Per-dataset (per-mixture-component) metrics ------------------------------------------------
 # Emit per-dataset train loss/accuracy (segment-summed within each mixed batch) and per-dataset eval
 # loss/accuracy (one eval pass per dataset). Opt-in; zero-overhead when false. Requires packing=true.
+# Supported only for text Grain ArrayRecord SFT through the pre-training trainer (use_sft=true).
 per_dataset_metrics: false
 # Comma-joined, ordered names of the train mixture components (runner fills this from the blend
 # manifest, in the same order as grain_train_files). Index i (1-based) maps to names[i-1].
+# Names must be unique and match [A-Za-z0-9][A-Za-z0-9_.-]*: one per source component.
+# With grain_train_mixture_config_path, they must equal the JSON keys in their original order.
 per_dataset_names: ''
 # Comma-joined, ordered names of the eval datasets; one separate eval pass is run per name.
+# Names must be unique and match [A-Za-z0-9][A-Za-z0-9_.-]*.
 per_dataset_eval_names: ''
 # Semicolon-joined eval file globs, aligned 1:1 with per_dataset_eval_names (runner-filled from the
 # eval manifest). Each becomes its own single-dataset eval iterator (Option B: N separate passes).

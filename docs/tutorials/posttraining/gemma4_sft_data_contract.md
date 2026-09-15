@@ -30,8 +30,11 @@ removed:
 - `prompt` plus `completion`
 - `question` plus `answer`
 
-`prompt`/`completion` and `question`/`answer` records are converted to one user
-message followed by one assistant message. A `messages` record is a non-empty
+String `prompt`/`completion` and `question`/`answer` records are converted to one
+user message followed by one assistant message. The HF path also accepts
+conversational columns and interleaves their messages pairwise, retaining fields
+such as `tool_calls`. Their message counts must match; use one ordered `messages`
+column for unequal-length tool trajectories. A `messages` record is a non-empty
 ordered list of mappings.
 
 ```json
@@ -40,6 +43,7 @@ ordered list of mappings.
   {"role": "user", "content": "Look up the value."},
   {
     "role": "assistant",
+    "content": "",
     "tool_calls": [
       {"type": "function", "function": {"name": "lookup", "arguments": {}}}
     ]
@@ -52,7 +56,12 @@ ordered list of mappings.
 Supported roles are `system`, `developer`, `user`, `assistant`, and `tool`.
 A `system` or `developer` message, when present, must be at index zero.
 Assistant-mask mode permits an assistant tool-call message to omit `content`;
-other messages require content expected by the selected template.
+segmented mode requires the field (use an empty string for a call-only message).
+Other messages require content expected by the selected template. Segmented
+mode rejects assistant-first rows and trailing unemitted user/tool messages.
+Assistant-mask mode delegates those shapes to the template and accepts them
+when the row still has loss-bearing tokens; it does not impose the segmented
+completion/trim requirement.
 
 ## Native tool declarations
 
@@ -80,6 +89,7 @@ or, for mixed rows:
 
 ```yaml
 train_data_columns: [messages, tools, enable_thinking]
+eval_data_columns: [messages, tools, enable_thinking]
 sft_enable_thinking_column: enable_thinking
 ```
 
@@ -88,7 +98,9 @@ boolean. ArrayRecord/TensorFlow records carry one scalar `0` or `1` in a
 single-element sequence, which MaxText normalizes to a boolean. Strings,
 missing values, invalid integers, and non-scalar sequences are rejected. The
 value applies to the entire conversation render; it is not changed between
-assistant turns.
+assistant turns. Every active eval source, including each named eval dataset,
+must also contain the configured boolean column. There is no eval-only fallback
+to the constant setting.
 
 ## Ownership is a template contract
 

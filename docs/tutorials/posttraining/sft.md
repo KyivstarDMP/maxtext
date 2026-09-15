@@ -126,8 +126,14 @@ By default, MaxText SFT expects one of four conversational dataset structures:
 
 - `["messages"]`: A single column containing a list of dictionaries with `role` and `content` (recommended).
 - `["messages", "tools"]`: Messages plus native tool declarations passed to the chat template.
-- `["prompt", "completion"]`: Separated prompt and completion columns.
+- `["prompt", "completion"]`: Separate lists of message dictionaries, interleaved in prompt/completion order. Both lists must have the same number of messages; use one ordered `messages` column for other conversation shapes.
 - `["question", "answer"]`: Question and answer columns (e.g., math datasets).
+
+For HF text SFT, each primary conversational column may also contain a JSON-encoded
+message list. Every column is decoded and validated before rendering; native tool
+calls and other message fields are preserved. Plain-text `prompt`/`completion`
+strings are not conversational lists and require a custom formatter. Malformed JSON
+or message structures raise a schema error rather than being passed to the template.
 
 During data processing, MaxText converts these into a unified `messages` schema (OpenAI-like format) before feeding it to the tokenizer:
 
@@ -159,6 +165,22 @@ tokenizer_revision: <40_HEX_COMMIT>
 chat_template_path: hf://example-org/example-model/templates/training.jinja
 chat_template_revision: <40_HEX_COMMIT>
 ```
+
+Pinning is opt-in; empty revision fields remain unpinned. The configured
+`tokenizer_revision` is honored by Hugging Face tokenizer loads in the text,
+multimodal, TFDS/C4, DPO pad-ID and distillation pad-ID paths. Local SentencePiece
+and tiktoken loaders reject a nonempty Hub revision. Template pins require a
+selected `chat_template_path`: an inline template or an absent path cannot
+silently bypass them. Local template files support a SHA-256 check, while a
+template revision applies only to a Hub path. RL preserves a tokenizer's
+existing template and rejects configured template pins that this would bypass.
+
+Migration notes: SFT now explicitly passes `enable_thinking=True` by default,
+where older configurations could omit the argument. Check the rendered tokens
+when a template distinguishes omission from true; set the desired thinking
+policy explicitly. In the Grain/HF text-SFT paths, a configured template path
+that cannot be loaded now fails startup instead of silently falling back to a
+tokenizer-provided template.
 
 ### Canonical token ownership for completion-only SFT
 
@@ -192,9 +214,11 @@ their context can be emitted. A row ending in unemitted results raises instead
 of silently discarding them. Terminal assistant calls without a recorded result
 remain supported.
 
-Segmented rendering restarts its round after an assistant followed by a new user.
-That next round replays the template's BOS and leading system/developer/tools
-context. Within one round, tool results are emitted once as a masked suffix.
+Segmented rendering starts a new round after an assistant followed by a new user.
+The explicit leading system/developer message is emitted in the first round and
+is not automatically reinserted into later rounds. Template-generated BOS and
+tool declarations may recur. Within one round, tool results are emitted once as
+a masked suffix.
 At a tool-to-user boundary, the pending result suffix and the new user prompt
 suffix are separate masked segments; earlier tokens are not replayed there.
 This per-round contract differs from rendering one full multi-turn conversation
@@ -206,8 +230,16 @@ at its common prefix with the generation prompt. Speculative prompt suffixes
 absent from the actual response are therefore excluded, including after an
 interrupted tool round. Original token IDs still flow downstream unchanged.
 Previously emitted tool/history tokens must remain an exact prefix; a template
-that changes them is rejected. Rows ending in an unemitted user message are
+that changes them is rejected. The completed context before an assistant must
+also remain an exact token prefix of both renders; divergence is allowed only
+after that context, in the assistant prefill. Unsafe context rewrites raise
+without changing the split of accepted rows. Rows ending in an unemitted user message are
 also rejected; the data producer must trim dangling tails before training.
+
+An absent tools column and an empty tools list (including JSON `"[]"`) both
+mean no declarations; the template receives no `tools` argument in either case.
+When leading-context pinning is requested, every accepted row must produce a
+nonempty exact pin, including rows with a leading message but no user turn.
 
 `sft_preserve_thinking=auto` omits the preservation argument in segmented mode
 and follows each row's thinking value in canonical mode. An explicit boolean
@@ -226,6 +258,57 @@ For records longer than `max_target_length`, see
 [SFT long-example windowing](sft_long_example_windowing.md). For the difference
 between one canonical training history and online generation prefixes, see
 [Gemma 4 multi-turn SFT and serving frontiers](gemma4_sft_serving_frontiers.md).
+
+### Per-dataset metrics with the pre-training trainer
+
+When training formatted SFT data through `maxtext.trainers.pre_train.train`,
+`per_dataset_metrics=true` reports loss and next-token accuracy over the
+supervised tokens. NNX supports these metrics with and without vocabulary
+tiling. TPU validation covered the tiled NNX path; the non-tiled NNX and retained
+Linen paths are covered by CPU tests. Per-dataset loss
+includes the configured z-loss, matching `learning/lm_loss` on both paths.
+
+Use text SFT with `use_sft=true`, `dataset_type=grain`, and
+`grain_file_type=arrayrecord`. Set nonempty, unique `per_dataset_names` in the
+same order and count as the training mixture; names must match
+`[A-Za-z0-9][A-Za-z0-9_.-]*`. Separate named evaluation passes additionally need
+aligned `per_dataset_eval_names` and `per_dataset_eval_files`, and `eval_steps > 0`.
+Dataset metrics require `packing=true` and do not support placeholder data hosts
+(`expansion_factor_real_data > 1`) or the Tunix post-training entry points.
+Named evaluation does not provide the aggregate `target_eval_loss` stopping rule;
+keep that threshold disabled when using separate dataset passes.
+
+The tiled helpers return loss, z-loss, per-dataset loss sums, and correct-token
+counts as a uniform four-tuple; callers can opt into a fifth, independently
+accumulated scalar correct count. With metrics disabled, both vectors and the
+optional scalar are `None`. Without `dataset_id`
+(as in separate evaluation passes), the helpers use two slots: an empty slot 0
+and the batch totals in slot 1. With IDs, slot 0 is reserved for padding and the
+remaining slots follow `per_dataset_names`. A dataset with supervised tokens
+and no correct predictions has valid zero accuracy; a dataset with no
+supervised tokens emits only its token count.
+
+The NNX tiled path accumulates metrics from the logits already computed in
+each chunk. It adds an argmax and per-slot selection sums without an additional
+output-head projection. Its reporting vectors do not contribute gradients or
+add tensors to the backward residuals. In one matched 40-step measurement
+window on 128 TPU chips across 32 hosts with 16 vocabulary tiles, metrics on
+increased step time by 2.29% relative to metrics off. This is not an old-versus-new
+reducer comparison or a general performance guarantee; selection work and
+program size grow with the number of dataset slots. Per-dataset metrics remain
+unsupported for block diffusion and dense indexer warm-up and raise an error there.
+
+`learning/total_correct` counts correct supervised training tokens independently
+of dataset IDs; it is a numerator, not an accuracy ratio. Named per-dataset
+evaluation (Option B) also consumes the independent count. Ordinary aggregate
+evaluation does not currently report accuracy.
+
+Finalized GCS evaluation records use `metrics_eval_step_<step>_aggregate.txt`
+or `metrics_eval_step_<step>_per_dataset.txt`, with a six-digit, zero-padded step.
+Re-evaluating a step after restart overwrites that producer's record. These
+finalized rows are separate from `metrics_step_*` training-window objects.
+Intermediate `running_eval` rows retain the existing behavior: they append to
+the training window but cannot trigger its upload.
 
 ### Advanced: Custom Dataset Formatter (e.g., ShareGPT)
 

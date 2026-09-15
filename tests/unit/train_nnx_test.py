@@ -51,6 +51,8 @@ class _Cfg:
   indexer_sparse_training: bool = False
   indexer_loss_scaling_factor: float = 0.0
   num_vocab_tiling: int = 1
+  per_dataset_metrics: bool = False
+  per_dataset_names: str = ""
   num_experts: int = 1
   retry_when_tokens_dropped: bool = False
   routed_bias: bool = False
@@ -355,6 +357,23 @@ class TestLossFnNNX(unittest.TestCase):
 
 class TestTrainStepNNX(unittest.TestCase):
   """Cover the NNX branch of train_step (the diff_wrapper / nnx.update path)."""
+
+  def test_train_step_reports_known_per_dataset_counts(self):
+    cfg, ts = _build_state()
+    cfg.per_dataset_metrics = True
+    cfg.per_dataset_names = "a,b"
+    data = _make_data()
+    data["dataset_id"] = jnp.array([[1, 1, 1, 1], [2, 2, 2, 2]], dtype=jnp.int32)
+    data["targets_segmentation"] = data["targets_segmentation"].at[1, -1].set(0)
+    predicted = jnp.argmax(ts.model(data["inputs"], data["inputs_position"]), axis=-1)
+    data["targets"] = jnp.where(data["dataset_id"] == 1, predicted, (predicted + 1) % cfg.vocab_size)
+    state_graphdef, state_pure = nnx.split(ts)
+    _, metrics = pre_train.train_step(
+        state_graphdef, cfg, state_mesh_shardings=None, params_shardings=None, state=state_pure, data=data
+    )
+    self.assertEqual(int(metrics["scalar"]["learning/total_correct"]), 4)
+    np.testing.assert_array_equal(metrics["per_dataset"]["correct_by_ds"], [0, 4, 0])
+    np.testing.assert_array_equal(metrics["per_dataset"]["token_count_by_ds"], [0, 4, 3])
 
   def test_train_step_returns_state_and_metrics(self):
     cfg, ts = _build_state()

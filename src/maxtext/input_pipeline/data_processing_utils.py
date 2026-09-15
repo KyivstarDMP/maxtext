@@ -95,13 +95,15 @@ def _build_tokenizer_cached(
   )
 
 
-def get_tokenizer_and_pad_id(config, add_bos: bool | None = None, add_eos: bool | None = None):
+def get_tokenizer_and_pad_id(
+    config, add_bos: bool | None = None, add_eos: bool | None = None, *, tokenizer_type: str | None = None
+):
   """Builds tokenizer and extracts pad_id safely."""
   bos = config.add_bos if add_bos is None else add_bos
   eos = config.add_eos if add_eos is None else add_eos
   tokenizer_model = _build_tokenizer_cached(
       config.tokenizer_path,
-      config.tokenizer_type,
+      config.tokenizer_type if tokenizer_type is None else tokenizer_type,
       bos,
       eos,
       config.hf_access_token,

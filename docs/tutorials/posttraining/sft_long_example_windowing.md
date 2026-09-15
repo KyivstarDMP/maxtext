@@ -100,7 +100,24 @@ completion's turn terminator.
 `sft_window_max_fan_out` is counted per example across **all** of its
 completion segments, not per completion. When the cap is reached the transform
 returns the records already produced and logs how many trailing completion
-tokens, potentially including a terminator, were dropped.
+tokens were dropped across the whole remaining example, including later
+completion segments and their terminators.
+
+## Multi-host capacity
+
+Finite multi-host windowing without training padding produces a startup warning.
+Different host shards can produce different numbers of windows and packed
+batches. If one host exhausts before the planned batch calls, collective calls
+can diverge. The warning documents this risk; it does not coordinate exhaustion.
+
+Preflight the minimum available **batches** across data-loading hosts, accounting
+for rendering, windowing, mixtures, packing, batch geometry and resume position.
+An exact equal-host schedule or an independently verified capacity estimate can
+establish that every host has enough batches. A raw-row percentage margin is
+not a general guarantee. Startup does not render the corpus, measure capacity,
+or consume/reset the live iterator to obtain counts. Keep this measurement in a
+separate preflight or source-bound receipt. Elastic Grain iteration with
+windowing is currently rejected.
 
 ## Leading-context pinning
 
@@ -119,10 +136,13 @@ native tool declarations. MaxText obtains it from `apply_chat_template` and
 requires it to be an exact token prefix of both the first prompt and the final
 formatted stream. It does not reconstruct the block from decoded text.
 
-When there is no explicit leading message, MaxText tries a tokenizer-generated
-empty developer block only as a render probe. The probe is not inserted into
-the source conversation. If that result is not an exact prefix, MaxText tries
-an exact BOS-only prefix; otherwise it fails.
+When there is no explicit leading message but nonempty native tools exist,
+MaxText renders an empty developer message to obtain the generated tools block.
+That complete block must be an exact prefix; there is no BOS-only fallback for
+tools declarations. When both the leading message and tools are absent (or the
+tools list is empty), MaxText tries an empty developer block as a render probe,
+then an exact BOS-only prefix if the probe is not a prefix; otherwise it fails.
+These probes are not inserted into the source conversation.
 
 Pinning changes a record only when the accumulated prefix exceeds the effective
 context cap. The replacement context is:

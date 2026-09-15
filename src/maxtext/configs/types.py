@@ -1631,10 +1631,6 @@ class Tokenizer(BaseModel):
       True,
       description="If False, use chunking for long sequences instead of truncation.",
   )
-  num_vocab_tiling: int = Field(
-      1,
-      description="Enables memory-saving optimization by tiling cross-entropy loss computation. >1 to enable.",
-  )
 
 
 class DatasetGeneral(BaseModel):
@@ -1917,19 +1913,25 @@ class FineTuning(BaseModel):
       description=(
           "If True, emit per-mixture-component (per-dataset) train loss/accuracy (segment-summed "
           "within each mixed batch) and per-dataset eval loss/accuracy (one eval pass per dataset). "
-          "Opt-in; zero-overhead when False. Requires packing=true."
+          "Opt-in; zero-overhead when False. Requires packing=true and text Grain ArrayRecord SFT "
+          "through the pre-training trainer (use_sft=true)."
       ),
   )
   per_dataset_names: str = Field(
       "",
       description=(
           "Comma-joined, ordered names of the train mixture components (runner-supplied from the "
-          "blend manifest, same order as grain_train_files). Index i (1-based) maps to names[i-1]."
+          "blend manifest, same order as grain_train_files). Index i (1-based) maps to names[i-1]. "
+          "Require one unique name per source, matching [A-Za-z0-9][A-Za-z0-9_.-]*. "
+          "For a JSON training mixture, names must equal its keys in their original order."
       ),
   )
   per_dataset_eval_names: str = Field(
       "",
-      description="Comma-joined, ordered names of eval datasets; one separate eval pass is run per name.",
+      description=(
+          "Comma-joined, ordered names of eval datasets; one separate eval pass is run per name. "
+          "Names must be unique and match [A-Za-z0-9][A-Za-z0-9_.-]*."
+      ),
   )
   per_dataset_eval_files: str = Field(
       "",
@@ -4879,9 +4881,17 @@ class MaxTextConfig(
             "grain_train_mixture_config_path, use hf_path with grain_file_type=parquet, or use dataset_path, "
             "dataset_name, and train_split with grain_file_type=tfrecord."
         )
-      if self.eval_interval > 0 and not self.grain_eval_files and not use_hf_parquet and not use_tfds_tfrecord_eval:
+      named_eval = self.per_dataset_metrics and bool(self.per_dataset_eval_files)
+      if (
+          self.eval_interval > 0
+          and not self.grain_eval_files
+          and not named_eval
+          and not use_hf_parquet
+          and not use_tfds_tfrecord_eval
+      ):
         raise ValueError(
-            "Please specify grain_eval_files, use hf_path with grain_file_type=parquet, or use dataset_path, "
+            "Please specify grain_eval_files, named per_dataset_eval_files with per_dataset_metrics, "
+            "use hf_path with grain_file_type=parquet, or use dataset_path, "
             "eval_dataset_name, and eval_split with grain_file_type=tfrecord; otherwise set eval_interval to <=0."
         )
     elif self.dataset_type == DatasetType.TFDS:

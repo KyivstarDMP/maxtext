@@ -52,9 +52,11 @@ def normalize_features(x, column_name):
   return {"inputs": x[column_name], "targets": x[column_name]}
 
 
-def get_tokenizer(tokenizer_path, tokenizer_type, add_bos, add_eos, hf_access_token=None):
+def get_tokenizer(tokenizer_path, tokenizer_type, add_bos, add_eos, hf_access_token=None, tokenizer_revision=None):
   # Load tokenizer
-  tokenizer_model = tokenizer.build_tokenizer(tokenizer_path, tokenizer_type, add_bos, add_eos, hf_access_token)
+  tokenizer_model = tokenizer.build_tokenizer(
+      tokenizer_path, tokenizer_type, add_bos, add_eos, hf_access_token, tokenizer_revision
+  )
   return tokenizer_model
 
 
@@ -191,6 +193,11 @@ def prepare_text_for_image_fusion(example, column_name, config):
 def combine_columns(example, columns, data_column):
   """Combine columns such as 'prompt' and 'completion' for sft training"""
   assert len(columns) > 1
+  if len({len(example[column]) for column in columns}) != 1:
+    raise ValueError(
+        "Conversational prompt/completion columns must have equal message counts for pairwise interleaving. "
+        "Use one ordered messages column for unequal-length tool trajectories."
+    )
   combined = []
   for i in range(len(example[columns[0]])):
     for c in columns:
@@ -281,7 +288,9 @@ def _resolve_sft_preserve_thinking(
 def _sft_template_kwargs(tools: Any, enable_thinking: bool, preserve_thinking: bool | None) -> dict[str, Any]:
   """Keep the resolved policy identical across full, prefix, suffix and pin renders."""
   kwargs: dict[str, Any] = {"enable_thinking": enable_thinking}
-  if tools is not None:
+  # The SFT row contract represents no declarations as either absent or [].
+  # Normalize here so full renders and pin probes use the same template kwargs.
+  if tools is not None and tools != []:
     kwargs["tools"] = tools
   if preserve_thinking is not None:
     kwargs["preserve_thinking"] = preserve_thinking
@@ -324,6 +333,19 @@ def _split_turn_token_ids(
 
   prompt_completion_ids = extract_token_ids(prompt_completion_tokens)
   prompt_ids = extract_token_ids(prompt_tokens)
+
+  # LCP may end inside a speculative assistant prefill (e.g. a thinking opener),
+  # but must not turn established user/context tokens into completion targets.
+  # Reject unsafe templates without changing the split of an accepted render.
+  context_ids = extract_token_ids(
+      tokenizer_model.apply_chat_template(round_msgs[:-1], add_generation_prompt=False, tokenize=True, **template_kwargs)
+  )
+  if context_ids != prompt_completion_ids[: len(context_ids)] or context_ids != prompt_ids[: len(context_ids)]:
+    raise ValueError(
+        "Chat template assistant boundary changes established context tokens. "
+        "Segmented mode requires a stable context prefix; use a compatible template or assistant_mask mode. "
+        f"Context tokens: {len(context_ids)}; full tokens: {len(prompt_completion_ids)}; prompt tokens: {len(prompt_ids)}."
+    )
 
   # Walk forward until the two sequences diverge
   common_len = 0
@@ -411,13 +433,17 @@ def _render_suffix_ids(
 ):
   """Extract a token suffix only when the previous render remains an exact prefix."""
   kwargs = _sft_template_kwargs(tools, enable_thinking, preserve_thinking)
-  baseline_ids = extract_token_ids(
-      tokenizer_model.apply_chat_template(
-          baseline_msgs,
-          add_generation_prompt=baseline_gen,
-          tokenize=True,
-          **kwargs,
+  baseline_ids = (
+      extract_token_ids(
+          tokenizer_model.apply_chat_template(
+              baseline_msgs,
+              add_generation_prompt=baseline_gen,
+              tokenize=True,
+              **kwargs,
+          )
       )
+      if baseline_msgs
+      else []
   )
   superset_ids = extract_token_ids(
       tokenizer_model.apply_chat_template(
@@ -454,11 +480,13 @@ def _get_tool_results_and_completion_deltas(  # pylint: disable=too-many-locals
     tools=None,
     enable_thinking=True,
     preserve_thinking: bool | None = None,
+    *,
+    emitted_len: int,
 ):
   """Render trailing tool results and the assistant response as adjacent token deltas.
 
   ``round_msgs`` must be the live round state and end in one or more tool
-  messages. The chat template render immediately before those tool messages is
+  messages. The chat template render through the last emitted message is
   required to be an exact token prefix of the render including the tools and
   the next assistant generation prompt. Returning only the suffix preserves a
   single canonical token stream without replaying the preceding tool call.
@@ -497,7 +525,7 @@ def _get_tool_results_and_completion_deltas(  # pylint: disable=too-many-locals
   template_kwargs = _sft_template_kwargs(tools, enable_thinking, preserve_thinking)
   superset_ids, suffix_ids = _render_suffix_ids(
       tokenizer_model,
-      round_msgs[:first_tool_idx],
+      round_msgs[:emitted_len],
       round_msgs,
       baseline_gen=False,
       superset_gen=True,
@@ -695,6 +723,8 @@ def _get_pinned_context_ids(
   # pinning the complete first prompt. Without tokenizer-provided message spans, the
   # former can cut into the user message or omit part of a context-dependent leading
   # block, while the latter would replay the first user's task in later windows.
+  if not pinned_ids:
+    raise ValueError("Chat template produced an empty leading-context pin; disable pinning or use a compatible template.")
   validate_pinned_context_prefix(
       tokenizer_model,
       pinned_ids,
@@ -760,6 +790,12 @@ def apply_chat_template(
   def append_segment(ids, prompt):
     if not ids:
       return
+    if pin_leading_context and not segment_ids:
+      if not pinned_context_rendered:
+        raise ValueError("Cannot emit a pinned SFT row before deriving its leading-context pin.")
+      validate_pinned_context_prefix(
+          tokenizer_model, pinned_context_ids, ids, [item.get("role") for item in round_msgs], "first emitted segment"
+      )
     segment_ids.append(list(ids))
     messages.append(tokenizer_model.decode(ids, skip_special_tokens=False))
     is_prompt.append(prompt)
@@ -784,6 +820,16 @@ def apply_chat_template(
         leading_message = message
         round_msgs.append(message)
       elif message["role"] == "user":
+        if pin_leading_context and not pinned_context_rendered:
+          pinned_context_ids = _get_pinned_context_ids(
+              tokenizer_model,
+              leading_message,
+              round_msgs + [message],
+              tools=tools,
+              enable_thinking=enable_thinking,
+              preserve_thinking=preservation,
+          )
+          pinned_context_rendered = True
         if round_msgs and round_msgs[-1]["role"] == "tool":
           # Tools have accumulated but have not yet been emitted. Flush their
           # suffix before taking the user suffix, or their bodies would be lost.
@@ -800,7 +846,7 @@ def apply_chat_template(
           )
           validate_tool_result_bodies(
               tokenizer_model,
-              round_msgs[emitted_len:],
+              [item for item in round_msgs[emitted_len:] if item.get("role") == "tool"],
               [tokenizer_model.decode(pending_ids, skip_special_tokens=False)],
               mode="segmented",
               roles=[item.get("role") for item in round_msgs],
@@ -823,6 +869,14 @@ def apply_chat_template(
           round_msgs.append(message)
           continue
         round_msgs.append(message)
+        # Defer the prompt until the full assistant render determines its boundary.
+      elif message["role"] == "tool":
+        if not round_msgs:
+          raise ValueError(f"Tool message at index {idx} with no preceding context.")
+        round_msgs.append(message)
+      elif message["role"] == "assistant":
+        if not round_msgs:
+          raise ValueError(f"Assistant message at index {idx} with no preceding context.")
         if pin_leading_context and not pinned_context_rendered:
           pinned_context_ids = _get_pinned_context_ids(
               tokenizer_model,
@@ -833,14 +887,6 @@ def apply_chat_template(
               preserve_thinking=preservation,
           )
           pinned_context_rendered = True
-        # Defer the prompt until the full assistant render determines its boundary.
-      elif message["role"] == "tool":
-        if not round_msgs:
-          raise ValueError(f"Tool message at index {idx} with no preceding context.")
-        round_msgs.append(message)
-      elif message["role"] == "assistant":
-        if not round_msgs:
-          raise ValueError(f"Assistant message at index {idx} with no preceding context.")
         if round_msgs[-1]["role"] == "tool":
           # Tool results condition this assistant response, so preserve their tokenizer-rendered
           # delta as prompt context. Marking it as a prompt keeps the result visible to attention
@@ -854,6 +900,7 @@ def apply_chat_template(
               tools=tools,
               enable_thinking=enable_thinking,
               preserve_thinking=preservation,
+              emitted_len=emitted_len,
           )
           append_segment(tool_results_delta, True)
           round_msgs.append(message)
@@ -866,14 +913,6 @@ def apply_chat_template(
               enable_thinking=enable_thinking,
               preserve_thinking=preservation,
           )
-          if pin_leading_context and not segment_ids:
-            validate_pinned_context_prefix(
-                tokenizer_model,
-                pinned_context_ids,
-                prompt_ids,
-                [item.get("role") for item in round_msgs],
-                "full-render prompt",
-            )
           append_segment(unemitted_prompt_ids(prompt_ids), True)
         append_segment(completion, False)
         emitted_len = len(round_msgs)
@@ -1334,6 +1373,8 @@ class SFTPromptMaskingWindows(FlatMapTransform):
 
     records = []
     prefix = []  # all tokens of preceding segments, replayed (masked) as grounding context
+    total_loss_tokens = sum(len(seg) for seg, prompt in zip(segments, is_prompt) if not (self.completion_only and prompt))
+    emitted_loss_tokens = 0
     warned_for_element = False
     for seg, is_p in zip(segments, is_prompt):
       seg = list(seg)
@@ -1381,8 +1422,9 @@ class SFTPromptMaskingWindows(FlatMapTransform):
       while i < n:
         if len(records) >= self.max_fan_out:
           max_logging.log(
-              f"SFTPromptMaskingWindows: hit max_fan_out={self.max_fan_out}; dropping {n - i} "
-              "trailing completion token(s) (including the turn terminator) for one example."
+              f"SFTPromptMaskingWindows: hit max_fan_out={self.max_fan_out}; dropping "
+              f"{total_loss_tokens - emitted_loss_tokens} remaining loss token(s) from this example, "
+              "including all later completion segments and their turn terminators."
           )
           return self._stamp_ds(records, element)
         overlap_tokens = comp[max(0, i - overlap_cap) : i]
@@ -1396,6 +1438,7 @@ class SFTPromptMaskingWindows(FlatMapTransform):
             }
         )
         i += len(loss_tokens)
+        emitted_loss_tokens += len(loss_tokens)
       prefix += comp
 
     return self._stamp_ds(records, element)

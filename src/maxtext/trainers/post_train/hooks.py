@@ -27,7 +27,7 @@ from flax import nnx
 from tunix.sft import peft_trainer
 from tunix.sft.hooks import DataHooks, TrainingHooks
 
-from maxtext.input_pipeline.input_pipeline_interface import create_data_iterator
+from maxtext.input_pipeline.input_pipeline_interface import create_data_iterator, validate_post_train_data_options
 from maxtext.common.data_loader import DataLoader
 from maxtext.common.goodput import GoodputEvent, record_goodput
 from maxtext.common.metric_logger import MetricLogger, MetadataKey
@@ -204,6 +204,7 @@ class BaseDataHooks(DataHooks):
   """Shared data hooks for post-training."""
 
   def __init__(self, config, mesh, goodput_recorder):
+    validate_post_train_data_options(config)
     self.config = config
     self.train_data_iterator, self.eval_data_iterator = create_data_iterator(config, mesh)
     self.train_data_loader = DataLoader(config, mesh, self.train_data_iterator, goodput_recorder=goodput_recorder)
