@@ -126,8 +126,14 @@ By default, MaxText SFT expects one of four conversational dataset structures:
 
 - `["messages"]`: A single column containing a list of dictionaries with `role` and `content` (recommended).
 - `["messages", "tools"]`: Messages plus native tool declarations passed to the chat template.
-- `["prompt", "completion"]`: Separated prompt and completion columns.
+- `["prompt", "completion"]`: Separate lists of message dictionaries, interleaved in prompt/completion order. Both lists must have the same number of messages; use one ordered `messages` column for other conversation shapes.
 - `["question", "answer"]`: Question and answer columns (e.g., math datasets).
+
+For HF text SFT, each primary conversational column may also contain a JSON-encoded
+message list. Every column is decoded and validated before rendering; native tool
+calls and other message fields are preserved. Plain-text `prompt`/`completion`
+strings are not conversational lists and require a custom formatter. Malformed JSON
+or message structures raise a schema error rather than being passed to the template.
 
 During data processing, MaxText converts these into a unified `messages` schema (OpenAI-like format) before feeding it to the tokenizer:
 

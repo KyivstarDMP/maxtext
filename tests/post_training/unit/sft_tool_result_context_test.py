@@ -1052,7 +1052,8 @@ def test_deferred_tool_context_and_pins_match_the_complete_round(monkeypatch, ro
     assert full_ids[: len(pin_ids)] == pin_ids
 
 
-def test_hf_prompt_completion_columns_preserve_native_tool_calls(monkeypatch):
+@pytest.mark.parametrize("streaming", [False, True])
+def test_hf_prompt_completion_columns_preserve_native_tool_calls(monkeypatch, streaming):
   import datasets  # pylint: disable=import-outside-toplevel
 
   class _BuiltinToolTokenizer(_PrefixStableToolTokenizer):
@@ -1070,10 +1071,12 @@ def test_hf_prompt_completion_columns_preserve_native_tool_calls(monkeypatch):
   dataset = datasets.Dataset.from_dict(
       {"prompt": [json.dumps(messages[::2])], "completion": [json.dumps(messages[1::2])]}
   )
+  if streaming:
+    dataset = dataset.to_iterable_dataset()
   monkeypatch.setattr(hf_data_processing.transformers.AutoTokenizer, "from_pretrained", lambda *args, **kwargs: tokenizer)
 
   def _check_before_batching(formatted, *args, **kwargs):
-    actual = [token for run in formatted[0]["messages"] for token in run]
+    actual = [token for run in next(iter(formatted))["messages"] for token in run]
     expected = tokenizer.apply_chat_template(
         messages, add_generation_prompt=False, tokenize=True, enable_thinking=True, tools=TOOLS
     )
@@ -1084,6 +1087,96 @@ def test_hf_prompt_completion_columns_preserve_native_tool_calls(monkeypatch):
 
   monkeypatch.setattr(input_pipeline_utils, "HFDataSource", _check_before_batching)
   with pytest.raises(RuntimeError, match="verified native tool columns"):
+    hf_data_processing.preprocessing_pipeline(
+        dataloading_host_index=0,
+        dataloading_host_count=1,
+        global_mesh=SimpleNamespace(size=1),
+        dataset=dataset,
+        config=SimpleNamespace(elastic_enabled=False),
+        data_column_names=["prompt", "completion"],
+        tokenize=True,
+        tokenizer_path="synthetic-tokenizer",
+        hf_access_token=None,
+        global_batch_size=1,
+        max_target_length=4096,
+        shuffle=False,
+        data_shuffle_seed=0,
+        use_sft=True,
+        chat_template="synthetic template",
+    )
+
+
+@pytest.mark.parametrize("column", ["prompt", "completion"])
+@pytest.mark.parametrize(
+    "invalid",
+    [
+        "Question",
+        "[invalid",
+        '"text"',
+        "42",
+        "null",
+        '{"role": "user", "content": "text"}',
+        "[]",
+        '["text"]',
+        '[{"content": "text"}]',
+        '[{"role": "user"}]',
+        '[{"role": 1, "content": "text"}]',
+        '[{"role": "", "content": "text"}]',
+        '[{"role": "user", "content": 42}]',
+        None,
+        ["text"],
+    ],
+)
+def test_hf_sft_schema_validates_each_column(column, invalid):
+  row = {
+      "prompt": [{"role": "user", "content": "question"}],
+      "completion": [{"role": "assistant", "content": "answer"}],
+  }
+  row[column] = invalid
+  with pytest.raises(ValueError, match=f"Invalid HF SFT column '{column}'"):
+    hf_data_processing._decode_and_validate_sft_columns(row, ["prompt", "completion"])
+
+
+@pytest.mark.parametrize("serialized", [False, True])
+def test_hf_sft_schema_preserves_native_message_fields(serialized):
+  conversation = [
+      {"role": "user", "content": "question"},
+      {
+          "role": "assistant",
+          "tool_calls": [{"type": "function", "function": {"name": "lookup", "arguments": {"query": "x"}}}],
+          "reasoning_content": "look this up",
+      },
+      {"role": "tool", "content": "result", "tool_call_id": "call-1"},
+      {"role": "assistant", "content": None, "tool_calls": [{"function": {"name": "finish"}}]},
+  ]
+  row = {"messages": json.dumps(conversation) if serialized else conversation, "tools": TOOLS}
+  result = hf_data_processing._decode_and_validate_sft_columns(row, ["messages"])
+  assert result == {"messages": conversation}
+  assert row["tools"] == TOOLS
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+def test_hf_pipeline_reports_invalid_second_column_before_rendering(monkeypatch, streaming):
+  import datasets  # pylint: disable=import-outside-toplevel
+
+  tokenizer = _PrefixStableToolTokenizer()
+  tokenizer.pad_token_id = 0
+  dataset = datasets.Dataset.from_dict(
+      {"prompt": [[{"role": "user", "content": "question"}]], "completion": ['{"not": "a conversation"}']}
+  )
+  if streaming:
+    dataset = dataset.to_iterable_dataset()
+  monkeypatch.setattr(hf_data_processing.transformers.AutoTokenizer, "from_pretrained", lambda *args, **kwargs: tokenizer)
+
+  def must_not_render(*args, **kwargs):
+    pytest.fail("Malformed input reached the renderer")
+
+  def consume(formatted, *args, **kwargs):
+    next(iter(formatted))
+
+  monkeypatch.setattr(input_pipeline_utils, "apply_chat_template", must_not_render)
+  monkeypatch.setattr(input_pipeline_utils, "HFDataSource", consume)
+  with pytest.raises(ValueError, match="Invalid HF SFT column 'completion'"):
     hf_data_processing.preprocessing_pipeline(
         dataloading_host_index=0,
         dataloading_host_count=1,

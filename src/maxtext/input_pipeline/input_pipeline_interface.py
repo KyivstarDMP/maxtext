@@ -104,7 +104,11 @@ def _validate_per_dataset_names(config: pyconfig.HyperParameters) -> None:
 
 def validate_post_train_data_options(config: pyconfig.HyperParameters) -> None:
   """Reject dataset attribution options unsupported by the Tunix consumers."""
-  if getattr(config, "per_dataset_metrics", False) or getattr(config, "per_dataset_eval_files", ""):
+  if (
+      getattr(config, "per_dataset_metrics", False)
+      or getattr(config, "per_dataset_eval_files", "")
+      or getattr(config, "per_dataset_eval_names", "")
+  ):
     raise ValueError(
         "Per-dataset metrics and named evaluation require maxtext.trainers.pre_train.train; "
         "Tunix post-training does not support these options."

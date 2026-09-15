@@ -133,9 +133,12 @@ def test_supported_configs_reach_iterator_builders(overrides, named_eval):
     assert not eval_data.call_args.kwargs
 
 
-@pytest.mark.parametrize("overrides", [{"per_dataset_metrics": True}, {"per_dataset_eval_files": "eval*"}])
+@pytest.mark.parametrize(
+    "overrides",
+    [{"per_dataset_metrics": True}, {"per_dataset_eval_files": "eval*"}, {"per_dataset_eval_names": "eval"}],
+)
 def test_tunix_rejects_metrics_and_named_eval_at_both_entry_points(overrides):
-  config = _config(per_dataset_metrics=False, per_dataset_eval_files="")
+  config = _config(per_dataset_metrics=False, per_dataset_eval_files="", per_dataset_eval_names="")
   for name, value in overrides.items():
     setattr(config, name, value)
   with mock.patch.object(hooks, "create_data_iterator") as access:
@@ -147,7 +150,7 @@ def test_tunix_rejects_metrics_and_named_eval_at_both_entry_points(overrides):
 
 
 def test_tunix_defaults_still_reach_data_hooks():
-  config = _config(per_dataset_metrics=False, per_dataset_eval_files="")
+  config = _config(per_dataset_metrics=False, per_dataset_eval_files="", per_dataset_eval_names="")
   train_sft.validate_config(config)
   with (
       mock.patch.object(hooks, "create_data_iterator", return_value=(object(), None)) as access,

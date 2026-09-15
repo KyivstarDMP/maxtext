@@ -44,6 +44,44 @@ def _get_pad_id(tokenizer):
   return pad_id
 
 
+def _decode_and_validate_sft_columns(example: dict, data_columns: list[str]) -> dict:
+  """Decode conversational columns and validate every row before Arrow infers its schema."""
+  decoded = {}
+  for column in data_columns:
+    messages = example.get(column)
+    diagnostic = (
+        f"Invalid HF SFT column {column!r}: expected a nonempty list of message objects "
+        "or a JSON-encoded message list. Plain-text prompt/completion columns require a custom formatter."
+    )
+    if isinstance(messages, str):
+      try:
+        messages = json.loads(messages)
+      except json.JSONDecodeError as error:
+        raise ValueError(diagnostic) from error
+    if not isinstance(messages, list) or not messages:
+      raise ValueError(diagnostic)
+    for index, message in enumerate(messages):
+      if (
+          not isinstance(message, dict)
+          or not isinstance(message.get("role"), str)
+          or not message["role"]
+          or not (
+              "content" in message
+              or (
+                  message["role"] == "assistant" and isinstance(message.get("tool_calls"), list) and message["tool_calls"]
+              )
+          )
+          or (message.get("content") is not None and not isinstance(message["content"], str))
+      ):
+        raise ValueError(
+            f"{diagnostic} Message {index} must have a nonempty string role and text/null content "
+            "(content may be omitted for assistant tool calls)."
+        )
+    # Keep native tool_calls, reasoning and other template-specific fields intact.
+    decoded[column] = messages
+  return decoded
+
+
 def _get_training_objective_transform(
     config: ml_collections.ConfigDict,
     *,
@@ -424,17 +462,9 @@ def preprocessing_pipeline(
         formatting_func_path=formatting_func_path,
         formatting_func_kwargs=formatting_func_kwargs,
     )
-    # Deserialize JSON string columns if needed
-    _json_deserialized = False
-    for col in data_column_names:
-      if isinstance(dataset.features.get(col), datasets.Value) and dataset.features[col].dtype == "string":
-        dataset = dataset.map(lambda x, c=col: {c: json.loads(x[c]) if isinstance(x[c], str) else x[c]})
-        _json_deserialized = True
-
-    if not _json_deserialized:
-      assert input_pipeline_utils.is_conversational(
-          dataset.features, data_column_names
-      ), "Dataset is not in conversational format."
+    # Validate every primary column, including decoded values and streaming rows
+    # whose feature metadata may be absent. Auxiliary tools stay separate.
+    dataset = dataset.map(_decode_and_validate_sft_columns, fn_kwargs={"data_columns": data_column_names})
 
     if len(data_column_names) > 1:
       combined_column_name = "messages"
