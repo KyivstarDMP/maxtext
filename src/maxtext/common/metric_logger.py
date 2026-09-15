@@ -206,7 +206,7 @@ class MetricLogger:
     # Key layout is `per_dataset_train_<type>/<name>`: W&B groups panels into sections by the FIRST '/'
     # segment (default "group by first prefix"), so putting the metric type in that segment gives one
     # section per (split, type) — per_dataset_train_loss / _accuracy / _tokens — each holding one panel
-    # per dataset. TensorBoard groups on the same prefix. See docs/012.
+    # per dataset. TensorBoard groups on the same prefix.
     for i, name in enumerate(names, start=1):
       t = float(tk_w[i])
       scalar[f"per_dataset_train_tokens/{name}"] = t
@@ -223,7 +223,7 @@ class MetricLogger:
 
     The metric type is the FIRST '/' segment (`per_dataset_eval_loss/<name>`, not
     `per_dataset_eval/loss/<name>`) so W&B — which groups panels into sections by the first prefix —
-    puts one section per (split, type), each holding one panel per dataset. See docs/012.
+    puts one section per (split, type), each holding one panel per dataset.
     """
     scalar = {}
     for name, (xent_sum, tokens, correct) in per_dataset_eval.items():
@@ -244,7 +244,7 @@ class MetricLogger:
     # This method runs before the matching train step's buffered flush. Defer W&B emission until the
     # previous train point is flushed, then accumulate these scalars at the current train step with
     # commit=False; the train metrics commit the combined W&B history row. TB/local/GCS are
-    # order-independent, so they stay here. See docs/012.
+    # order-independent, so they stay here.
     if scalar:
       self._pending_per_dataset_eval_wandb = (dict(scalar), step)
 

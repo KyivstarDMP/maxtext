@@ -173,7 +173,7 @@ class MultiHostDataLoadIterator:
       return jtu.tree_map(lambda x: jnp.full_like(x, 0), self.last_local_data)
     # Host received zero real batches (empty strided shard). Seed an all-zero local batch of the known column
     # shapes so this host still issues a collective in lockstep with its peers. Zero targets_segmentation =>
-    # contributes 0 to loss and token weights (see docs/012).
+    # contributes 0 to loss and token weights.
     if self.padding_batch_template is not None:
       return jtu.tree_map(lambda x: np.zeros(x.shape, x.dtype), self.padding_batch_template)
     raise ValueError("last_local_data is None and no padding_batch_template provided, cannot make padding batch.")

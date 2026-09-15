@@ -241,7 +241,11 @@ Use text SFT with `use_sft=true`, `dataset_type=grain`, and
 `grain_file_type=arrayrecord`. Set nonempty, unique `per_dataset_names` in the
 same order and count as the training mixture; names must match
 `[A-Za-z0-9][A-Za-z0-9_.-]*`. Separate named evaluation passes additionally need
-aligned `per_dataset_eval_names` and `grain_eval_files`.
+aligned `per_dataset_eval_names` and `per_dataset_eval_files`, and `eval_steps > 0`.
+Dataset metrics require `packing=true` and do not support placeholder data hosts
+(`expansion_factor_real_data > 1`) or the Tunix post-training entry points.
+Named evaluation does not provide the aggregate `target_eval_loss` stopping rule;
+keep that threshold disabled when using separate dataset passes.
 
 The tiled helpers return loss, z-loss, per-dataset loss sums, and correct-token
 counts as a uniform four-tuple; callers can opt into a fifth, independently

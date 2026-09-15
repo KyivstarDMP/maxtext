@@ -134,6 +134,7 @@ def _dataset_metrics_config(**overrides):
       "per_dataset_metrics": True,
       "dataset_type": "grain",
       "use_sft": True,
+      "packing": True,
       "per_dataset_names": "first,second",
       "grain_train_files": "first/*.array_record,0.5;second/*.array_record,0.5",
       "grain_train_mixture_config_path": "",
@@ -147,6 +148,8 @@ def _dataset_metrics_config(**overrides):
       "max_target_length": 8,
       "expansion_factor_real_data": 1,
       "eval_interval": 1,
+      "eval_steps": 1,
+      "target_eval_loss": 0.0,
   }
   values.update(overrides)
   return SimpleNamespace(**values)

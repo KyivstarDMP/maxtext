@@ -174,6 +174,8 @@ def loss_fn(model, config, data, dropout_rng, params, sparsity_state=None, is_tr
   if config.per_dataset_metrics:
     if is_block_diffusion or (config.use_indexer and not config.indexer_sparse_training):
       raise ValueError("Per-dataset metrics are not supported for block diffusion or indexer warm-up.")
+    if is_train and "dataset_id" not in data:
+      raise ValueError("Per-dataset training metrics require a token-aligned dataset_id in the training batch.")
   if getattr(config, "attention_type", "global") == "block_diffusion" and not is_block_diffusion:
     raise ValueError(
         "Block-diffusion attention requires target-aligned block-diffusion losses; "
@@ -1060,7 +1062,7 @@ def training_loop_iteration(
       # FIXED `eval_steps` launches: the per-dataset iterators are built with force_padding_batch=True
       # (input_pipeline_interface.py), so next() never raises StopIteration and no host exits early.
       # All-zero padding batches have targets_segmentation==0 -> contribute 0 to loss/weights/correct,
-      # so the metric is identical to a real-only pass (see docs/012).
+      # so the metric is identical to a real-only pass.
       assert eval_steps > 0, (
           "per_dataset_metrics Option B requires eval_steps > 0: the per-dataset iterators pad "
           "indefinitely (force_padding_batch), so eval_steps is what bounds each dataset pass."

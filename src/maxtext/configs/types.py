@@ -1631,10 +1631,6 @@ class Tokenizer(BaseModel):
       True,
       description="If False, use chunking for long sequences instead of truncation.",
   )
-  num_vocab_tiling: int = Field(
-      1,
-      description="Enables memory-saving optimization by tiling cross-entropy loss computation. >1 to enable.",
-  )
 
 
 class DatasetGeneral(BaseModel):
@@ -4885,9 +4881,17 @@ class MaxTextConfig(
             "grain_train_mixture_config_path, use hf_path with grain_file_type=parquet, or use dataset_path, "
             "dataset_name, and train_split with grain_file_type=tfrecord."
         )
-      if self.eval_interval > 0 and not self.grain_eval_files and not use_hf_parquet and not use_tfds_tfrecord_eval:
+      named_eval = self.per_dataset_metrics and bool(self.per_dataset_eval_files)
+      if (
+          self.eval_interval > 0
+          and not self.grain_eval_files
+          and not named_eval
+          and not use_hf_parquet
+          and not use_tfds_tfrecord_eval
+      ):
         raise ValueError(
-            "Please specify grain_eval_files, use hf_path with grain_file_type=parquet, or use dataset_path, "
+            "Please specify grain_eval_files, named per_dataset_eval_files with per_dataset_metrics, "
+            "use hf_path with grain_file_type=parquet, or use dataset_path, "
             "eval_dataset_name, and eval_split with grain_file_type=tfrecord; otherwise set eval_interval to <=0."
         )
     elif self.dataset_type == DatasetType.TFDS:

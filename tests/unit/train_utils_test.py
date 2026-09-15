@@ -122,6 +122,17 @@ class TestReorderedDataIterator(unittest.TestCase):
       self.assertIs(wrapped.data_iterator, inner)
     self.assertEqual(next(view[1]), 20)
 
+  def test_named_eval_reorders_and_resets_each_iterator(self):
+    inners = {"first": _FakeIterator([1]), "second": _FakeIterator([2])}
+    view = train_utils._reorder_data_iterator_for_loader(lambda batch: batch * 10, inners)
+    self.assertEqual(list(view), ["first", "second"])
+    self.assertEqual({name: next(iterator) for name, iterator in view.items()}, {"first": 10, "second": 20})
+    for name, iterator in view.items():
+      self.assertIs(iterator.data_iterator, inners[name])
+      iterator.reset()
+      self.assertEqual(inners[name].reset_calls, 1)
+    self.assertEqual({name: next(iterator) for name, iterator in view.items()}, {"first": 10, "second": 20})
+
   def test_grain_checkpoint_round_trip_through_reorder_view(self):
     """Batches consumed through the view advance the saved Grain state, and an
     in-place restore is visible through a view built before the restore."""

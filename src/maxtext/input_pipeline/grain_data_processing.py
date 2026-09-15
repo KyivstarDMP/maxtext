@@ -1143,7 +1143,7 @@ def make_grain_eval_iterator(
   ``force_padding_batch`` (per_dataset_metrics Option B): force the multi-host iterator to pad instead of
   raising StopIteration, so every host issues an identical (fixed) number of eval collectives even when a
   small per-dataset split does not divide evenly across hosts. Without this, a short host exits early and
-  the SPMD launch groups diverge (E0200). See docs/012.
+  the SPMD launch groups diverge (E0200).
   """
   assert (
       config.global_batch_size_to_load_eval % global_mesh.size == 0
@@ -1225,17 +1225,17 @@ def make_grain_eval_iterator(
   # A multimodal split with an empty host would need image columns too, so fail fast at setup.
   assert not (force_padding_batch and config.use_multimodal), (
       "per_dataset_metrics Option B (force_padding_batch) is not supported for multimodal eval: the "
-      "zero-data-host padding template covers text columns only (see docs/012)."
+      "zero-data-host padding template covers text columns only."
   )
 
   # Zero-batch template for a host whose strided eval shard is EMPTY (a split with fewer records than
   # dataloading hosts): it has no real batch to clone, so _make_padding_batch would otherwise ValueError.
   # These are exactly the six int32 columns a *text* eval batch carries: the two data columns plus their
   # _position/_segmentation, packed to (local batch, max_target_length). stamp_dataset_id=False for eval, so
-  # there is no dataset_id column. Left None for multimodal (pre-existing generate_padding_batch_eval path),
-  # which preserves the prior clone-last-batch behavior.
+  # there is no dataset_id column. Other eval paths keep the prior clone-last-batch behavior:
+  # DPO and offline distillation have different batch fields and cannot use this text template.
   padding_batch_template = None
-  if use_padding and not config.use_multimodal:
+  if force_padding_batch and not config.use_multimodal:
     local_bs = data_processing_utils.get_local_batch_size(config)
     seq = config.max_target_length
     padding_batch_template = {
