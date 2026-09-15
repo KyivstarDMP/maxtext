@@ -251,3 +251,32 @@ def test_empty_host_padding_template_is_specific_to_named_eval(force_padding, us
     padding = iterator._make_padding_batch()  # pylint: disable=protected-access
     assert set(padding) == {"different_schema"}
     np.testing.assert_array_equal(padding["different_schema"], np.zeros((1, 3), dtype=np.float32))
+
+
+@pytest.mark.parametrize(
+    "padding,epochs,hosts,warning",
+    [(False, 1, 2, True), (True, 1, 2, False), (False, None, 2, False), (False, 1, 1, False)],
+)
+def test_finite_window_warning_does_not_consume_or_reset_iterator(padding, epochs, hosts, warning):
+  config = _config(
+      per_dataset_metrics=False,
+      sft_long_example_handling="window",
+      num_epoch=epochs,
+      generate_padding_batch_train=padding,
+      eval_interval=0,
+  )
+  with (
+      mock.patch.object(input_pipeline_interface, "get_process_loading_real_data", return_value=list(range(hosts))),
+      mock.patch.object(input_pipeline_interface.jax, "process_index", return_value=0),
+      mock.patch.object(input_pipeline_interface, "make_grain_train_iterator") as build,
+      mock.patch.object(input_pipeline_interface.max_logging, "warning") as warn,
+  ):
+    iterator, _ = input_pipeline_interface.create_data_iterator(config, object())
+  assert iterator is build.return_value
+  iterator.__next__.assert_not_called()
+  iterator.__iter__.assert_not_called()
+  iterator.reset.assert_not_called()
+  assert warn.call_count == int(warning)
+  if warning:
+    assert "Startup does not measure this capacity" in warn.call_args.args[0]
+    assert "does not provide coordinated exhaustion" in warn.call_args.args[0]

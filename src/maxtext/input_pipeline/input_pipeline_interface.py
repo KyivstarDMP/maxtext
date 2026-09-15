@@ -205,6 +205,21 @@ def create_data_iterator(config: pyconfig.HyperParameters, mesh):
       config.max_target_length,
       mesh,
   )
+  if (
+      config.dataset_type == "grain"
+      and getattr(config, "use_sft", False)
+      and getattr(config, "sft_long_example_handling", "truncate") == "window"
+      and getattr(config, "num_epoch", None) is not None
+      and config.num_epoch > 0
+      and not getattr(config, "generate_padding_batch_train", False)
+      and len(process_indices_train) > 1
+  ):
+    max_logging.warning(
+        "Finite multi-host SFT windowing without training padding can exhaust one host before others. "
+        "Independently preflight the minimum available batches across data-loading hosts after rendering, "
+        "windowing, packing and resume, and ensure it covers the planned batch calls. Startup does not "
+        "measure this capacity; this warning does not provide coordinated exhaustion."
+    )
   output_train_iterator = create_process_specific_iterator(config, mesh, process_indices_train, train_iterator)
   if config.expansion_factor_real_data > 1:  # assert number of hosts loading real data
     assert len(process_indices_train) == jax.process_count() // config.expansion_factor_real_data

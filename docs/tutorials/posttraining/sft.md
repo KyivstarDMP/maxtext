@@ -208,8 +208,16 @@ at its common prefix with the generation prompt. Speculative prompt suffixes
 absent from the actual response are therefore excluded, including after an
 interrupted tool round. Original token IDs still flow downstream unchanged.
 Previously emitted tool/history tokens must remain an exact prefix; a template
-that changes them is rejected. Rows ending in an unemitted user message are
+that changes them is rejected. The completed context before an assistant must
+also remain an exact token prefix of both renders; divergence is allowed only
+after that context, in the assistant prefill. Unsafe context rewrites raise
+without changing the split of accepted rows. Rows ending in an unemitted user message are
 also rejected; the data producer must trim dangling tails before training.
+
+An absent tools column and an empty tools list (including JSON `"[]"`) both
+mean no declarations; the template receives no `tools` argument in either case.
+When leading-context pinning is requested, every accepted row must produce a
+nonempty exact pin, including rows with a leading message but no user turn.
 
 `sft_preserve_thinking=auto` omits the preservation argument in segmented mode
 and follows each row's thinking value in canonical mode. An explicit boolean

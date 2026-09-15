@@ -100,7 +100,24 @@ completion's turn terminator.
 `sft_window_max_fan_out` is counted per example across **all** of its
 completion segments, not per completion. When the cap is reached the transform
 returns the records already produced and logs how many trailing completion
-tokens, potentially including a terminator, were dropped.
+tokens were dropped across the whole remaining example, including later
+completion segments and their terminators.
+
+## Multi-host capacity
+
+Finite multi-host windowing without training padding produces a startup warning.
+Different host shards can produce different numbers of windows and packed
+batches. If one host exhausts before the planned batch calls, collective calls
+can diverge. The warning documents this risk; it does not coordinate exhaustion.
+
+Preflight the minimum available **batches** across data-loading hosts, accounting
+for rendering, windowing, mixtures, packing, batch geometry and resume position.
+An exact equal-host schedule or an independently verified capacity estimate can
+establish that every host has enough batches. A raw-row percentage margin is
+not a general guarantee. Startup does not render the corpus, measure capacity,
+or consume/reset the live iterator to obtain counts. Keep this measurement in a
+separate preflight or source-bound receipt. Elastic Grain iteration with
+windowing is currently rejected.
 
 ## Leading-context pinning
 

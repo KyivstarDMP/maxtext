@@ -433,14 +433,12 @@ def preprocessing_pipeline(
 
     if len(data_column_names) > 1:
       combined_column_name = "messages"
-      dataset_features = datasets.Features(
-          {combined_column_name: [{"content": datasets.Value(dtype="string"), "role": datasets.Value(dtype="string")}]}
-      )
+      # Let Arrow infer the combined schema: narrowing it to role/content drops
+      # native tool_calls, reasoning fields and auxiliary tools declarations.
       dataset = dataset.map(
           input_pipeline_utils.combine_columns,
           fn_kwargs={"columns": data_column_names, "data_column": combined_column_name},
           remove_columns=data_column_names,
-          features=dataset_features,
       )
       data_column_names = [combined_column_name]
 

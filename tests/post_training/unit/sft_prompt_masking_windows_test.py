@@ -383,3 +383,16 @@ if __name__ == "__main__":
       fn()
       print(f"PASS {name}")
   print("ALL PASS")
+
+
+def test_fanout_drop_count_includes_later_completions(monkeypatch):
+  logs = []
+  monkeypatch.setattr(input_pipeline_utils.max_logging, "log", logs.append)
+  transform = SFTPromptMaskingWindows("text", completion_only=True, max_target_length=8, unk_id=PAD, max_fan_out=1)
+  windows = transform.flat_map(
+      {"text": [[1, 2], list(range(100, 110)), [3, 4], list(range(200, 210))], "is_prompt": [True, False, True, False]}
+  )
+  assert len(windows) == 1
+  assert _loss_tokens(windows[0]) == list(range(100, 106))
+  assert len(logs) == 1
+  assert "dropping 14 remaining loss token(s)" in logs[0]
