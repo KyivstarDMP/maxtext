@@ -301,11 +301,12 @@ def test_missing_metric_numerators_do_not_become_successful_zeros(missing):
     train._assemble_per_dataset_aux(config, data, loss, correct)  # pylint: disable=protected-access
 
 
-def test_dataset_logger_uses_token_weighted_sums_and_omits_absent_values():
+@pytest.mark.parametrize("period", [2, 0, -1])
+def test_dataset_logger_uses_token_weighted_sums_and_omits_absent_values(period):
   from maxtext.common.metric_logger import MetricLogger  # pylint: disable=import-outside-toplevel
 
   logger = MetricLogger.__new__(MetricLogger)
-  logger.config = SimpleNamespace(per_dataset_log_period=2, log_period=1, steps=3, per_dataset_names="a,b,absent")
+  logger.config = SimpleNamespace(per_dataset_log_period=period, log_period=2, steps=3, per_dataset_names="a,b,absent")
   logger._per_dataset_accum = None  # pylint: disable=protected-access
   first = {
       "scalar": {},
@@ -336,3 +337,43 @@ def test_dataset_logger_uses_token_weighted_sums_and_omits_absent_values():
       "per_dataset_train_tokens/absent": 0.0,
   }
   assert logger._per_dataset_accum is None  # pylint: disable=protected-access
+  final = {
+      "scalar": {},
+      "per_dataset": {
+          "xent_sum_by_ds": np.array([999.0, 14.0, 0.0, 0.0]),
+          "correct_by_ds": np.array([999, 1, 0, 0]),
+          "token_count_by_ds": np.array([999, 2, 0, 0]),
+      },
+  }
+  logger._expand_per_dataset_train(final, 2)  # pylint: disable=protected-access
+  assert final["scalar"] == {
+      "per_dataset_train_tokens/a": 2.0,
+      "per_dataset_train_loss/a": 7.0,
+      "per_dataset_train_accuracy/a": 0.5,
+      "per_dataset_train_tokens/b": 0.0,
+      "per_dataset_train_tokens/absent": 0.0,
+  }
+  assert logger._per_dataset_accum is None  # pylint: disable=protected-access
+
+
+def test_named_eval_reports_literal_loss_accuracy_and_perplexity():
+  from maxtext.common.metric_logger import MetricLogger  # pylint: disable=import-outside-toplevel
+
+  logger = MetricLogger.__new__(MetricLogger)
+  logger.config = SimpleNamespace(enable_tensorboard=True, metrics_file="", gcs_metrics=False)
+  with mock.patch.object(logger, "write_metrics_to_tensorboard") as write:
+    logger.write_per_dataset_eval({"first": (6.0, 3, 2), "absent": (0.0, 0, 0), "no_accuracy": (3.0, 2, None)}, 9)
+  write.assert_called_once()
+  assert write.call_args.args[1:] == (9, "eval")
+  assert write.call_args.args[0]["scalar"] == pytest.approx(
+      {
+          "per_dataset_eval_tokens/first": 3.0,
+          "per_dataset_eval_loss/first": 2.0,
+          "per_dataset_eval_accuracy/first": 0.6666666666666666,
+          "per_dataset_eval_perplexity/first": 7.38905609893065,
+          "per_dataset_eval_tokens/absent": 0.0,
+          "per_dataset_eval_tokens/no_accuracy": 2.0,
+          "per_dataset_eval_loss/no_accuracy": 1.5,
+          "per_dataset_eval_perplexity/no_accuracy": 4.4816890703380645,
+      }
+  )

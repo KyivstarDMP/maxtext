@@ -1304,10 +1304,24 @@ def test_per_dataset_tiling_nnx_trainer_loss_and_gradients(tied, with_ids, is_tr
       return train.loss_fn(local, cfg, dict(data), None, None, is_train=is_train)
 
     with nn_partitioning.axis_rules(cfg.logical_axis_rules):
-      results.append(jax.jit(jax.value_and_grad(objective, has_aux=True))(params))
+      loss_and_grad = jax.jit(jax.value_and_grad(objective, has_aux=True))
+      if is_train and not with_ids and metrics:
+        with pytest.raises(ValueError, match="token-aligned dataset_id"):
+          loss_and_grad(params)
+      else:
+        results.append(loss_and_grad(params))
   for first, second, third in zip(*(jax.tree_util.tree_leaves(p) for p in parameter_snapshots), strict=True):
     np.testing.assert_array_equal(first, second)
     np.testing.assert_array_equal(first, third)
+  if is_train and not with_ids:
+    # Both metrics-enabled paths reject missing IDs; metrics-off training works.
+    assert len(results) == 1
+    (loss, aux), grads = results[0]
+    assert np.isfinite(loss)
+    assert int(aux["total_weights"]) == int(mask.sum())
+    assert "per_dataset" not in aux
+    assert all(np.isfinite(leaf).all() for leaf in jax.tree_util.tree_leaves(grads))
+    return
   (reference_loss, reference_aux), reference_grads = results[0]
   for (loss, aux), grads in results[1:]:
     np.testing.assert_allclose(loss, reference_loss, rtol=3e-5, atol=2e-6)

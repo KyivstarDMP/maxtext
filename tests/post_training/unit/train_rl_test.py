@@ -622,7 +622,7 @@ class TokenizerChatTemplateTest(unittest.TestCase):
     mock_load.return_value = "{% for message in messages %}{{ message.content }}{% endfor %}"
     trainer_config = SimpleNamespace(
         chat_template=None,
-        chat_template_path="/path/to/jinja_template.json",
+        chat_template_path="hf://example/model/jinja_template.json",
         chat_template_revision=TEST_REVISION,
         chat_template_sha256="a" * 64,
         hf_access_token="test-token",
@@ -630,7 +630,7 @@ class TokenizerChatTemplateTest(unittest.TestCase):
     )
     train_rl.configure_tokenizer_chat_template(mock_tokenizer, trainer_config)
     mock_load.assert_called_once_with(
-        "/path/to/jinja_template.json",
+        "hf://example/model/jinja_template.json",
         hf_access_token="test-token",
         revision=TEST_REVISION,
         expected_sha256="a" * 64,

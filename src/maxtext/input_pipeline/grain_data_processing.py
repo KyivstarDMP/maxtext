@@ -652,6 +652,12 @@ def _configure_sft_chat_template(config, data_columns, tokenizer_model, tokenize
   """Load an optional template file and validate the selected Grain SFT mode."""
   chat_template = getattr(config, "chat_template", None)
   chat_template_path = getattr(config, "chat_template_path", "")
+  instruction_data_processing.validate_chat_template_pins(
+      chat_template,
+      chat_template_path,
+      getattr(config, "chat_template_revision", ""),
+      getattr(config, "chat_template_sha256", ""),
+  )
   if not chat_template and chat_template_path:
     chat_template = instruction_data_processing.load_chat_template_from_file(
         chat_template_path,

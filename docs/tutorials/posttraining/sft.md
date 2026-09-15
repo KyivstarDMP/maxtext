@@ -160,6 +160,22 @@ chat_template_path: hf://example-org/example-model/templates/training.jinja
 chat_template_revision: <40_HEX_COMMIT>
 ```
 
+Pinning is opt-in; empty revision fields remain unpinned. The configured
+`tokenizer_revision` is honored by Hugging Face tokenizer loads in the text,
+multimodal, TFDS/C4, DPO pad-ID and distillation pad-ID paths. Local SentencePiece
+and tiktoken loaders reject a nonempty Hub revision. Template pins require a
+selected `chat_template_path`: an inline template or an absent path cannot
+silently bypass them. Local template files support a SHA-256 check, while a
+template revision applies only to a Hub path. RL preserves a tokenizer's
+existing template and rejects configured template pins that this would bypass.
+
+Migration notes: SFT now explicitly passes `enable_thinking=True` by default,
+where older configurations could omit the argument. Check the rendered tokens
+when a template distinguishes omission from true; set the desired thinking
+policy explicitly. In the Grain/HF text-SFT paths, a configured template path
+that cannot be loaded now fails startup instead of silently falling back to a
+tokenizer-provided template.
+
 ### Canonical token ownership for completion-only SFT
 
 The tokenized Grain pipeline also supports an opt-in canonical mode. It renders
@@ -242,7 +258,8 @@ between one canonical training history and online generation prefixes, see
 When training formatted SFT data through `maxtext.trainers.pre_train.train`,
 `per_dataset_metrics=true` reports loss and next-token accuracy over the
 supervised tokens. NNX supports these metrics with and without vocabulary
-tiling. The retained Linen path is covered by CPU tests only. Per-dataset loss
+tiling. TPU validation covered the tiled NNX path; the non-tiled NNX and retained
+Linen paths are covered by CPU tests. Per-dataset loss
 includes the configured z-loss, matching `learning/lm_loss` on both paths.
 
 Use text SFT with `use_sft=true`, `dataset_type=grain`, and

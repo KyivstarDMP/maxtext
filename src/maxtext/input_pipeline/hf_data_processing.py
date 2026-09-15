@@ -212,6 +212,7 @@ def vision_sft_preprocessing_pipeline(
       add_eos_token=False,
       legacy=False,
       token=config.hf_access_token,
+      revision=getattr(config, "tokenizer_revision", "") or None,
       extra_special_tokens={},
   )
   pad_id = _get_pad_id(tokenizer)
@@ -349,6 +350,10 @@ def preprocessing_pipeline(
     raise ValueError(
         "sft_enable_thinking_column is currently supported only by the Grain SFT pipeline; "
         "use the constant sft_enable_thinking setting for HF SFT."
+    )
+  if use_sft:
+    instruction_data_processing.validate_chat_template_pins(
+        chat_template, chat_template_path, chat_template_revision, chat_template_sha256
     )
   if use_sft and not chat_template and chat_template_path:
     chat_template = instruction_data_processing.load_chat_template_from_file(

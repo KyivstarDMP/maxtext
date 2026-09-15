@@ -600,7 +600,17 @@ class MetricLogger:
     if not hasattr(self, "_text_tokenizer"):
       from maxtext.input_pipeline import data_processing_utils  # pylint: disable=import-outside-toplevel
 
-      self._text_tokenizer, _ = data_processing_utils.get_tokenizer_and_pad_id(self.config)
+      # Cache failure as None so an unavailable tokenizer is reported once.
+      self._text_tokenizer = None
+      if getattr(self.config, "dataset_type", "") == "hf":
+        # The HF input pipeline always selects AutoTokenizer, including configs
+        # whose tokenizer_type still has the SentencePiece default.
+        overrides = {"tokenizer_type": "huggingface"}
+        if getattr(self.config, "use_sft", False):
+          overrides.update(add_bos=False, add_eos=False)
+        self._text_tokenizer, _ = data_processing_utils.get_tokenizer_and_pad_id(self.config, **overrides)
+      else:
+        self._text_tokenizer, _ = data_processing_utils.get_tokenizer_and_pad_id(self.config)
     return self._text_tokenizer
 
   @staticmethod
@@ -633,10 +643,11 @@ class MetricLogger:
     if jax.process_index() != 0:
       return
 
-    max_logging.log(f"[TextSample] Logging text samples at step {step} (period={self.config.log_text_period})...")
-
     try:
       tokenizer = self._get_tokenizer()
+      if tokenizer is None:
+        return
+      max_logging.log(f"[TextSample] Logging text samples at step {step} (period={self.config.log_text_period})...")
       num_tokens = self.config.log_text_num_tokens
 
       def _to_numpy(array):
@@ -651,6 +662,9 @@ class MetricLogger:
       targets = _to_numpy(batch["targets"])
       inputs_segmentation = _to_numpy(batch["inputs_segmentation"])
       targets_segmentation = _to_numpy(batch["targets_segmentation"])
+      local_length = inputs.shape[-1]
+      global_length = batch["inputs"].shape[-1]
+      fragment = local_length < global_length
       num_samples = min(self.config.log_text_num_samples, inputs.shape[0])
       tensorboard_parts = []
 
@@ -672,6 +686,10 @@ class MetricLogger:
           else:
             label = f"Step {step} | sample {sample_index}"
             heading = f"### Sample {sample_index}"
+          if fragment:
+            scope = f"local sequence fragment ({local_length} of {global_length} sequence positions)"
+            label += f" | {scope}"
+            heading += f" | {scope}"
 
           input_token_view, input_token_description = self._format_token_view(input_tokens, num_tokens)
           target_token_view, target_token_description = self._format_token_view(target_tokens, num_tokens)

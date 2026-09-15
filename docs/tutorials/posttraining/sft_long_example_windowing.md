@@ -136,10 +136,13 @@ native tool declarations. MaxText obtains it from `apply_chat_template` and
 requires it to be an exact token prefix of both the first prompt and the final
 formatted stream. It does not reconstruct the block from decoded text.
 
-When there is no explicit leading message, MaxText tries a tokenizer-generated
-empty developer block only as a render probe. The probe is not inserted into
-the source conversation. If that result is not an exact prefix, MaxText tries
-an exact BOS-only prefix; otherwise it fails.
+When there is no explicit leading message but nonempty native tools exist,
+MaxText renders an empty developer message to obtain the generated tools block.
+That complete block must be an exact prefix; there is no BOS-only fallback for
+tools declarations. When both the leading message and tools are absent (or the
+tools list is empty), MaxText tries an empty developer block as a render probe,
+then an exact BOS-only prefix if the probe is not a prefix; otherwise it fails.
+These probes are not inserted into the source conversation.
 
 Pinning changes a record only when the accumulated prefix exceeds the effective
 context cap. The replacement context is:

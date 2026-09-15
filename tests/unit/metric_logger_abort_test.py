@@ -20,6 +20,7 @@ from unittest import mock
 import numpy as np
 
 from maxtext.common.metric_logger import MetricLogger, MetadataKey
+from maxtext.utils import exceptions
 
 # pylint: disable=missing-function-docstring,protected-access
 
@@ -183,7 +184,39 @@ class MetricLoggerWandbTest(unittest.TestCase):
         metric_type="eval",
         wandb_commit=False,
     )
+    scalar = write_metrics.call_args.args[0]["scalar"]
+    self.assertAlmostEqual(scalar["eval/avg_loss"], 2.0, places=6)
+    self.assertAlmostEqual(scalar["eval/avg_perplexity"], 7.38905609893065, places=6)
+    for key in ("moe_lb_loss", "indexer_loss", "mtp_loss", "mtp_acceptance_rate_percent", "z_loss"):
+      self.assertEqual(scalar[f"eval/avg_{key}"], 0.0)
     self.assertEqual(logger._pending_eval_step_count, 0)
+
+  def test_final_eval_stops_only_when_target_loss_is_reached(self):
+    for threshold, should_stop in ((1.5, False), (2.5, True)):
+      with self.subTest(threshold=threshold):
+        logger = MetricLogger.__new__(MetricLogger)
+        logger.config = SimpleNamespace(target_eval_loss=threshold)
+        logger._pending_eval_step_count = 2
+        logger.cumulative_eval_metrics = {
+            "scalar": {
+                "eval/total_loss": 6.0,
+                "eval/total_weights": 3.0,
+                "eval/moe_lb_loss": 0.0,
+                "eval/indexer_loss": 0.0,
+                "eval/mtp_loss": 0.0,
+                "eval/mtp_acceptance_rate_percent": 0.0,
+                "eval/z_loss": 0.0,
+            }
+        }
+        with mock.patch.object(logger, "write_metrics") as write:
+          if should_stop:
+            with self.assertRaisesRegex(exceptions.StopTraining, "Target loss"):
+              logger._finalize_eval_metrics(11)
+          else:
+            logger._finalize_eval_metrics(11)
+        write.assert_called_once()
+        self.assertAlmostEqual(write.call_args.args[0]["scalar"]["eval/avg_loss"], 2.0, places=6)
+        self.assertEqual(logger._pending_eval_step_count, 0)
 
   def test_pending_per_dataset_eval_accumulates_without_committing(self):
     logger = MetricLogger.__new__(MetricLogger)

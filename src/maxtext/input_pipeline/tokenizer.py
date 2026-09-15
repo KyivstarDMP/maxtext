@@ -264,6 +264,10 @@ def build_tokenizer(
     tokenizer_revision=None,
 ):
   """Loads the tokenizer at `tokenizer_path`"""
+  if tokenizer_revision and tokenizer_type != "huggingface":
+    raise ValueError(
+        "tokenizer_revision requires tokenizer_type=huggingface; local tokenizer files do not use Hub revisions."
+    )
   max_logging.log(f"Tokenizer path: {tokenizer_path}")
   if tokenizer_type == "tiktoken":
     assert "tiktoken" in tokenizer_path, f"Invalid tokenizer type: {tokenizer_type} chosen for {tokenizer_path}"

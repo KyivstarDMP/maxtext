@@ -52,9 +52,11 @@ def normalize_features(x, column_name):
   return {"inputs": x[column_name], "targets": x[column_name]}
 
 
-def get_tokenizer(tokenizer_path, tokenizer_type, add_bos, add_eos, hf_access_token=None):
+def get_tokenizer(tokenizer_path, tokenizer_type, add_bos, add_eos, hf_access_token=None, tokenizer_revision=None):
   # Load tokenizer
-  tokenizer_model = tokenizer.build_tokenizer(tokenizer_path, tokenizer_type, add_bos, add_eos, hf_access_token)
+  tokenizer_model = tokenizer.build_tokenizer(
+      tokenizer_path, tokenizer_type, add_bos, add_eos, hf_access_token, tokenizer_revision
+  )
   return tokenizer_model
 
 
@@ -191,6 +193,11 @@ def prepare_text_for_image_fusion(example, column_name, config):
 def combine_columns(example, columns, data_column):
   """Combine columns such as 'prompt' and 'completion' for sft training"""
   assert len(columns) > 1
+  if len({len(example[column]) for column in columns}) != 1:
+    raise ValueError(
+        "Conversational prompt/completion columns must have equal message counts for pairwise interleaving. "
+        "Use one ordered messages column for unequal-length tool trajectories."
+    )
   combined = []
   for i in range(len(example[columns[0]])):
     for c in columns:

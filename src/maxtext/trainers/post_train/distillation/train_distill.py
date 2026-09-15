@@ -593,6 +593,7 @@ def build_training_components(
       add_bos=student_config.add_bos,
       add_eos=student_config.add_eos,
       hf_access_token=student_config.hf_access_token,
+      tokenizer_revision=getattr(student_config, "tokenizer_revision", "") or None,
   )
   pad_id = tok.pad_id if tok.pad_id is not None else 0
 
