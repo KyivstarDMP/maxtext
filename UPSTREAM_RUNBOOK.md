@@ -83,17 +83,60 @@ Do not merge `pr/abc` directly into `develop`. Transfer individual fixes; accept
 
 ## 5. Synchronize `develop` With Upstream
 
-Synchronize periodically, including after upstream PR acceptance. This is independent of feature development and PR preparation.
+Synchronize periodically, including after upstream PR acceptance. Prepare each sync on a dedicated branch for review and testing, starting from the latest fetched `origin/develop` to avoid including unpublished commits from local `develop`.
 
-```bash
-git fetch --multiple origin upstream
-git switch develop
-git merge --ff-only origin/develop
-git merge upstream/main
-```
+1. Create a `sync/` branch from the fork's current `develop`:
 
-Resolve conflicts and validate the updated custom version with automated checks and a representative training smoke test where practical. Publish through the normal internal process only after validation. Preserve upstream ancestry when integrating the result: do not squash the upstream synchronization or rebase `develop`.
+   ```bash
+   git fetch --multiple origin upstream
+   git switch -c sync/upstream-20260910 origin/develop
+   ```
 
-Keep earlier copied commits in history; upstream acceptance does not require reverting them. Identical edits normally merge without duplication. Validate review changes and custom adaptations even if the merge has no conflicts.
+2. Merge upstream into the sync branch:
+
+   ```bash
+   git merge upstream/main
+   ```
+
+3. Resolve conflicts, validate the updated custom version, and push.
+
+   After validation succeeds:
+
+   ```bash
+   git push -u origin sync/upstream-20260910
+   ```
+
+4. Open an internal PR targeting `develop` in `KyivstarDMP/maxtext`. In the prompted PR description, summarize the upstream changes, conflict resolutions, and validation results.
+
+   ```bash
+   gh pr create --repo KyivstarDMP/maxtext \
+     --base develop --head sync/upstream-20260910 \
+     --title "Sync upstream into develop (2026-09-10)"
+   ```
+
+5. After the required reviews and checks pass, land the PR with a merge commit:
+
+   ```bash
+   gh pr merge sync/upstream-20260910 --repo KyivstarDMP/maxtext --merge
+   ```
+
+   Once the PR has landed, fetch and verify that the sync branch's tip is an ancestor of `origin/develop`:
+
+   ```bash
+   git fetch origin
+   git merge-base --is-ancestor sync/upstream-20260910 origin/develop
+   ```
+
+   Continue only if the ancestry check exits successfully (status `0`). Otherwise, keep the branch and investigate the landing.
+
+   After verification, switch to the landed revision and delete the temporary branch locally and on the fork. Skip the last command if GitHub has already deleted the remote branch.
+
+   ```bash
+   git switch --detach origin/develop
+   git branch -d sync/upstream-20260910
+   git push origin --delete sync/upstream-20260910
+   ```
+
+Keep earlier copied commits in history; upstream acceptance does not require reverting them. Identical edits normally merge without duplication.
 
 Deploy tested `develop` revisions and record the full commit SHA from `git rev-parse HEAD` in the deployed checkout.
