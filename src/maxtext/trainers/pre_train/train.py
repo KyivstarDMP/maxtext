@@ -165,7 +165,7 @@ def _assemble_per_dataset_aux(config, data, xent_sum_by_ds, correct_by_ds):
   Only for the train path (batches carry `dataset_id`); eval Option B runs per-dataset passes and
   has no `dataset_id`, so this returns None there.
   """
-  if not (config.per_dataset_metrics and "dataset_id" in data):
+  if not (max_utils.per_dataset_train_metrics_enabled(config) and "dataset_id" in data):
     return None
   num_seg = _num_datasets_plus1(config)
   ids = data["dataset_id"].reshape(-1)
@@ -196,11 +196,12 @@ def loss_fn(model, config, data, dropout_rng, params, sparsity_state=None, is_tr
   """
   del dropout_rng, params, sparsity_state  # unused for NNX (kept for signature parity)
   is_block_diffusion = getattr(config, "training_objective", "causal_lm") == "block_diffusion"
-  if config.per_dataset_metrics:
+  if getattr(config, "per_dataset_metrics", False):
     if is_block_diffusion or (config.use_indexer and not config.indexer_sparse_training):
       raise ValueError("Per-dataset metrics are not supported for block diffusion or indexer warm-up.")
-    if is_train and "dataset_id" not in data:
+    if is_train and max_utils.per_dataset_train_metrics_enabled(config) and "dataset_id" not in data:
       raise ValueError("Per-dataset training metrics require a token-aligned dataset_id in the training batch.")
+  per_dataset_metric_work = max_utils.per_dataset_metric_work_enabled(config, is_train)
   if getattr(config, "attention_type", "global") == "block_diffusion" and not is_block_diffusion:
     raise ValueError(
         "Block-diffusion attention requires target-aligned block-diffusion losses; "
@@ -313,7 +314,7 @@ def loss_fn(model, config, data, dropout_rng, params, sparsity_state=None, is_tr
     xent_sum, total_z_loss, pd_xent, pd_correct, total_correct = vocab_tiling_nnx_loss(
         model, hidden_states, data, config, is_train, return_total_correct=True
     )
-    if config.per_dataset_metrics and "dataset_id" in data:
+    if per_dataset_metric_work and "dataset_id" in data:
       xent_sum_by_ds, correct_by_ds = pd_xent, pd_correct
   else:
     if is_block_diffusion:
@@ -350,7 +351,7 @@ def loss_fn(model, config, data, dropout_rng, params, sparsity_state=None, is_tr
 
     xent_sum = jnp.sum(xent)
     total_z_loss = jnp.sum(z_loss)
-    if config.per_dataset_metrics:
+    if per_dataset_metric_work:
       total_correct = _total_correct_from_logits(logits, data)
       if "dataset_id" in data:
         xent_sum_by_ds, correct_by_ds = _per_dataset_from_logits(logits, xent, data, config)

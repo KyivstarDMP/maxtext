@@ -268,15 +268,35 @@ tiling. TPU validation covered the tiled NNX path; the non-tiled NNX and retaine
 Linen paths are covered by CPU tests. Per-dataset loss
 includes the configured z-loss, matching `learning/lm_loss` on both paths.
 
-Use text SFT with `use_sft=true`, `dataset_type=grain`, and
-`grain_file_type=arrayrecord`. Set nonempty, unique `per_dataset_names` in the
+Use `dataset_type=grain` and `grain_file_type=arrayrecord`, either for text SFT
+(`use_sft=true`) or for ordinary pretraining. In pretraining, each record's source
+ID is copied to every chunk produced by `TokenizeAndChunk` (or kept through
+`TokenizeAndTrim`), expanded to one ID per token, packed as a `dataset_id` column
+and shifted with `targets`. Set nonempty, unique `per_dataset_names` in the
 same order and count as the training mixture; names must match
 `[A-Za-z0-9][A-Za-z0-9_.-]*`. Separate named evaluation passes additionally need
 aligned `per_dataset_eval_names` and `per_dataset_eval_files`, and `eval_steps > 0`.
 Dataset metrics require `packing=true` and do not support placeholder data hosts
-(`expansion_factor_real_data > 1`) or the Tunix post-training entry points.
+(`expansion_factor_real_data > 1`), multimodal inputs, DPO inputs, offline
+distillation, or the Tunix post-training entry points.
 Named evaluation does not provide the aggregate `target_eval_loss` stopping rule;
 keep that threshold disabled when using separate dataset passes.
+
+`per_dataset_train_metrics` (default `true`) selects the training half:
+
+| `per_dataset_metrics` | `per_dataset_train_metrics` | Named eval sets                | Per-source training metrics | Evaluation              |
+| --------------------- | --------------------------- | ------------------------------ | --------------------------- | ----------------------- |
+| `false`               | ignored                     | none                           | no                          | ordinary aggregate eval |
+| `false`               | ignored                     | set                            | rejected                    | rejected                |
+| `true`                | `true`                      | set                            | yes                         | one pass per named set  |
+| `true`                | `true`                      | none                           | yes                         | ordinary aggregate eval |
+| `true`                | `false`                     | set (with `eval_interval > 0`) | no                          | one pass per named set  |
+| `true`                | `false`                     | none                           | rejected                    | rejected                |
+
+With `per_dataset_train_metrics=false`, training records are not stamped,
+training batches carry no `dataset_id`, and the loss does no per-dataset metric
+work during training; named evaluation still reports accuracy. Supplied
+`per_dataset_names` are validated even in eval-only mode, but are not required.
 
 The tiled helpers return loss, z-loss, per-dataset loss sums, and correct-token
 counts as a uniform four-tuple; callers can opt into a fifth, independently

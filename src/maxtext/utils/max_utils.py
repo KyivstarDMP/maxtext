@@ -1420,3 +1420,24 @@ def is_eval(config) -> bool:
   eval_rules = getattr(config, "logical_axis_rules_for_eval", None)
   train_rules = getattr(config, "logical_axis_rules", None)
   return bool(eval_rules and eval_rules != train_rules and get_logical_axis_rules() == eval_rules)
+
+
+def per_dataset_train_metrics_enabled(config) -> bool:
+  """Return whether training batches carry source IDs for per-dataset training metrics.
+
+  ``per_dataset_metrics`` is the umbrella switch for per-dataset reporting; ``per_dataset_train_metrics``
+  opts out of the training half (source stamping, ID batches and per-source training reductions) while
+  keeping named per-dataset evaluation.
+  """
+  return bool(getattr(config, "per_dataset_metrics", False)) and bool(getattr(config, "per_dataset_train_metrics", True))
+
+
+def per_dataset_metric_work_enabled(config, is_train: bool) -> bool:
+  """Return whether the loss should compute per-dataset and correct-token metric work for this batch.
+
+  Training work follows :func:`per_dataset_train_metrics_enabled`. Evaluation work follows the umbrella
+  ``per_dataset_metrics`` switch so named evaluation keeps reporting accuracy in eval-only mode.
+  """
+  if is_train:
+    return per_dataset_train_metrics_enabled(config)
+  return bool(getattr(config, "per_dataset_metrics", False))

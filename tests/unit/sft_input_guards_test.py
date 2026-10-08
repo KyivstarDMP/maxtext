@@ -56,6 +56,10 @@ def _config(**overrides):
   return SimpleNamespace(**values)
 
 
+# Metrics off: named-eval fields would be silently ignored, so they are rejected unless cleared too.
+_METRICS_OFF = {"per_dataset_metrics": False, "per_dataset_eval_names": "", "per_dataset_eval_files": ""}
+
+
 @pytest.mark.parametrize(
     "overrides,diagnostic",
     [
@@ -66,7 +70,13 @@ def _config(**overrides):
         ({"target_eval_loss": 0.1}, "target_eval_loss > 0"),
         ({"sft_long_example_handling": "window", "grain_use_elastic_iterator": True}, "elastic"),
         (
-            {"per_dataset_metrics": False, "dataset_type": "hf", "sft_long_example_handling": "window"},
+            {
+                "per_dataset_metrics": False,
+                "per_dataset_eval_names": "",
+                "per_dataset_eval_files": "",
+                "dataset_type": "hf",
+                "sft_long_example_handling": "window",
+            },
             "only for the Grain",
         ),
     ],
@@ -95,7 +105,7 @@ def test_unsupported_configs_fail_before_data_access(overrides, diagnostic):
     ],
 )
 def test_multimodal_rejects_unapplied_text_options(overrides):
-  config = _config(per_dataset_metrics=False, use_multimodal=True, **overrides)
+  config = _config(**_METRICS_OFF, use_multimodal=True, **overrides)
   with mock.patch.object(input_pipeline_interface, "get_process_loading_real_data") as access:
     with pytest.raises(ValueError, match="Multimodal SFT does not apply"):
       input_pipeline_interface.create_data_iterator(config, object())
@@ -106,8 +116,8 @@ def test_multimodal_rejects_unapplied_text_options(overrides):
     "overrides,named_eval",
     [
         ({}, True),
-        ({"per_dataset_metrics": False, "packing": False, "eval_interval": 0}, False),
-        ({"per_dataset_metrics": False, "use_multimodal": True}, False),
+        ({**_METRICS_OFF, "packing": False, "eval_interval": 0}, False),
+        ({**_METRICS_OFF, "use_multimodal": True}, False),
         ({"eval_interval": 0, "eval_steps": 0, "target_eval_loss": 1.0}, False),
     ],
 )
@@ -262,7 +272,7 @@ def test_empty_host_padding_template_is_specific_to_named_eval(force_padding, us
 )
 def test_finite_window_warning_does_not_consume_or_reset_iterator(padding, epochs, hosts, warning):
   config = _config(
-      per_dataset_metrics=False,
+      **_METRICS_OFF,
       sft_long_example_handling="window",
       num_epoch=epochs,
       generate_padding_batch_train=padding,

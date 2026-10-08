@@ -163,7 +163,7 @@ def get_shaped_batch(config, batch_sharding=None, is_eval=False):
     shaped_batch["corruption_mask"] = jax.ShapeDtypeStruct(batch_shape, jnp.int32, sharding=batch_sharding)
     shaped_batch["targets_loss_mask"] = jax.ShapeDtypeStruct(batch_shape, jnp.int32, sharding=batch_sharding)
 
-  if config.per_dataset_metrics:
+  if max_utils.per_dataset_train_metrics_enabled(config):
     shaped_batch["dataset_id"] = jax.ShapeDtypeStruct(batch_shape, jnp.int32, sharding=batch_sharding)
   if config.use_multimodal:
     batch_size = config.micro_batch_size_to_eval_on if is_eval else config.micro_batch_size_to_train_on
