@@ -155,7 +155,7 @@ def vocab_tiling_linen_loss(
   # TODO (chengnuojin) all gather only embedding table instead of all params after NNX module is enabled
   gathered_params = all_gather_over_fsdp(params, param_spec, model.mesh, get_logical_axis_rules(), config.shard_mode)
 
-  per_dataset = config.per_dataset_metrics
+  per_dataset = max_utils.per_dataset_metric_work_enabled(config, is_train)
 
   def _per_dataset_linen():
     """Forward-only tiled dataset sums and an independent scalar correct count (no grad).
@@ -390,7 +390,7 @@ def vocab_tiling_nnx_loss(model, hidden_states, data, config, is_train, *, retur
   segmentation = data["targets_segmentation"]
   deterministic = not config.enable_dropout if is_train else True
   model_mode = "train"
-  per_dataset = config.per_dataset_metrics
+  per_dataset = max_utils.per_dataset_metric_work_enabled(config, is_train)
   if per_dataset:
     if "dataset_id" in data:
       num_dataset_slots = len([name for name in config.per_dataset_names.split(",") if name]) + 1

@@ -38,6 +38,7 @@ from maxtext.input_pipeline import multihost_dataloading
 from maxtext.input_pipeline._mmap_datasource import MMapDatasetConfig, get_mmap_dataset, get_mmap_npy_dataset
 from maxtext.utils import gcs_utils
 from maxtext.utils import max_logging
+from maxtext.utils import max_utils
 
 
 def construct_hf_dataset_path(hf_path: str, hf_train_files: str | None = None, split: str = "train") -> str:
@@ -448,9 +449,16 @@ def pretrain_preprocessing_pipeline(
     tokenize,
     grain_worker_count,
     grain_per_worker_buffer_size,
-    stamp_dataset_id=False,  # unused; accepted so all grain pipelines share one partial
+    stamp_dataset_id=False,
 ):
-  """Use grain pipeline to pre-process the dataset and return iterators for pretrain"""
+  """Use grain pipeline to pre-process the dataset and return iterators for pretrain.
+
+  ``stamp_dataset_id`` mirrors the flag given to :func:`get_datasets`: when the training mixture was
+  stamped with 1-based source IDs, each record's ID is expanded to its tokens after chunking or trimming
+  and packed as a ``dataset_id`` column aligned with ``targets``. Evaluation is never stamped.
+  """
+  if stamp_dataset_id and config.grain_file_type != "arrayrecord":
+    raise ValueError("Pretraining dataset IDs are implemented only for ArrayRecord sources.")
   if config.grain_file_type in ("mmap", "mmap_npy"):
     assert len(data_columns) == 1, (
         f"grain_file_type={config.grain_file_type!r} requires exactly one pre-tokenized "
@@ -459,6 +467,8 @@ def pretrain_preprocessing_pipeline(
     return _mmap_pretrain_pipeline(dataset, config, data_columns[0], grain_worker_count, grain_per_worker_buffer_size)
 
   is_offline = getattr(config, "is_offline_distillation", False)
+  if stamp_dataset_id and is_offline:
+    raise ValueError("Per-dataset training metrics are not supported for offline distillation.")
 
   columns_to_parse = list(data_columns)
   if is_offline:
@@ -477,6 +487,10 @@ def pretrain_preprocessing_pipeline(
     else:
       dataset = dataset.apply(grain_tokenizer.TokenizeAndChunk(text_column, config.max_target_length, tokenizer_model))
 
+  if stamp_dataset_id:
+    num_datasets = len([name for name in config.per_dataset_names.split(",") if name])
+    dataset = dataset.map(input_pipeline_utils.ExpandDatasetId(text_column, num_datasets))
+
   pipeline_columns = ["inputs", "targets"]
   rekey_dict = {col: text_column for col in pipeline_columns}
 
@@ -484,6 +498,8 @@ def pretrain_preprocessing_pipeline(
 
   if is_offline:
     pipeline_columns.extend(["top_k_logits", "top_k_indices"])
+  if stamp_dataset_id:
+    pipeline_columns.append("dataset_id")
 
   batch_size = data_processing_utils.get_local_batch_size(config)
   dataset = data_processing_utils.format_and_batch(
@@ -1038,7 +1054,7 @@ def make_grain_train_iterator(
       grain_data_source_max_workers=config.grain_data_source_max_workers,
       grain_index_storage_option=getattr(config, "grain_index_storage_option", None),
       mixture_config_path=config.grain_train_mixture_config_path,
-      stamp_dataset_id=config.per_dataset_metrics,
+      stamp_dataset_id=max_utils.per_dataset_train_metrics_enabled(config),
       elastic=config.grain_use_elastic_iterator,
       hf_access_token=getattr(config, "hf_access_token", None),
       dataset_config=dataset_config,
@@ -1053,7 +1069,7 @@ def make_grain_train_iterator(
       "grain_per_worker_buffer_size": config.grain_per_worker_buffer_size,
   }
   if not config.use_multimodal:
-    preprocessing_fn_kwargs["stamp_dataset_id"] = config.per_dataset_metrics
+    preprocessing_fn_kwargs["stamp_dataset_id"] = max_utils.per_dataset_train_metrics_enabled(config)
   if config.use_sft and config.use_multimodal:
     preprocessing_fn_kwargs["image_column"] = config.train_image_column
 

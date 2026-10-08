@@ -1858,6 +1858,32 @@ class Rekey(grain.MapTransform):
     return element
 
 
+class ExpandDatasetId(grain.MapTransform):
+  """Expand a record's scalar mixture-source ``dataset_id`` into one ID per token of ``feature_name``.
+
+  Pretraining stamps one 1-based source ID per raw record before mixing. After tokenization (and
+  chunking or trimming) this turns it into an ``int32`` array aligned with the record's tokens, so the
+  packers and the target shift carry it exactly like ``inputs``/``targets``. Slot 0 stays reserved for
+  padding, so live tokens must carry an ID in ``1..num_datasets``.
+  """
+
+  def __init__(self, feature_name, num_datasets):
+    self.feature_name = feature_name
+    self.num_datasets = int(num_datasets)
+
+  def map(self, element):
+    if "dataset_id" not in element:
+      raise ValueError("Per-dataset training metrics expected a stamped dataset_id on every training record.")
+    source = np.asarray(element["dataset_id"])
+    if source.ndim != 0 or not np.issubdtype(source.dtype, np.integer):
+      raise ValueError(f"dataset_id must be one integer per record before expansion, got {source!r}.")
+    source_id = int(source)
+    if not 1 <= source_id <= self.num_datasets:
+      raise ValueError(f"dataset_id {source_id} is outside the configured sources 1..{self.num_datasets}.")
+    element["dataset_id"] = np.full(len(element[self.feature_name]), source_id, dtype=np.int32)
+    return element
+
+
 class DropKeys(grain.MapTransform):
   """Remove the given keys from each element (e.g. packer-emitted junk columns)."""
 

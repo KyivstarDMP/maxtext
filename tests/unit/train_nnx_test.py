@@ -52,6 +52,7 @@ class _Cfg:
   indexer_loss_scaling_factor: float = 0.0
   num_vocab_tiling: int = 1
   per_dataset_metrics: bool = False
+  per_dataset_train_metrics: bool = True
   per_dataset_names: str = ""
   num_experts: int = 1
   retry_when_tokens_dropped: bool = False
@@ -375,6 +376,37 @@ class TestTrainStepNNX(unittest.TestCase):
     np.testing.assert_array_equal(metrics["per_dataset"]["correct_by_ds"], [0, 4, 0])
     np.testing.assert_array_equal(metrics["per_dataset"]["token_count_by_ds"], [0, 4, 3])
 
+  def test_eval_only_train_step_matches_metrics_off(self):
+    """per_dataset_train_metrics=false trains exactly like metrics-off and needs no dataset_id."""
+    data = _make_data()
+    cfg, ts = _build_state()
+    state_graphdef, state_pure = nnx.split(ts)
+    _, off_metrics = pre_train.train_step(
+        state_graphdef, cfg, state_mesh_shardings=None, params_shardings=None, state=state_pure, data=data
+    )
+    cfg, ts = _build_state()  # Same deterministic initialization; one train_step per state.
+    cfg.per_dataset_metrics = True
+    cfg.per_dataset_train_metrics = False
+    cfg.per_dataset_names = "a,b"
+    state_graphdef, state_pure = nnx.split(ts)
+    _, eval_only_metrics = pre_train.train_step(
+        state_graphdef, cfg, state_mesh_shardings=None, params_shardings=None, state=state_pure, data=data
+    )
+    self.assertNotIn("per_dataset", eval_only_metrics)
+    self.assertNotIn("learning/total_correct", eval_only_metrics["scalar"])
+    for key in ("learning/loss", "learning/raw_grad_norm"):
+      np.testing.assert_allclose(eval_only_metrics["scalar"][key], off_metrics["scalar"][key], rtol=1e-6)
+
+  def test_train_metrics_on_still_require_dataset_ids(self):
+    cfg, ts = _build_state()
+    cfg.per_dataset_metrics = True
+    cfg.per_dataset_names = "a,b"
+    state_graphdef, state_pure = nnx.split(ts)
+    with self.assertRaisesRegex(ValueError, "token-aligned dataset_id"):
+      pre_train.train_step(
+          state_graphdef, cfg, state_mesh_shardings=None, params_shardings=None, state=state_pure, data=_make_data()
+      )
+
   def test_train_step_returns_state_and_metrics(self):
     cfg, ts = _build_state()
     state_graphdef, state_pure = nnx.split(ts)
@@ -508,6 +540,22 @@ class TestEvalStepNNX(unittest.TestCase):
     ):
       self.assertIn(key, metrics["scalar"])
     self.assertTrue(jnp.isfinite(metrics["scalar"]["evaluation/loss"]))
+
+
+class TestEvalOnlyDatasetMetricsNNX(unittest.TestCase):
+  """Named evaluation keeps its accuracy numerator when training attribution is off."""
+
+  def test_eval_step_reports_total_correct_in_eval_only_mode(self):
+    cfg, ts = _build_state()
+    cfg.per_dataset_metrics = True
+    cfg.per_dataset_train_metrics = False
+    state_graphdef, state_pure = nnx.split(ts)
+    data = _make_data(batch=cfg.micro_batch_size_to_eval_on, vocab=cfg.vocab_size)
+    predicted = jnp.argmax(ts.model(data["inputs"], data["inputs_position"]), axis=-1)
+    data["targets"] = predicted
+    metrics = pre_train.eval_step(state_graphdef, cfg, state_pure, data)
+    expected = int(jnp.sum(data["targets_segmentation"] != 0))
+    self.assertEqual(int(metrics["scalar"]["evaluation/total_correct"]), expected)
 
 
 class TestSkipStepOnSpikesNNX(unittest.TestCase):

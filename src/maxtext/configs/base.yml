@@ -852,8 +852,13 @@ sft_window_pinned_context_warn_fraction: 0.5
 # --- Per-dataset (per-mixture-component) metrics ------------------------------------------------
 # Emit per-dataset train loss/accuracy (segment-summed within each mixed batch) and per-dataset eval
 # loss/accuracy (one eval pass per dataset). Opt-in; zero-overhead when false. Requires packing=true.
-# Supported only for text Grain ArrayRecord SFT through the pre-training trainer (use_sft=true).
+# Supported for text Grain ArrayRecord inputs through the pre-training trainer, for ordinary pretraining
+# and for SFT (use_sft=true). Multimodal, DPO, offline distillation and Tunix trainers are rejected.
 per_dataset_metrics: false
+# With per_dataset_metrics=true: stamp training sources and report per-source training metrics. Set false
+# for named evaluation only (requires per_dataset_eval_names/files and eval_interval > 0); training then
+# carries no dataset_id and does no per-dataset metric work. Ignored when per_dataset_metrics=false.
+per_dataset_train_metrics: true
 # Comma-joined, ordered names of the train mixture components (runner fills this from the blend
 # manifest, in the same order as grain_train_files). Index i (1-based) maps to names[i-1].
 # Names must be unique and match [A-Za-z0-9][A-Za-z0-9_.-]*: one per source component.

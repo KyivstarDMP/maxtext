@@ -96,12 +96,156 @@ def test_metrics_reject_sources_that_do_not_stamp_dataset_ids(file_type):
     grain_data_processing.make_grain_train_iterator(config, SimpleNamespace(size=1), [0])
 
 
-def test_pretraining_metrics_fail_before_data_loading():
-  config = SimpleNamespace(per_dataset_metrics=True, dataset_type="grain", use_sft=False)
-  with mock.patch.object(input_pipeline_interface, "make_grain_train_iterator") as load_data:
-    with pytest.raises(ValueError, match="pretraining does not preserve dataset IDs"):
+@pytest.mark.parametrize(
+    "overrides,diagnostic",
+    [
+        ({"dataset_type": "hf"}, "Grain ArrayRecord"),
+        ({"use_multimodal": True}, "multimodal"),
+        ({"use_dpo": True}, "DPO"),
+        ({"is_offline_distillation": True}, "offline distillation"),
+        ({"training_objective": "block_diffusion"}, "block diffusion"),
+        ({"use_indexer": True, "indexer_sparse_training": False}, "indexer warm-up"),
+        ({"packing": False}, "packing=true"),
+        ({"expansion_factor_real_data": 2}, "placeholder hosts"),
+    ],
+)
+@pytest.mark.parametrize("use_sft", [False, True])
+def test_unsupported_dataset_metric_routes_fail_before_data_loading(overrides, diagnostic, use_sft):
+  config = _dataset_metrics_config(use_sft=use_sft, **overrides)
+  with (
+      mock.patch.object(input_pipeline_interface, "make_grain_train_iterator") as train_data,
+      mock.patch.object(input_pipeline_interface, "make_grain_eval_iterator") as eval_data,
+  ):
+    with pytest.raises(ValueError, match=diagnostic):
       input_pipeline_interface.create_data_iterator(config, object())
-  load_data.assert_not_called()
+  train_data.assert_not_called()
+  eval_data.assert_not_called()
+
+
+def _create_iterators(config):
+  with (
+      mock.patch.object(input_pipeline_interface, "get_process_loading_real_data", return_value=[0]),
+      mock.patch.object(input_pipeline_interface.jax, "process_index", return_value=0),
+      mock.patch.object(input_pipeline_interface, "make_grain_train_iterator") as train_data,
+      mock.patch.object(input_pipeline_interface, "make_grain_eval_iterator") as eval_data,
+  ):
+    train_iterator, eval_iterator = input_pipeline_interface.create_data_iterator(config, object())
+  return train_iterator, eval_iterator, train_data, eval_data
+
+
+@pytest.mark.parametrize("train_metrics", [True, False])
+def test_pretraining_accepts_dataset_metrics_with_named_eval(train_metrics):
+  config = _dataset_metrics_config(
+      use_sft=False,
+      per_dataset_train_metrics=train_metrics,
+      per_dataset_eval_names="eval_uk,eval_en",
+      per_dataset_eval_files="uk*;en*",
+  )
+  _, eval_iterators, train_data, eval_data = _create_iterators(config)
+  train_data.assert_called_once()
+  assert list(eval_iterators) == ["eval_uk", "eval_en"]
+  assert eval_data.call_count == 2
+
+
+def test_eval_only_metrics_do_not_require_training_names():
+  config = _dataset_metrics_config(
+      use_sft=False,
+      per_dataset_train_metrics=False,
+      per_dataset_names="",
+      per_dataset_eval_names="eval_uk",
+      per_dataset_eval_files="uk*",
+  )
+  _, eval_iterators, train_data, _ = _create_iterators(config)
+  train_data.assert_called_once()
+  assert list(eval_iterators) == ["eval_uk"]
+
+
+@pytest.mark.parametrize(
+    "overrides,diagnostic",
+    [
+        # Named eval requested without the umbrella flag would be silently ignored.
+        ({"per_dataset_metrics": False, "per_dataset_eval_names": "e", "per_dataset_eval_files": "e*"}, "require"),
+        ({"per_dataset_metrics": False, "per_dataset_eval_files": "e*"}, "require"),
+        # Eval-only mode must enable something.
+        ({"per_dataset_train_metrics": False}, "leaves only named evaluation"),
+        (
+            {
+                "per_dataset_train_metrics": False,
+                "per_dataset_eval_names": "e",
+                "per_dataset_eval_files": "e*",
+                "eval_interval": 0,
+            },
+            "eval_interval > 0",
+        ),
+        (
+            {
+                "per_dataset_train_metrics": False,
+                "per_dataset_eval_names": "e",
+                "per_dataset_eval_files": "e*",
+                "eval_steps": -1,
+            },
+            "eval_steps > 0",
+        ),
+        (
+            {
+                "per_dataset_train_metrics": False,
+                "per_dataset_eval_names": "e",
+                "per_dataset_eval_files": "e*",
+                "target_eval_loss": 1.0,
+            },
+            "target_eval_loss",
+        ),
+        # Supplied training labels are validated even when training attribution is off.
+        (
+            {
+                "per_dataset_train_metrics": False,
+                "per_dataset_names": "first,first",
+                "per_dataset_eval_names": "e",
+                "per_dataset_eval_files": "e*",
+            },
+            "unique",
+        ),
+        (
+            {"per_dataset_train_metrics": False, "per_dataset_eval_names": "e", "per_dataset_eval_files": "e*;f*"},
+            "one-to-one",
+        ),
+    ],
+)
+@pytest.mark.parametrize("use_sft", [False, True])
+def test_ineffective_or_ignored_metric_settings_fail_before_loading(overrides, diagnostic, use_sft):
+  config = _dataset_metrics_config(use_sft=use_sft, **overrides)
+  with (
+      mock.patch.object(input_pipeline_interface, "make_grain_train_iterator") as train_data,
+      mock.patch.object(input_pipeline_interface, "make_grain_eval_iterator") as eval_data,
+  ):
+    with pytest.raises(ValueError, match=diagnostic):
+      input_pipeline_interface.create_data_iterator(config, object())
+  train_data.assert_not_called()
+  eval_data.assert_not_called()
+
+
+def test_default_train_metrics_switch_is_inert_without_umbrella_and_for_tunix():
+  config = _dataset_metrics_config(per_dataset_metrics=False, per_dataset_train_metrics=True, use_sft=False)
+  _, eval_iterator, train_data, _ = _create_iterators(config)
+  train_data.assert_called_once()
+  assert not isinstance(eval_iterator, dict)
+  tunix_defaults = SimpleNamespace(
+      per_dataset_metrics=False, per_dataset_train_metrics=True, per_dataset_eval_names="", per_dataset_eval_files=""
+  )
+  input_pipeline_interface.validate_post_train_data_options(tunix_defaults)
+
+
+@pytest.mark.parametrize("train_metrics,stamped", [(True, True), (False, False)])
+def test_training_stamps_sources_only_when_training_metrics_are_on(train_metrics, stamped):
+  from maxtext.utils import max_utils  # pylint: disable=import-outside-toplevel
+
+  config = SimpleNamespace(per_dataset_metrics=True, per_dataset_train_metrics=train_metrics)
+  assert max_utils.per_dataset_train_metrics_enabled(config) is stamped
+  assert max_utils.per_dataset_metric_work_enabled(config, is_train=True) is stamped
+  assert max_utils.per_dataset_metric_work_enabled(config, is_train=False) is True
+  off = SimpleNamespace(per_dataset_metrics=False, per_dataset_train_metrics=True)
+  assert not max_utils.per_dataset_train_metrics_enabled(off)
+  assert not max_utils.per_dataset_metric_work_enabled(off, is_train=False)
 
 
 def test_pretraining_without_dataset_metrics_still_creates_iterator():

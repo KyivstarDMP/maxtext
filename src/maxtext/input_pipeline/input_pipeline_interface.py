@@ -30,6 +30,7 @@ from maxtext.input_pipeline.olmo_grain_data_processing import make_olmo_grain_ev
 from maxtext.input_pipeline.synthetic_data_processing import SyntheticDataIterator
 from maxtext.input_pipeline.synthetic_data_processing import PlaceHolderDataIterator
 from maxtext.utils import max_logging
+from maxtext.utils import max_utils
 from maxtext.utils.sharding import remove_size_one_mesh_axis
 
 
@@ -73,7 +74,7 @@ def _parse_dataset_names(value: str, field: str) -> list[str]:
   return names
 
 
-def _validate_per_dataset_names(config: pyconfig.HyperParameters) -> None:
+def _validate_per_dataset_train_names(config: pyconfig.HyperParameters) -> None:
   """Validate source-to-label alignment before any dataset iterator is created."""
   names = _parse_dataset_names(config.per_dataset_names, "per_dataset_names")
   if config.grain_train_mixture_config_path:
@@ -93,13 +94,70 @@ def _validate_per_dataset_names(config: pyconfig.HyperParameters) -> None:
           "in grain_train_files order."
       )
 
-  if config.per_dataset_eval_names or config.per_dataset_eval_files:
-    eval_names = _parse_dataset_names(config.per_dataset_eval_names, "per_dataset_eval_names")
-    eval_files = config.per_dataset_eval_files.split(";")
-    if any(not source.strip() for source in eval_files):
-      raise ValueError("per_dataset_eval_files must contain nonempty file patterns.")
-    if len(eval_names) != len(eval_files):
-      raise ValueError("per_dataset_eval_names and per_dataset_eval_files must align one-to-one in order.")
+
+def _validate_named_eval_mapping(config: pyconfig.HyperParameters) -> None:
+  """Validate named evaluation labels and their file patterns before any dataset I/O."""
+  eval_names = _parse_dataset_names(config.per_dataset_eval_names, "per_dataset_eval_names")
+  eval_files = config.per_dataset_eval_files.split(";")
+  if any(not source.strip() for source in eval_files):
+    raise ValueError("per_dataset_eval_files must contain nonempty file patterns.")
+  if len(eval_names) != len(eval_files):
+    raise ValueError("per_dataset_eval_names and per_dataset_eval_files must align one-to-one in order.")
+
+
+def _validate_per_dataset_options(config: pyconfig.HyperParameters) -> None:
+  """Reject unsupported or ineffective per-dataset metric settings before any dataset I/O.
+
+  ``per_dataset_metrics`` is the umbrella switch. With ``per_dataset_train_metrics`` (default true) it
+  stamps training sources and reports per-source training metrics; named evaluation runs one eval pass
+  per ``per_dataset_eval_names`` entry. Supported route: text Grain ArrayRecord through
+  ``maxtext.trainers.pre_train.train`` with packing, for ordinary pretraining and for SFT.
+  """
+  named_eval = bool(getattr(config, "per_dataset_eval_names", "") or getattr(config, "per_dataset_eval_files", ""))
+  if not getattr(config, "per_dataset_metrics", False):
+    if named_eval:
+      raise ValueError(
+          "per_dataset_eval_names/per_dataset_eval_files require per_dataset_metrics=true; "
+          "otherwise they would be silently ignored."
+      )
+    return
+  if config.dataset_type != "grain":
+    raise ValueError("Per-dataset metrics require the Grain ArrayRecord pipeline.")
+  if getattr(config, "use_multimodal", False):
+    raise ValueError("Per-dataset metrics are not supported for multimodal inputs.")
+  if getattr(config, "use_dpo", False):
+    raise ValueError("Per-dataset metrics are not supported for DPO inputs.")
+  if getattr(config, "is_offline_distillation", False):
+    raise ValueError("Per-dataset metrics are not supported for offline distillation.")
+  # loss_fn keeps the same guard for direct callers; rejecting here avoids input and model setup.
+  if getattr(config, "training_objective", "causal_lm") == "block_diffusion":
+    raise ValueError("Per-dataset metrics are not supported for block diffusion.")
+  if getattr(config, "use_indexer", False) and not getattr(config, "indexer_sparse_training", False):
+    raise ValueError("Per-dataset metrics are not supported for indexer warm-up.")
+  if not config.packing:
+    raise ValueError("Per-dataset metrics require packing=true for token-aligned dataset IDs.")
+  if config.expansion_factor_real_data > 1:
+    raise ValueError("Per-dataset metrics do not support expansion_factor_real_data > 1 (placeholder hosts).")
+
+  train_metrics = max_utils.per_dataset_train_metrics_enabled(config)
+  if train_metrics or config.per_dataset_names:
+    # Training labels are required for training attribution; supplied labels are always validated.
+    _validate_per_dataset_train_names(config)
+  if not train_metrics:
+    if not named_eval:
+      raise ValueError(
+          "per_dataset_train_metrics=false leaves only named evaluation; set per_dataset_eval_names and "
+          "per_dataset_eval_files, or disable per_dataset_metrics."
+      )
+    if config.eval_interval <= 0:
+      raise ValueError("Eval-only per-dataset metrics (per_dataset_train_metrics=false) require eval_interval > 0.")
+  if named_eval:
+    _validate_named_eval_mapping(config)
+    if config.eval_interval > 0:
+      if config.eval_steps <= 0:
+        raise ValueError("Named per-dataset evaluation requires eval_steps > 0 to bound its padding batches.")
+      if config.target_eval_loss > 0:
+        raise ValueError("target_eval_loss > 0 is not supported with named per-dataset evaluation.")
 
 
 def validate_post_train_data_options(config: pyconfig.HyperParameters) -> None:
@@ -155,21 +213,7 @@ def _validate_sft_input_options(config: pyconfig.HyperParameters) -> None:
 
 def create_data_iterator(config: pyconfig.HyperParameters, mesh):
   """Create train and eval data iterators given configs and mesh."""
-  if config.per_dataset_metrics and config.dataset_type != "grain":
-    raise ValueError("Per-dataset metrics require the Grain ArrayRecord pipeline.")
-  if config.per_dataset_metrics and not config.use_sft:
-    raise ValueError("Per-dataset metrics require use_sft=true; pretraining does not preserve dataset IDs.")
-  if config.per_dataset_metrics:
-    if not config.packing:
-      raise ValueError("Per-dataset metrics require packing=true for token-aligned dataset IDs.")
-    if config.expansion_factor_real_data > 1:
-      raise ValueError("Per-dataset metrics do not support expansion_factor_real_data > 1 (placeholder hosts).")
-    if config.eval_interval > 0 and config.per_dataset_eval_files:
-      if config.eval_steps <= 0:
-        raise ValueError("Named per-dataset evaluation requires eval_steps > 0 to bound its padding batches.")
-      if config.target_eval_loss > 0:
-        raise ValueError("target_eval_loss > 0 is not supported with named per-dataset evaluation.")
-    _validate_per_dataset_names(config)
+  _validate_per_dataset_options(config)
   _validate_sft_input_options(config)
 
   # Return synthetic dataset if selected

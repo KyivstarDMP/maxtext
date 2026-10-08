@@ -1079,11 +1079,20 @@ class _MetricsNNXHead(nnx.Module):
 
 
 def _per_dataset_tiling_fixture(
-    backend, *, with_ids=True, metrics=True, names="a,b,absent", tiles=4, is_train=True, return_total_correct=False
+    backend,
+    *,
+    with_ids=True,
+    metrics=True,
+    names="a,b,absent",
+    tiles=4,
+    is_train=True,
+    return_total_correct=False,
+    train_metrics=True,
 ):
   """Real output heads and sharding; dropout is off, so this fixture does not test it."""
   cfg = SimpleNamespace(
       per_dataset_metrics=metrics,
+      per_dataset_train_metrics=train_metrics,
       per_dataset_names=names,
       num_vocab_tiling=tiles,
       vocab_size=4,
@@ -1199,6 +1208,27 @@ def test_per_dataset_tiling_disabled_returns_none(backend, with_ids):
   assert losses is None and correct is None
   np.testing.assert_allclose(total, _independent_loss(logits(params, hidden), data, cfg.z_loss_multiplier), rtol=2e-5)
   assert "argmax[" not in str(jax.make_jaxpr(tiled)(params, hidden))
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("backend", ["linen", "nnx"])
+def test_eval_only_metrics_skip_training_work_and_keep_eval_accuracy(backend):
+  """per_dataset_train_metrics=false: no metric work on training batches, accuracy on eval batches."""
+  cfg, data, params, hidden, tiled, logits = _per_dataset_tiling_fixture(
+      backend, with_ids=False, train_metrics=False, is_train=True, return_total_correct=True
+  )
+  total, _, losses, correct, total_correct = jax.jit(tiled)(params, hidden)
+  assert losses is None and correct is None and total_correct is None
+  np.testing.assert_allclose(total, _independent_loss(logits(params, hidden), data, cfg.z_loss_multiplier), rtol=2e-5)
+  assert "argmax[" not in str(jax.make_jaxpr(tiled)(params, hidden))
+
+  cfg, data, params, hidden, tiled, logits = _per_dataset_tiling_fixture(
+      backend, with_ids=False, train_metrics=False, is_train=False, return_total_correct=True
+  )
+  total, _, losses, correct, total_correct = jax.jit(tiled)(params, hidden)
+  _, expected_correct, _, _ = _independent_dataset_sums(logits(params, hidden), data, cfg)
+  assert int(total_correct) == int(expected_correct.sum()) > 0
+  np.testing.assert_allclose(losses[1], total, rtol=2e-5, atol=2e-6)
 
 
 @pytest.mark.cpu_only

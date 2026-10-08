@@ -1913,8 +1913,16 @@ class FineTuning(BaseModel):
       description=(
           "If True, emit per-mixture-component (per-dataset) train loss/accuracy (segment-summed "
           "within each mixed batch) and per-dataset eval loss/accuracy (one eval pass per dataset). "
-          "Opt-in; zero-overhead when False. Requires packing=true and text Grain ArrayRecord SFT "
-          "through the pre-training trainer (use_sft=true)."
+          "Opt-in; zero-overhead when False. Requires packing=true and text Grain ArrayRecord inputs "
+          "through the pre-training trainer (ordinary pretraining or use_sft=true)."
+      ),
+  )
+  per_dataset_train_metrics: bool = Field(
+      True,
+      description=(
+          "With per_dataset_metrics=True, stamp training sources and report per-source training "
+          "metrics. False keeps only named per-dataset evaluation (requires per_dataset_eval_names/files "
+          "and eval_interval > 0). Ignored when per_dataset_metrics=False."
       ),
   )
   per_dataset_names: str = Field(

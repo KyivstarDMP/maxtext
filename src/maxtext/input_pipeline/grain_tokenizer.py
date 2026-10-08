@@ -112,6 +112,9 @@ class TokenizeAndChunk(TokenizerTransformBase, grain.experimental.FlatMapTransfo
           token_ids[start_idx : start_idx + chunk_size], dtype=np.int32  # pyrefly: ignore[unsupported-operation]
       )  # pyrefly: ignore[unsupported-operation]
       new_element = {self.feature_name: chunk}
+      if "dataset_id" in element:
+        # Every chunk of a document belongs to the document's mixture source (per_dataset_metrics).
+        new_element["dataset_id"] = element["dataset_id"]
       output_elements.append(new_element)
 
     return output_elements
