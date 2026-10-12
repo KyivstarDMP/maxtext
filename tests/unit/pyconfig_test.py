@@ -49,6 +49,57 @@ class PyconfigTest(unittest.TestCase):
           use_gmm_v2=False,
       )
 
+  def test_moe_combine_kernel_tc_requires_sparse_matmul(self):
+    with self.assertRaisesRegex(ValueError, "`moe_combine_kernel='tc'` requires `sparse_matmul=True`"):
+      pyconfig.initialize(
+          [os.path.join(MAXTEXT_PKG_DIR, "train.py"), get_test_config_path()],
+          moe_combine_kernel="tc",
+          sparse_matmul=False,
+      )
+
+  def test_moe_combine_kernel_tc_rejects_ring_of_experts(self):
+    with self.assertRaisesRegex(ValueError, "requires `use_ring_of_experts=False`"):
+      pyconfig.initialize(
+          [os.path.join(MAXTEXT_PKG_DIR, "train.py"), get_test_config_path()],
+          moe_combine_kernel="tc",
+          sparse_matmul=True,
+          use_ring_of_experts=True,
+          use_ragged_sort=True,
+          ici_expert_parallelism=2,
+      )
+
+  def test_moe_permute_kernel_tc_requires_direct_token_gather(self):
+    with self.assertRaisesRegex(ValueError, "`moe_permute_kernel='tc'` requires `moe_use_direct_token_gather=True`"):
+      pyconfig.initialize(
+          [os.path.join(MAXTEXT_PKG_DIR, "train.py"), get_test_config_path()],
+          moe_permute_kernel="tc",
+          moe_use_direct_token_gather=False,
+      )
+
+  def test_split_expert_weight_layout_requires_gmm_v2_prefuse_and_exp_on_fsdp(self):
+    with self.assertRaisesRegex(ValueError, "`moe_split_expert_weight_layout=True` requires `prefuse_moe_weights=True`"):
+      pyconfig.initialize(
+          [os.path.join(MAXTEXT_PKG_DIR, "train.py"), get_test_config_path()],
+          moe_split_expert_weight_layout=True,
+          prefuse_moe_weights=False,
+      )
+
+  def test_split_expert_weight_layout_rejects_expert_parallelism(self):
+    with self.assertRaisesRegex(ValueError, "requires a static expert group offset"):
+      pyconfig.initialize(
+          [os.path.join(MAXTEXT_PKG_DIR, "train.py"), get_test_config_path()],
+          moe_split_expert_weight_layout=True,
+          prefuse_moe_weights=True,
+          shard_exp_on_fsdp=True,
+          sparse_matmul=True,
+          use_tokamax_gmm=True,
+          use_gmm_v2=True,
+          num_experts=8,
+          base_mlp_dim=256,
+          base_moe_mlp_dim=256,
+          ici_expert_parallelism=2,
+      )
+
   def test_step_dropless_fallback_rejects_unreplayable_combinations(self):
     def initialize(**kwargs):
       return pyconfig.initialize(

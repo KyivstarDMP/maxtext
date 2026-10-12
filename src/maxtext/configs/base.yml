@@ -322,6 +322,17 @@ moe_tc_ragged_3d_gmm: false # moe_tc_ragged_sort with tokamax gmm_v2: keep the s
 moe_tc_ragged_3d_dispatch: false # moe_tc_ragged_sort + moe_tc_ragged_3d_gmm: keep tokens in the (batch, seq, emb // 128, 128) layout through the EP all-gather and combine.
 moe_tc_window_routing: false # moe_tc_ragged_sort: keep only the shard's [start, start + cap) routing window, packed uint32 sorts.
 moe_use_direct_token_gather: false # whether to gather tokens directly in expert order instead of materializing Top-K copies
+# MoE "combine" (unpermute + Top-K weighted sum) implementation in the sparse matmul path without expert parallelism:
+#   "xla": gather the expert outputs back into token order and einsum with the routing weights (default).
+#   "tc":  fused TensorCore Pallas kernel (kernels/moe_combine_tc.py), f32 accumulation, no unsorted copy in HBM.
+#          Requires sparse_matmul=true and use_ring_of_experts=false; falls back to "xla" for unsupported shapes.
+moe_combine_kernel: "xla"
+# MoE token permute (gather into expert-sorted order) implementation when moe_use_direct_token_gather=true:
+#   "xla": XLA gather (default).
+#   "tc":  fused TensorCore Pallas kernel (kernels/moe_combine_tc.py `permute`). Requires use_ring_of_experts=false;
+#          falls back to "xla" for quantized activations or unsupported shapes. Pair with
+#          --xla_tpu_offload_gather_to_sparsecore=false --xla_tpu_offload_all_supported_gathers_to_sparsecore=false.
+moe_permute_kernel: "xla"
 use_gather_mosaic_kernel: false # whether to use a custom mosaic kernel for token gather ops
 ragged_gather_fallback: false # when true, unconditionally use the JAX reference implementation instead of the
                               # ragged gather SparseCore kernel. When false (default), use the SparseCore kernel.
@@ -395,6 +406,14 @@ moe_fsdp_use_two_stage_all_gather: false
 # Shard the expert dimension of the MLP weights on the FSDP axis.
 # This configuration is recommended only when num_experts is a multiple of fsdp_parallelism
 shard_exp_on_fsdp: false
+# Store the prefused MoE `wi` weight as [2, num_experts, emb/2, 2*mlp] (a row-major reshape of the fused
+# [num_experts, emb, 2*mlp] weight whose two leading slices are the expert halves W[:E/2] and W[E/2:]).
+# Each half is all-gathered on its own and consumed by two chained gmm_v2 calls (kernels/megablox/split_gmm.py),
+# so no copy of the ~1 GB fused weight is ever concatenated or split in forward or backward.
+# Requires prefuse_moe_weights=true, shard_exp_on_fsdp=true, sparse_matmul=true, use_gmm_v2=true, no quantization,
+# num_moe_emb_chunks=0, no expert parallelism, and even num_experts / moe_expert_input_dim.
+# false (default) keeps the fused [num_experts, emb, 2*mlp] layout.
+moe_split_expert_weight_layout: false
 # Keep embed_moe sharded so we can manually QAG it over FSDP.
 # Requires quantization to be specified and weight_quantization_calibration_method to be fixed (static scaling mode).
 shard_embed_moe_on_fsdp: false

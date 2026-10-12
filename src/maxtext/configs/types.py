@@ -1352,6 +1352,27 @@ class MoEGeneral(BaseModel):
       False,
       description="Whether to gather tokens directly in expert order instead of materializing Top-K copies.",
   )
+  moe_combine_kernel: Literal["xla", "tc"] = Field(
+      "xla",
+      description=(
+          "Implementation of the MoE combine (unpermute + Top-K weighted sum) in the sparse matmul path without"
+          " expert parallelism. 'xla': gather back into token order and einsum (default). 'tc': fused TensorCore"
+          " Pallas kernel (kernels/moe_combine_tc.py) with f32 accumulation that never materializes the"
+          " [tokens * top_k, emb] unsorted copy. Requires sparse_matmul=True, use_ring_of_experts=False and"
+          " use_ragged_sort=False; falls back to 'xla' at runtime when the kernel preconditions do not hold."
+      ),
+  )
+  moe_permute_kernel: Literal["xla", "tc"] = Field(
+      "xla",
+      description=(
+          "Implementation of the MoE token permute (gather into expert-sorted order) when"
+          " moe_use_direct_token_gather=True. 'xla': XLA gather (default). 'tc': fused TensorCore Pallas kernel"
+          " (kernels/moe_combine_tc.py `permute`, forward and backward). Requires moe_use_direct_token_gather=True"
+          " and use_ring_of_experts=False; falls back to 'xla' at runtime when the kernel preconditions do not"
+          " hold. Intended for use with --xla_tpu_offload_gather_to_sparsecore=false"
+          " --xla_tpu_offload_all_supported_gathers_to_sparsecore=false."
+      ),
+  )
   use_gather_mosaic_kernel: bool = Field(
       False,
       description="Whether to use a custom mosaic kernel for token gather ops.",
@@ -1475,6 +1496,17 @@ class MoEGeneral(BaseModel):
       False,
       description="Whether to fuse the expert scaling factors into the expert weights. "
       "This can improve inference performance.",
+  )
+  moe_split_expert_weight_layout: bool = Field(
+      False,
+      description=(
+          "Store the prefused MoE `wi` weight as [2, num_experts, emb/2, 2*mlp], a row-major reshape of the fused"
+          " [num_experts, emb, 2*mlp] weight whose two leading slices are the expert halves W[:E/2] and W[E/2:]."
+          " Each half is all-gathered on its own and consumed by two chained gmm_v2 calls (split_gmm), so the fused"
+          " weight is never concatenated or split in forward or backward. Requires prefuse_moe_weights=True,"
+          " shard_exp_on_fsdp=True, sparse_matmul=True, use_gmm_v2=True, no quantization, num_moe_emb_chunks=0,"
+          " no expert parallelism and even num_experts / moe_expert_input_dim."
+      ),
   )
 
   @model_validator(mode="after")
@@ -5858,6 +5890,41 @@ class MaxTextConfig(
 
     if self.use_gmm_v2_heuristic_tiling and not self.use_gmm_v2:
       raise ValueError("`use_gmm_v2_heuristic_tiling=True` requires `use_gmm_v2=True`.")
+
+    if self.moe_combine_kernel == "tc":
+      if not self.sparse_matmul:
+        raise ValueError("`moe_combine_kernel='tc'` requires `sparse_matmul=True`.")
+      if self.use_ring_of_experts or self.use_ragged_sort:
+        raise ValueError("`moe_combine_kernel='tc'` requires `use_ring_of_experts=False` and `use_ragged_sort=False`.")
+
+    if self.moe_permute_kernel == "tc":
+      if not self.moe_use_direct_token_gather:
+        raise ValueError("`moe_permute_kernel='tc'` requires `moe_use_direct_token_gather=True`.")
+      if self.use_ring_of_experts:
+        raise ValueError("`moe_permute_kernel='tc'` requires `use_ring_of_experts=False`.")
+
+    if self.moe_split_expert_weight_layout:
+      if not (self.prefuse_moe_weights and self.shard_exp_on_fsdp and self.sparse_matmul and self.use_gmm_v2):
+        raise ValueError(
+            "`moe_split_expert_weight_layout=True` requires `prefuse_moe_weights=True`, `shard_exp_on_fsdp=True`,"
+            " `sparse_matmul=True` and `use_gmm_v2=True`."
+        )
+      if self.quantization or self.num_moe_emb_chunks > 0 or self.attention in ("vllm_rpa", "vllm_batched_rpa"):
+        raise ValueError(
+            "`moe_split_expert_weight_layout=True` is not supported with quantization, `num_moe_emb_chunks > 0`"
+            " or the vLLM fused MoE attention paths."
+        )
+      if self.ici_expert_parallelism != 1 or self.dcn_expert_parallelism != 1:
+        raise ValueError(
+            "`moe_split_expert_weight_layout=True` requires a static expert group offset, i.e."
+            " `ici_expert_parallelism=1` and `dcn_expert_parallelism=1`."
+        )
+      expert_input_dim = self.emb_dim if self.moe_expert_input_dim <= 0 else self.moe_expert_input_dim
+      if self.num_experts % 2 != 0 or expert_input_dim % 2 != 0:
+        raise ValueError(
+            "`moe_split_expert_weight_layout=True` requires even `num_experts` and expert input dim, got"
+            f" num_experts={self.num_experts}, moe_expert_input_dim={expert_input_dim}."
+        )
 
     for val in self.compress_ratios:
       if val != 0 and val < 4:
