@@ -162,6 +162,9 @@ def get_shaped_batch(config, batch_sharding=None, is_eval=False):
   if getattr(config, "training_objective", "causal_lm") == "block_diffusion":
     shaped_batch["corruption_mask"] = jax.ShapeDtypeStruct(batch_shape, jnp.int32, sharding=batch_sharding)
     shaped_batch["targets_loss_mask"] = jax.ShapeDtypeStruct(batch_shape, jnp.int32, sharding=batch_sharding)
+
+  if max_utils.per_dataset_train_metrics_enabled(config):
+    shaped_batch["dataset_id"] = jax.ShapeDtypeStruct(batch_shape, jnp.int32, sharding=batch_sharding)
   if config.use_multimodal:
     batch_size = config.micro_batch_size_to_eval_on if is_eval else config.micro_batch_size_to_train_on
     is_video = getattr(config, "video_max_grid_t", None) is not None
@@ -2022,6 +2025,8 @@ def add_config_to_summary_writer(config, summary_writer):
     else:
       config_dict = dict(config)
     for key, value in config_dict.items():
+      if key in pyconfig.KEYS_NO_LOGGING:
+        continue
       max_utils.add_text_to_summary_writer(key, str(value), summary_writer)
 
 

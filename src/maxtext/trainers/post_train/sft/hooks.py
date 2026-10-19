@@ -15,7 +15,7 @@
 
 """Training and data loading hooks for SFT"""
 
-from typing import override
+from typing import override  # pylint: disable=no-name-in-module
 
 import jax
 import jax.numpy as jnp
@@ -25,6 +25,12 @@ from maxtext.trainers.post_train.hooks import BaseTrainingHooks, BaseDataHooks
 
 class SFTTrainingHooks(BaseTrainingHooks):
   """Training hooks for SFT."""
+
+  @override
+  def on_train_step_end(self, train_ctx, train_step, train_loss, step_time=0.0):
+    """Write metrics and optionally decode examples from the just-consumed SFT batch."""
+    super().on_train_step_end(train_ctx, train_step, train_loss, step_time)
+    self.metric_logger.maybe_log_text_samples(train_ctx.data_hooks.train_batch, train_step)
 
   @override
   def get_total_weights(self, batch) -> jax.Array:

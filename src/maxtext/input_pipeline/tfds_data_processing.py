@@ -113,6 +113,7 @@ def preprocessing_pipeline(
     drop_remainder: bool = True,
     prefetch_size=tf.data.experimental.AUTOTUNE,
     hf_access_token: str = "",
+    tokenizer_revision: str | None = None,
 ):
   """pipeline for preprocessing TFDS dataset."""
   missing = [c for c in data_column_names if c not in dataset.element_spec]
@@ -141,7 +142,9 @@ def preprocessing_pipeline(
   )
   data_column_names = ("inputs", "targets")
 
-  tokenizer_model = input_pipeline_utils.get_tokenizer(tokenizer_path, tokenizer_type, add_bos, add_eos, hf_access_token)
+  tokenizer_model = input_pipeline_utils.get_tokenizer(
+      tokenizer_path, tokenizer_type, add_bos, add_eos, hf_access_token, tokenizer_revision
+  )
   if tokenizer_model.pad_id is not None:
     pad_id = tokenizer_model.pad_id
   elif tokenizer_model.unk_id is not None:
@@ -240,6 +243,7 @@ def make_tfds_train_iterator(
         num_epochs=config.num_epoch,
         pack_examples=config.packing,
         hf_access_token=config.hf_access_token,
+        tokenizer_revision=getattr(config, "tokenizer_revision", "") or None,
     )
     return multihost_dataloading.MultiHostDataLoadIterator(
         train_dataloader, global_mesh, config.generate_padding_batch_train
@@ -264,6 +268,7 @@ def make_tfds_train_iterator(
         num_epochs=config.num_epoch,
         pack_examples=config.packing,
         hf_access_token=config.hf_access_token,
+        tokenizer_revision=getattr(config, "tokenizer_revision", "") or None,
     )
     global_shape = (config.global_batch_size_to_load, config.max_target_length)
     return multihost_dataloading.RemoteIteratorWrapper(
@@ -304,6 +309,7 @@ def make_tfds_eval_iterator(
         add_eos=config.add_eos,
         pack_examples=config.packing,
         hf_access_token=config.hf_access_token,
+        tokenizer_revision=getattr(config, "tokenizer_revision", "") or None,
     )
     return multihost_dataloading.MultiHostDataLoadIterator(
         eval_dataloader, global_mesh, config.generate_padding_batch_eval
@@ -331,6 +337,7 @@ def make_tfds_eval_iterator(
         add_eos=config.add_eos,
         pack_examples=config.packing,
         hf_access_token=config.hf_access_token,
+        tokenizer_revision=getattr(config, "tokenizer_revision", "") or None,
     )
     global_shape = (config.global_batch_size_to_load_eval, config.max_target_length)
     return multihost_dataloading.RemoteIteratorWrapper(

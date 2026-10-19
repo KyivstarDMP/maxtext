@@ -57,6 +57,9 @@ class _Cfg:
   indexer_sparse_training: bool = False
   indexer_loss_scaling_factor: float = 0.0
   num_vocab_tiling: int = 1
+  per_dataset_metrics: bool = False
+  per_dataset_train_metrics: bool = True
+  per_dataset_names: str = ""
   num_experts: int = 1
   moe_dropless_fallback: str | None = None
   routed_bias: bool = False
@@ -376,6 +379,54 @@ class TestLossFnNNX(unittest.TestCase):
 class TestTrainStepNNX(unittest.TestCase):
   """Cover the NNX branch of train_step (the diff_wrapper / nnx.update path)."""
 
+  def test_train_step_reports_known_per_dataset_counts(self):
+    cfg, ts = _build_state()
+    cfg.per_dataset_metrics = True
+    cfg.per_dataset_names = "a,b"
+    data = _make_data()
+    data["dataset_id"] = jnp.array([[1, 1, 1, 1], [2, 2, 2, 2]], dtype=jnp.int32)
+    data["targets_segmentation"] = data["targets_segmentation"].at[1, -1].set(0)
+    predicted = jnp.argmax(ts.model(data["inputs"], data["inputs_position"]), axis=-1)
+    data["targets"] = jnp.where(data["dataset_id"] == 1, predicted, (predicted + 1) % cfg.vocab_size)
+    state_graphdef, state_pure = nnx.split(ts)
+    _, metrics = pre_train.train_step(
+        state_graphdef, cfg, state_mesh_shardings=None, params_shardings=None, state=state_pure, data=data
+    )
+    self.assertEqual(int(metrics["scalar"]["learning/total_correct"]), 4)
+    np.testing.assert_array_equal(metrics["per_dataset"]["correct_by_ds"], [0, 4, 0])
+    np.testing.assert_array_equal(metrics["per_dataset"]["token_count_by_ds"], [0, 4, 3])
+
+  def test_eval_only_train_step_matches_metrics_off(self):
+    """per_dataset_train_metrics=false trains exactly like metrics-off and needs no dataset_id."""
+    data = _make_data()
+    cfg, ts = _build_state()
+    state_graphdef, state_pure = nnx.split(ts)
+    _, off_metrics = pre_train.train_step(
+        state_graphdef, cfg, state_mesh_shardings=None, params_shardings=None, state=state_pure, data=data
+    )
+    cfg, ts = _build_state()  # Same deterministic initialization; one train_step per state.
+    cfg.per_dataset_metrics = True
+    cfg.per_dataset_train_metrics = False
+    cfg.per_dataset_names = "a,b"
+    state_graphdef, state_pure = nnx.split(ts)
+    _, eval_only_metrics = pre_train.train_step(
+        state_graphdef, cfg, state_mesh_shardings=None, params_shardings=None, state=state_pure, data=data
+    )
+    self.assertNotIn("per_dataset", eval_only_metrics)
+    self.assertNotIn("learning/total_correct", eval_only_metrics["scalar"])
+    for key in ("learning/loss", "learning/raw_grad_norm"):
+      np.testing.assert_allclose(eval_only_metrics["scalar"][key], off_metrics["scalar"][key], rtol=1e-6)
+
+  def test_train_metrics_on_still_require_dataset_ids(self):
+    cfg, ts = _build_state()
+    cfg.per_dataset_metrics = True
+    cfg.per_dataset_names = "a,b"
+    state_graphdef, state_pure = nnx.split(ts)
+    with self.assertRaisesRegex(ValueError, "token-aligned dataset_id"):
+      pre_train.train_step(
+          state_graphdef, cfg, state_mesh_shardings=None, params_shardings=None, state=state_pure, data=_make_data()
+      )
+
   def test_train_step_returns_state_and_metrics(self):
     cfg, ts = _build_state()
     state_graphdef, state_pure = nnx.split(ts)
@@ -560,6 +611,22 @@ class TestEvalStepNNX(unittest.TestCase):
     ):
       self.assertIn(key, metrics["scalar"])
     self.assertTrue(jnp.isfinite(metrics["scalar"]["evaluation/loss"]))
+
+
+class TestEvalOnlyDatasetMetricsNNX(unittest.TestCase):
+  """Named evaluation keeps its accuracy numerator when training attribution is off."""
+
+  def test_eval_step_reports_total_correct_in_eval_only_mode(self):
+    cfg, ts = _build_state()
+    cfg.per_dataset_metrics = True
+    cfg.per_dataset_train_metrics = False
+    state_graphdef, state_pure = nnx.split(ts)
+    data = _make_data(batch=cfg.micro_batch_size_to_eval_on, vocab=cfg.vocab_size)
+    predicted = jnp.argmax(ts.model(data["inputs"], data["inputs_position"]), axis=-1)
+    data["targets"] = predicted
+    metrics = pre_train.eval_step(state_graphdef, cfg, state_pure, data)
+    expected = int(jnp.sum(data["targets_segmentation"] != 0))
+    self.assertEqual(int(metrics["scalar"]["evaluation/total_correct"]), expected)
 
 
 class TestSkipStepOnSpikesNNX(unittest.TestCase):
@@ -852,6 +919,7 @@ class TestTrainingLoopIterationEvalRetry(unittest.TestCase):
       with_first_phase=False,
       first_phase_overflow=False,
       required_rbf=None,
+      named_eval=False,
   ):
     """Runs training_loop_iteration with fake step fns and returns (eval loss used, dropless call count).
 
@@ -885,7 +953,9 @@ class TestTrainingLoopIterationEvalRetry(unittest.TestCase):
 
     def p_eval_step(state, batch, *rng_args):
       del state, batch, rng_args
-      metrics = {"scalar": {"evaluation/total_loss": jnp.array(self._PRIMARY_LOSS)}}
+      metrics = {
+          "scalar": {"evaluation/total_loss": jnp.array(self._PRIMARY_LOSS), "evaluation/total_weights": jnp.array(1.0)}
+      }
       if step_fallback:
         metrics["has_moe_overflow"] = jnp.bool_(has_overflow)
       return metrics
@@ -895,7 +965,9 @@ class TestTrainingLoopIterationEvalRetry(unittest.TestCase):
     def p_eval_step_dropless(state, batch, *rng_args):
       del state, batch, rng_args
       dropless_calls.append(1)
-      return {"scalar": {"evaluation/total_loss": jnp.array(self._DROPLESS_LOSS)}}
+      return {
+          "scalar": {"evaluation/total_loss": jnp.array(self._DROPLESS_LOSS), "evaluation/total_weights": jnp.array(1.0)}
+      }
 
     mesh = jax.sharding.Mesh(np.array(jax.devices()[:1]).reshape(1), ("data",))
     cfg = pytypes.SimpleNamespace(
@@ -949,14 +1021,36 @@ class TestTrainingLoopIterationEvalRetry(unittest.TestCase):
         "dump_hlo_delete_local_after": False,
         "dump_hlo_upload_all": False,
     }
+    if named_eval:
+      dataset_iterator = mock.MagicMock()
+      dataset_iterator.__next__.return_value = jnp.zeros((1,))
+      python_vars["eval_data_iterator"] = {"eval_uk": dataset_iterator}
+      immutable_data["eval_steps"] = 2
+
     with mock.patch.object(pre_train.sharding, "get_input_data_sharding", return_value=None):
       pre_train.training_loop_iteration(jax_device_state, python_vars, immutable_data)
+
+    if named_eval:
+      dataset_iterator.reset.assert_called_once()
+      dataset_iterator.__next__.assert_has_calls([mock.call(), mock.call()])
+      totals = metric_logger_instance.write_per_dataset_eval.call_args.args[0]["eval_uk"]
+      return totals[0] / totals[1], len(dropless_calls)
 
     eval_call = next(
         c for c in metric_logger_instance.buffer_and_write_metrics.call_args_list if not c.kwargs["is_training"]
     )
     used_loss = float(eval_call.args[0]["scalar"]["evaluation/total_loss"])
     return used_loss, len(dropless_calls)
+
+  def test_named_eval_replays_overflowed_batches(self):
+    used_loss, retries = self._run(True, True, True, named_eval=True)
+    self.assertEqual(used_loss, self._DROPLESS_LOSS)
+    self.assertEqual(retries, 2)
+
+  def test_named_eval_keeps_primary_metrics_without_overflow(self):
+    used_loss, retries = self._run(True, False, True, named_eval=True)
+    self.assertEqual(used_loss, self._PRIMARY_LOSS)
+    self.assertEqual(retries, 0)
 
   def test_replays_with_dropless_metrics_on_overflow(self):
     used_loss, dropless_call_count = self._run(step_fallback=True, has_overflow=True, with_dropless=True)

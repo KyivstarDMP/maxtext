@@ -318,6 +318,9 @@ def _create_trainer(model, optimizer, tunix_config, mt_config):
 
 def validate_config(config):
   """Validates the configuration parameters for SFT training."""
+  from maxtext.input_pipeline.input_pipeline_interface import validate_post_train_data_options  # pylint: disable=import-outside-toplevel
+
+  validate_post_train_data_options(config)
   if config.optimizer_memory_host_offload:
     raise ValueError(
         "optimizer_memory_host_offload=True is not supported on the post-training "

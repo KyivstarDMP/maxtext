@@ -14,6 +14,7 @@
 
 """Instruction data processing test."""
 
+import hashlib
 import json
 import os
 import tempfile
@@ -153,6 +154,157 @@ class InstructionDataProcessingTest(unittest.TestCase):
 
       # Test non-existent file
       self.assertIsNone(instruction_data_processing.load_chat_template_from_file("non_existent.jinja"))
+
+  def test_load_chat_template_from_hub_with_revision_token_and_sha(self):
+    template_bytes = b"{% generation %}answer{% endgeneration %}"
+    expected_sha256 = hashlib.sha256(template_bytes).hexdigest()
+    with tempfile.TemporaryDirectory() as tmpdir:
+      downloaded_path = os.path.join(tmpdir, "chat_template.jinja")
+      with open(downloaded_path, "wb") as template_file:
+        template_file.write(template_bytes)
+
+      with patch.object(instruction_data_processing, "hf_hub_download", return_value=downloaded_path) as mock_download:
+        template = instruction_data_processing.load_chat_template_from_file(
+            "hf://example-org/example-model/templates/train.jinja",
+            hf_access_token="test-token",
+            revision="0123456789abcdef0123456789abcdef01234567",
+            expected_sha256=expected_sha256,
+        )
+
+    self.assertEqual(template, template_bytes.decode("utf-8"))
+    mock_download.assert_called_once_with(
+        repo_id="example-org/example-model",
+        filename="templates/train.jinja",
+        revision="0123456789abcdef0123456789abcdef01234567",
+        token="test-token",
+    )
+
+  def test_local_and_hub_jinja2_templates_use_original_suffix_and_verify_sha(self):
+    template_bytes = b"{% generation %}answer{% endgeneration %}"
+    digest = hashlib.sha256(template_bytes).hexdigest()
+    with tempfile.TemporaryDirectory() as tmpdir:
+      # Hub downloads can resolve to an extensionless blob path.
+      for hub in (False, True):
+        with self.subTest(hub=hub):
+          downloaded_path = os.path.join(tmpdir, "blob" if hub else "template.jinja2")
+          with open(downloaded_path, "wb") as template_file:
+            template_file.write(template_bytes)
+          path = "hf://example-org/example-model/template.jinja2" if hub else downloaded_path
+          with patch.object(instruction_data_processing, "hf_hub_download", return_value=downloaded_path):
+            self.assertEqual(
+                instruction_data_processing.load_chat_template_from_file(path, expected_sha256=digest),
+                template_bytes.decode("utf-8"),
+            )
+            with self.assertRaisesRegex(ValueError, "SHA-256 mismatch"):
+              instruction_data_processing.load_chat_template_from_file(path, expected_sha256="0" * 64)
+
+  def test_existing_template_with_unsupported_suffix_has_specific_error(self):
+    with tempfile.TemporaryDirectory() as tmpdir:
+      for hub in (False, True):
+        with self.subTest(hub=hub):
+          downloaded_path = os.path.join(tmpdir, "blob" if hub else "template.unsupported")
+          with open(downloaded_path, "w", encoding="utf-8") as template_file:
+            template_file.write("template")
+          path = "hf://example-org/example-model/template.unsupported" if hub else downloaded_path
+          with patch.object(instruction_data_processing, "hf_hub_download", return_value=downloaded_path):
+            with self.assertRaisesRegex(ValueError, "Unsupported chat template file extension '.unsupported'"):
+              instruction_data_processing.load_chat_template_from_file(path)
+      self.assertIsNone(
+          instruction_data_processing.load_chat_template_from_file(os.path.join(tmpdir, "missing.unsupported"))
+      )
+
+  def test_load_chat_template_normalizes_empty_hub_options_to_none(self):
+    with tempfile.TemporaryDirectory() as tmpdir:
+      downloaded_path = os.path.join(tmpdir, "chat_template.jinja")
+      with open(downloaded_path, "w", encoding="utf-8") as template_file:
+        template_file.write("template")
+
+      with patch.object(instruction_data_processing, "hf_hub_download", return_value=downloaded_path) as mock_download:
+        self.assertEqual(
+            instruction_data_processing.load_chat_template_from_file(
+                "hf://example-org/example-model/chat_template.jinja",
+                hf_access_token="",
+                revision="",
+            ),
+            "template",
+        )
+
+    self.assertIsNone(mock_download.call_args.kwargs["revision"])
+    self.assertIsNone(mock_download.call_args.kwargs["token"])
+
+  def test_load_chat_template_rejects_sha_mismatch(self):
+    with tempfile.TemporaryDirectory() as tmpdir:
+      downloaded_path = os.path.join(tmpdir, "chat_template.jinja")
+      with open(downloaded_path, "w", encoding="utf-8") as template_file:
+        template_file.write("template")
+
+      with patch.object(instruction_data_processing, "hf_hub_download", return_value=downloaded_path):
+        with self.assertRaisesRegex(ValueError, "SHA-256 mismatch"):
+          instruction_data_processing.load_chat_template_from_file(
+              "hf://example-org/example-model/chat_template.jinja",
+              revision="0123456789abcdef0123456789abcdef01234567",
+              expected_sha256="0" * 64,
+          )
+
+  def test_load_local_chat_template_checks_sha(self):
+    template_bytes = b"local template"
+    with tempfile.TemporaryDirectory() as tmpdir:
+      template_path = os.path.join(tmpdir, "chat_template.jinja")
+      with open(template_path, "wb") as template_file:
+        template_file.write(template_bytes)
+
+      self.assertEqual(
+          instruction_data_processing.load_chat_template_from_file(
+              template_path,
+              expected_sha256=hashlib.sha256(template_bytes).hexdigest(),
+          ),
+          "local template",
+      )
+
+  def test_load_chat_template_rejects_revision_inside_uri(self):
+    with patch.object(instruction_data_processing, "hf_hub_download") as mock_download:
+      with self.assertRaisesRegex(ValueError, "set chat_template_revision separately"):
+        instruction_data_processing.load_chat_template_from_file(
+            "hf://example-org/example-model@feature/template/chat_template.jinja"
+        )
+    mock_download.assert_not_called()
+
+  def test_load_chat_template_rejects_percent_encoded_path(self):
+    with patch.object(instruction_data_processing, "hf_hub_download") as mock_download:
+      with self.assertRaisesRegex(ValueError, "Percent-encoded"):
+        instruction_data_processing.load_chat_template_from_file(
+            "hf://example-org/example-model/templates%2Fchat_template.jinja"
+        )
+    mock_download.assert_not_called()
+
+  def test_load_chat_template_rejects_missing_hub_path(self):
+    with patch.object(instruction_data_processing, "hf_hub_download") as mock_download:
+      with self.assertRaisesRegex(ValueError, "include a file path"):
+        instruction_data_processing.load_chat_template_from_file("hf://example-org/example-model")
+    mock_download.assert_not_called()
+
+  def test_load_chat_template_rejects_missing_hub_repository(self):
+    with patch.object(instruction_data_processing, "hf_hub_download") as mock_download:
+      with self.assertRaises(ValueError):
+        instruction_data_processing.load_chat_template_from_file("hf://example-org")
+    mock_download.assert_not_called()
+
+  def test_load_chat_template_rejects_non_model_hub_uri(self):
+    with patch.object(instruction_data_processing, "hf_hub_download") as mock_download:
+      with self.assertRaisesRegex(ValueError, "model repository"):
+        instruction_data_processing.load_chat_template_from_file(
+            "hf://datasets/example-org/example-dataset/chat_template.jinja"
+        )
+    mock_download.assert_not_called()
+
+  @unittest.skipUnless(os.environ.get("MAXTEXT_RUN_NETWORK_TESTS") == "1", "network integration is opt-in")
+  def test_load_public_pinned_hub_chat_template(self):
+    template = instruction_data_processing.load_chat_template_from_file(
+        "hf://HuggingFaceTB/SmolLM3-3B/chat_template.jinja",
+        revision="a07cc9a04f16550a088caea529712d1d335b0ac1",
+    )
+
+    self.assertIn("{% generation", template)
 
 
 class TestCustomDataFormatting(unittest.TestCase):

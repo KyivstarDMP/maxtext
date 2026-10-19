@@ -14,6 +14,8 @@
 
 """Input pipeline"""
 import functools
+import json
+import re
 
 import jax
 from jax.sharding import PartitionSpec as P
@@ -28,6 +30,7 @@ from maxtext.input_pipeline.olmo_grain_data_processing import make_olmo_grain_ev
 from maxtext.input_pipeline.synthetic_data_processing import SyntheticDataIterator
 from maxtext.input_pipeline.synthetic_data_processing import PlaceHolderDataIterator
 from maxtext.utils import max_logging
+from maxtext.utils import max_utils
 from maxtext.utils.sharding import remove_size_one_mesh_axis
 
 
@@ -61,8 +64,159 @@ def create_process_specific_iterator(
   return output_iterator
 
 
+def _parse_dataset_names(value: str, field: str) -> list[str]:
+  """Require unambiguous labels without changing the source order."""
+  names = value.split(",")
+  if any(not name or name != name.strip() for name in names):
+    raise ValueError(f"{field} must contain nonempty names without surrounding whitespace.")
+  if len(set(names)) != len(names):
+    raise ValueError(f"{field} must contain unique names.")
+  if any(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", name) is None for name in names):
+    raise ValueError(f"{field} names must match [A-Za-z0-9][A-Za-z0-9_.-]*.")
+  return names
+
+
+def _validate_per_dataset_train_names(config: pyconfig.HyperParameters) -> None:
+  """Validate source-to-label alignment before any dataset iterator is created."""
+  names = _parse_dataset_names(config.per_dataset_names, "per_dataset_names")
+  if config.grain_train_mixture_config_path:
+    with open(config.grain_train_mixture_config_path, "r", encoding="utf-8") as mixture_file:
+      mixture = json.load(mixture_file)
+    if not isinstance(mixture, dict) or not mixture:
+      raise ValueError("grain_train_mixture_config_path must contain a nonempty JSON object.")
+    if names != list(mixture):
+      raise ValueError("per_dataset_names must match the JSON training mixture keys in their original order.")
+  else:
+    sources = config.grain_train_files.split(";")
+    if any(not source.strip() for source in sources):
+      raise ValueError("Per-dataset metrics require nonempty grain_train_files components.")
+    if len(names) != len(sources):
+      raise ValueError(
+          f"per_dataset_names ({len(names)}) must provide one name per training mixture component ({len(sources)}), "
+          "in grain_train_files order."
+      )
+
+
+def _validate_named_eval_mapping(config: pyconfig.HyperParameters) -> None:
+  """Validate named evaluation labels and their file patterns before any dataset I/O."""
+  eval_names = _parse_dataset_names(config.per_dataset_eval_names, "per_dataset_eval_names")
+  eval_files = config.per_dataset_eval_files.split(";")
+  if any(not source.strip() for source in eval_files):
+    raise ValueError("per_dataset_eval_files must contain nonempty file patterns.")
+  if len(eval_names) != len(eval_files):
+    raise ValueError("per_dataset_eval_names and per_dataset_eval_files must align one-to-one in order.")
+
+
+def _validate_per_dataset_options(config: pyconfig.HyperParameters) -> None:
+  """Reject unsupported or ineffective per-dataset metric settings before any dataset I/O.
+
+  ``per_dataset_metrics`` is the umbrella switch. With ``per_dataset_train_metrics`` (default true) it
+  stamps training sources and reports per-source training metrics; named evaluation runs one eval pass
+  per ``per_dataset_eval_names`` entry. Supported route: text Grain ArrayRecord through
+  ``maxtext.trainers.pre_train.train`` with packing, for ordinary pretraining and for SFT.
+  """
+  named_eval = bool(getattr(config, "per_dataset_eval_names", "") or getattr(config, "per_dataset_eval_files", ""))
+  if not getattr(config, "per_dataset_metrics", False):
+    if named_eval:
+      raise ValueError(
+          "per_dataset_eval_names/per_dataset_eval_files require per_dataset_metrics=true; "
+          "otherwise they would be silently ignored."
+      )
+    return
+  if config.dataset_type != "grain":
+    raise ValueError("Per-dataset metrics require the Grain ArrayRecord pipeline.")
+  if getattr(config, "use_multimodal", False):
+    raise ValueError("Per-dataset metrics are not supported for multimodal inputs.")
+  if getattr(config, "use_dpo", False):
+    raise ValueError("Per-dataset metrics are not supported for DPO inputs.")
+  if getattr(config, "is_offline_distillation", False):
+    raise ValueError("Per-dataset metrics are not supported for offline distillation.")
+  # loss_fn keeps the same guard for direct callers; rejecting here avoids input and model setup.
+  if getattr(config, "training_objective", "causal_lm") == "block_diffusion":
+    raise ValueError("Per-dataset metrics are not supported for block diffusion.")
+  if getattr(config, "use_indexer", False) and not getattr(config, "indexer_sparse_training", False):
+    raise ValueError("Per-dataset metrics are not supported for indexer warm-up.")
+  if not config.packing:
+    raise ValueError("Per-dataset metrics require packing=true for token-aligned dataset IDs.")
+  if config.expansion_factor_real_data > 1:
+    raise ValueError("Per-dataset metrics do not support expansion_factor_real_data > 1 (placeholder hosts).")
+
+  train_metrics = max_utils.per_dataset_train_metrics_enabled(config)
+  if train_metrics or config.per_dataset_names:
+    # Training labels are required for training attribution; supplied labels are always validated.
+    _validate_per_dataset_train_names(config)
+  if not train_metrics:
+    if not named_eval:
+      raise ValueError(
+          "per_dataset_train_metrics=false leaves only named evaluation; set per_dataset_eval_names and "
+          "per_dataset_eval_files, or disable per_dataset_metrics."
+      )
+    if config.eval_interval <= 0:
+      raise ValueError("Eval-only per-dataset metrics (per_dataset_train_metrics=false) require eval_interval > 0.")
+  if named_eval:
+    _validate_named_eval_mapping(config)
+    if config.eval_interval > 0:
+      if config.eval_steps <= 0:
+        raise ValueError("Named per-dataset evaluation requires eval_steps > 0 to bound its padding batches.")
+      if config.target_eval_loss > 0:
+        raise ValueError("target_eval_loss > 0 is not supported with named per-dataset evaluation.")
+
+
+def validate_post_train_data_options(config: pyconfig.HyperParameters) -> None:
+  """Reject dataset attribution options unsupported by the Tunix consumers."""
+  if (
+      getattr(config, "per_dataset_metrics", False)
+      or getattr(config, "per_dataset_eval_files", "")
+      or getattr(config, "per_dataset_eval_names", "")
+  ):
+    raise ValueError(
+        "Per-dataset metrics and named evaluation require maxtext.trainers.pre_train.train; "
+        "Tunix post-training does not support these options."
+    )
+
+
+def _validate_sft_input_options(config: pyconfig.HyperParameters) -> None:
+  """Reject text SFT settings that the selected input pipeline cannot apply."""
+  if not getattr(config, "use_sft", False):
+    return
+  if getattr(config, "use_multimodal", False):
+    text_defaults = {
+        "sft_chat_template_mode": "segmented",
+        "sft_enable_thinking": True,
+        "sft_enable_thinking_column": "",
+        "sft_preserve_thinking": "auto",
+        "sft_long_example_handling": "truncate",
+        "sft_window_pin_leading_context": False,
+        "sft_window_overlap": 256,
+        "sft_window_context_cap": -1,
+        "sft_window_max_fan_out": 32,
+        "sft_window_pinned_context_overflow": "error",
+        "sft_window_pinned_context_warn_fraction": 0.5,
+        "chat_template": "",
+        "chat_template_path": "",
+        "chat_template_revision": "",
+        "chat_template_sha256": "",
+    }
+    unsupported = [key for key, default in text_defaults.items() if getattr(config, key, default) != default]
+    for key in ("train_data_columns", "eval_data_columns"):
+      if "tools" in getattr(config, key, ()):
+        unsupported.append(key)
+    if unsupported:
+      raise ValueError(f"Multimodal SFT does not apply text chat-template options: {', '.join(unsupported)}.")
+  if getattr(config, "sft_long_example_handling", "truncate") == "window":
+    if config.dataset_type == "hf":
+      raise ValueError(
+          "sft_long_example_handling='window' is currently implemented only for the Grain SFT pipeline; "
+          "dataset_type='hf' would otherwise silently use head-truncating SFTPromptMasking."
+      )
+    if getattr(config, "grain_use_elastic_iterator", False):
+      raise ValueError("sft_long_example_handling='window' is not supported with grain_use_elastic_iterator=True.")
+
+
 def create_data_iterator(config: pyconfig.HyperParameters, mesh):
   """Create train and eval data iterators given configs and mesh."""
+  _validate_per_dataset_options(config)
+  _validate_sft_input_options(config)
 
   # Return synthetic dataset if selected
   if config.dataset_type == "synthetic":
@@ -101,6 +255,21 @@ def create_data_iterator(config: pyconfig.HyperParameters, mesh):
       config.max_target_length,
       mesh,
   )
+  if (
+      config.dataset_type == "grain"
+      and getattr(config, "use_sft", False)
+      and getattr(config, "sft_long_example_handling", "truncate") == "window"
+      and getattr(config, "num_epoch", None) is not None
+      and config.num_epoch > 0
+      and not getattr(config, "generate_padding_batch_train", False)
+      and len(process_indices_train) > 1
+  ):
+    max_logging.warning(
+        "Finite multi-host SFT windowing without training padding can exhaust one host before others. "
+        "Independently preflight the minimum available batches across data-loading hosts after rendering, "
+        "windowing, packing and resume, and ensure it covers the planned batch calls. Startup does not "
+        "measure this capacity; this warning does not provide coordinated exhaustion."
+    )
   output_train_iterator = create_process_specific_iterator(config, mesh, process_indices_train, train_iterator)
   if config.expansion_factor_real_data > 1:  # assert number of hosts loading real data
     assert len(process_indices_train) == jax.process_count() // config.expansion_factor_real_data
@@ -118,7 +287,28 @@ def create_data_iterator(config: pyconfig.HyperParameters, mesh):
 
     if config.expansion_factor_real_data > 1:
       assert len(process_indices_eval) == jax.process_count() // config.expansion_factor_real_data
-    output_eval_iterator = create_process_specific_iterator(
-        config, mesh, process_indices_eval, eval_iterator, is_training=False
-    )
+    if config.per_dataset_metrics and config.per_dataset_eval_files:
+      # Option B: one single-dataset eval iterator per component, keyed by name. jit_eval_step is
+      # shape-based, so a dict here is fine; the eval loop runs one pass per entry.
+      names = config.per_dataset_eval_names.split(",")
+      globs = config.per_dataset_eval_files.split(";")
+      # force_padding_batch=True (per-dataset iterators ONLY): these small single-dataset splits do not
+      # divide evenly across hosts, so without padding a short host raises StopIteration and exits the eval
+      # loop early -> unequal jit_eval_step launch counts -> E0200 SPMD desync. Padding keeps every host in
+      # lockstep for a fixed eval_steps launches. The aggregate else-branch below is left untouched (keeps
+      # config.generate_padding_batch_eval).
+      output_eval_iterator = {
+          name: create_process_specific_iterator(
+              config,
+              mesh,
+              process_indices_eval,
+              functools.partial(eval_iterator, eval_files_override=glob, force_padding_batch=True),
+              is_training=False,
+          )
+          for name, glob in zip(names, globs)
+      }
+    else:
+      output_eval_iterator = create_process_specific_iterator(
+          config, mesh, process_indices_eval, eval_iterator, is_training=False
+      )
   return output_train_iterator, output_eval_iterator

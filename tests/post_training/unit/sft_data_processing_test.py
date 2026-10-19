@@ -473,7 +473,7 @@ class SFTDataProcessingTest(unittest.TestCase):
             ]
         }
     )
-    with self.assertRaisesRegex(ValueError, "System messages must be at index 0"):
+    with self.assertRaisesRegex(ValueError, "'system' message found at index 1. It must be at index 0"):
       self.get_data_iterator(dataset, ["messages"])
 
 

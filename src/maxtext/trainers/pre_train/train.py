@@ -85,7 +85,7 @@ from maxtext.utils import maxtext_utils_nnx
 from maxtext.utils import train_utils
 from maxtext.utils import mllog_utils
 from maxtext.utils.gradient_accumulation import gradient_accumulation_loss_and_grad
-from maxtext.utils.vocabulary_tiling import vocab_tiling_nnx_loss
+from maxtext.utils.vocabulary_tiling import _sum_by_dataset, vocab_tiling_nnx_loss
 
 
 class EncoderKwargs(TypedDict, total=False):
@@ -129,6 +129,56 @@ def _one_hot_targets(targets, config, mesh):
 # -----------------------------------------------------------------------------
 
 
+def _num_datasets_plus1(config):
+  """Static [num_datasets + 1]: slot 0 = pad/unknown, 1..num_datasets = mixture components."""
+  return len([n for n in config.per_dataset_names.split(",") if n]) + 1
+
+
+def _per_dataset_from_logits(logits, masked_xent, data, config):
+  """Non-tiled per-dataset (xent_sum, correct_count) vectors of shape [num_datasets+1].
+
+  `masked_xent` is the per-token cross-entropy already multiplied by the completion mask, so a
+  selection sum by `dataset_id` gives each component's summed loss. `correct` is next-token accuracy
+  over the same mask. Both emit an SPMD all-reduce over the DP-sharded batch inside pjit.
+  """
+  num_seg = _num_datasets_plus1(config)
+  ids = data["dataset_id"].reshape(-1)
+  mask = data["targets_segmentation"] != 0
+  xent_sum_by_ds = _sum_by_dataset(masked_xent.reshape(-1), ids, num_seg)
+  correct = (jnp.argmax(logits, axis=-1) == data["targets"]) & mask
+  correct_by_ds = _sum_by_dataset(correct.reshape(-1).astype(jnp.int32), ids, num_seg)
+  return xent_sum_by_ds, correct_by_ds
+
+
+def _total_correct_from_logits(logits, data):
+  """Aggregate next-token correct-token count over the loss mask (non-tiled path only).
+
+  With vocab tiling the decoder returns logits=None, so the tiled path sources this from the
+  tiled scan instead (in both the Linen and NNX loss functions).
+  """
+  return jnp.sum((jnp.argmax(logits, axis=-1) == data["targets"]) & (data["targets_segmentation"] != 0))
+
+
+def _assemble_per_dataset_aux(config, data, xent_sum_by_ds, correct_by_ds):
+  """Per-dataset aux dict (xent_sum / correct / token_count, each [num_datasets+1]) or None.
+
+  Only for the train path (batches carry `dataset_id`); eval Option B runs per-dataset passes and
+  has no `dataset_id`, so this returns None there.
+  """
+  if not (max_utils.per_dataset_train_metrics_enabled(config) and "dataset_id" in data):
+    return None
+  num_seg = _num_datasets_plus1(config)
+  ids = data["dataset_id"].reshape(-1)
+  token_count_by_ds = _sum_by_dataset((data["targets_segmentation"] != 0).reshape(-1).astype(jnp.int32), ids, num_seg)
+  if xent_sum_by_ds is None or correct_by_ds is None:
+    raise ValueError("Per-dataset metrics require loss and correct-token sums; this loss path does not provide them.")
+  return {
+      "xent_sum_by_ds": xent_sum_by_ds,
+      "correct_by_ds": correct_by_ds,
+      "token_count_by_ds": token_count_by_ds,
+  }
+
+
 def loss_fn(model, config, data, dropout_rng, params, sparsity_state=None, is_train=True):
   """loss_fn for both train and eval.
 
@@ -146,6 +196,12 @@ def loss_fn(model, config, data, dropout_rng, params, sparsity_state=None, is_tr
   """
   del dropout_rng, params, sparsity_state  # unused for NNX (kept for signature parity)
   is_block_diffusion = getattr(config, "training_objective", "causal_lm") == "block_diffusion"
+  if getattr(config, "per_dataset_metrics", False):
+    if is_block_diffusion or (config.use_indexer and not config.indexer_sparse_training):
+      raise ValueError("Per-dataset metrics are not supported for block diffusion or indexer warm-up.")
+    if is_train and max_utils.per_dataset_train_metrics_enabled(config) and "dataset_id" not in data:
+      raise ValueError("Per-dataset training metrics require a token-aligned dataset_id in the training batch.")
+  per_dataset_metric_work = max_utils.per_dataset_metric_work_enabled(config, is_train)
   if getattr(config, "attention_type", "global") == "block_diffusion" and not is_block_diffusion:
     raise ValueError(
         "Block-diffusion attention requires target-aligned block-diffusion losses; "
@@ -199,6 +255,12 @@ def loss_fn(model, config, data, dropout_rng, params, sparsity_state=None, is_tr
         "encoder_images": encoder_images,
         "encoder_image_masks": encoder_image_masks,
     }
+
+  # Per-dataset (per mixture component) accumulators; filled in the loss branch below (train only).
+  xent_sum_by_ds = None
+  correct_by_ds = None
+  # Aggregate correct-token count for this batch; used for eval accuracy (train or eval).
+  total_correct = None
   # Flax NNX model: forward pass, then pop Intermediates sown during it.
   logits = model(
       decoder_input_tokens=data["inputs"],
@@ -249,7 +311,11 @@ def loss_fn(model, config, data, dropout_rng, params, sparsity_state=None, is_tr
   elif config.num_vocab_tiling > 1:
     hidden_state_key = ("decoder", "hidden_states")
     hidden_states = maxtext_utils.get_nested_value(intermediate_outputs, hidden_state_key)[0]
-    xent_sum, total_z_loss = vocab_tiling_nnx_loss(model, hidden_states, data, config, is_train)
+    xent_sum, total_z_loss, pd_xent, pd_correct, total_correct = vocab_tiling_nnx_loss(
+        model, hidden_states, data, config, is_train, return_total_correct=True
+    )
+    if per_dataset_metric_work and "dataset_id" in data:
+      xent_sum_by_ds, correct_by_ds = pd_xent, pd_correct
   else:
     if is_block_diffusion:
       logits = block_diffusion_target_alignment.align_logits_to_targets(
@@ -285,12 +351,17 @@ def loss_fn(model, config, data, dropout_rng, params, sparsity_state=None, is_tr
 
     xent_sum = jnp.sum(xent)
     total_z_loss = jnp.sum(z_loss)
+    if per_dataset_metric_work:
+      total_correct = _total_correct_from_logits(logits, data)
+      if "dataset_id" in data:
+        xent_sum_by_ds, correct_by_ds = _per_dataset_from_logits(logits, xent, data, config)
 
   if is_block_diffusion:
     assert targets_loss_mask is not None
     total_weights = jnp.sum(targets_loss_mask)
   else:
     total_weights = jnp.sum(data["targets_segmentation"] != 0)
+  per_dataset_aux = _assemble_per_dataset_aux(config, data, xent_sum_by_ds, correct_by_ds)
   # If gradient accumulation is enabled, we don't need to divide xent_sum
   # by total_weights and then multiply the computed gradient by total_weights,
   # since it's equivalent to computing the gradient from xent_sum.
@@ -309,7 +380,6 @@ def loss_fn(model, config, data, dropout_rng, params, sparsity_state=None, is_tr
     # updates and scaling internally.
     loss = xent_sum / (total_weights + EPS)
 
-  # We keep z-loss normalized by total_weights.
   total_z_loss = total_z_loss / (total_weights + EPS)
 
   # The auxiliary losses below (MTP, indexer, MoE load balance) are already
@@ -434,6 +504,11 @@ def loss_fn(model, config, data, dropout_rng, params, sparsity_state=None, is_tr
       load_ratios = jnp.concatenate(load_ratios)
       aux["moe_max_load_ratio"] = jnp.max(load_ratios)
       aux["moe_max_load_ratio_mean"] = jnp.mean(load_ratios)
+
+  if per_dataset_aux is not None:
+    aux["per_dataset"] = per_dataset_aux
+  if total_correct is not None:
+    aux["total_correct"] = total_correct
   return loss, aux
 
 
@@ -612,6 +687,7 @@ def train_step(model, config, state_mesh_shardings, params_shardings, state, dat
   moe_bias_updates = aux.get("moe_bias_updates")
   mtp_moe_bias_updates = aux.get("mtp_moe_bias_updates")
   mtp_loss = aux.get("mtp_loss", 0.0)
+  per_dataset = aux.get("per_dataset")
   new_opt_state = None
   bias_metrics = {}
   # log_step_diagnostics: the updated router biases and this step's bias updates (see step_diagnostics).
@@ -764,6 +840,11 @@ def train_step(model, config, state_mesh_shardings, params_shardings, state, dat
   if getattr(config, "log_required_ragged_buffer_factor", False) and "moe_required_rbf" in aux:
     # Top-level (not "scalar"): a per-layer vector, read by training_loop_iteration for the REQUIRED_RBF line.
     metrics["moe_required_rbf"] = aux["moe_required_rbf"]
+
+  if per_dataset is not None:
+    metrics["per_dataset"] = per_dataset
+    # Independent scalar reduction, never reconstructed from the grouped vector.
+    metrics["scalar"]["learning/total_correct"] = aux["total_correct"].astype(jnp.float32)
   if getattr(config, "record_internal_nn_metrics", False):
     record_activation_metrics(metrics, intermediate_outputs, config)
 
@@ -793,18 +874,23 @@ def eval_step(model, config, state, data, dropout_rng=None):
   indexer_loss = aux.get("indexer_loss", 0.0)
   mtp_loss = aux.get("mtp_loss", 0.0)
   eval_total_loss = xent_sum
-  metrics = {
-      "scalar": {
-          "evaluation/loss": loss,
-          "evaluation/z_loss": z_loss,
-          "evaluation/total_loss": eval_total_loss,
-          "evaluation/total_weights": total_weights,
-          "evaluation/moe_lb_loss": moe_lb_loss,
-          "evaluation/indexer_loss": indexer_loss,
-          "evaluation/mtp_loss": mtp_loss,
-          "evaluation/mtp_acceptance_rate_percent": mtp_acceptance_rate,
-      },
+  eval_scalar = {
+      "evaluation/loss": loss,
+      "evaluation/z_loss": z_loss,
+      "evaluation/total_loss": eval_total_loss,
+      "evaluation/total_weights": total_weights,
+      "evaluation/moe_lb_loss": moe_lb_loss,
+      "evaluation/indexer_loss": indexer_loss,
+      "evaluation/mtp_loss": mtp_loss,
+      "evaluation/mtp_acceptance_rate_percent": mtp_acceptance_rate,
   }
+  # loss_fn supplies an independent correct-token count when per_dataset_metrics is enabled,
+  # for both tiled and full-logit paths. Named per-dataset eval (Option B) consumes it;
+  # the ordinary aggregate eval logger does not report accuracy.
+  eval_total_correct = aux.get("total_correct")
+  if eval_total_correct is not None:
+    eval_scalar["evaluation/total_correct"] = eval_total_correct.astype(jnp.float32)
+  metrics = {"scalar": eval_scalar}
   if config.moe_dropless_fallback == "step":
     metrics["has_moe_overflow"] = aux.get("has_moe_overflow", False)
   if config.moe_dropless_fallback == "layer":
@@ -961,45 +1047,82 @@ def training_loop_iteration(
       wait_t = time.perf_counter()
       prefill_thread.join(timeout=600)
       max_logging.log(f"eval cache prefill: waited {time.perf_counter() - wait_t:.3f} s before eval")
-    # Explicitly reset the eval iterator and counters before starting the eval loop
-    if hasattr(eval_data_iterator, "reset"):
-      eval_data_iterator.reset()
-    metric_logger_instance.reset_eval_metrics()
-    mllog_utils.eval_start(config, completed_step, start_step=start_step)
-    max_logging.log(f"Starting eval after train step {step}")
+    if isinstance(eval_data_iterator, dict):
+      # Named iterators pad exhausted hosts so every process issues the same collectives.
+      assert eval_steps > 0, "Named evaluation requires eval_steps > 0 to bound padded iterators."
+      eval_sharding = sharding.get_input_data_sharding(config, mesh, rules=config.logical_axis_rules_for_eval)
+      per_dataset_eval = {}
+      eval_loop_start = datetime.datetime.now()
+      mllog_utils.eval_start(config, completed_step, start_step=start_step)
+      for ds_name, ds_iter in eval_data_iterator.items():
+        ds_iter.reset()
+        xent_sum_acc, tokens_acc, correct_acc = 0.0, 0.0, 0.0
+        has_correct = True
+        for _ in range(eval_steps):
+          eval_batch = jax.device_put(next(ds_iter), eval_sharding)
+          with jax.set_mesh(mesh), logical_axis_rules(logical_axis_rules_for_eval):
+            eval_metrics = p_eval_step(state, eval_batch, *step_rng_args)
+            if (
+                config.moe_dropless_fallback == "step"
+                and p_eval_step_dropless is not None
+                and bool(eval_metrics.get("has_moe_overflow"))
+            ):
+              max_logging.log(f"eval[{ds_name}]: replaying overflowed batch with dropless buffer")
+              eval_metrics = p_eval_step_dropless(state, eval_batch, *step_rng_args)
+            scalar = eval_metrics["scalar"]
+          xent_sum_acc += float(scalar["evaluation/total_loss"])
+          tokens_acc += float(scalar["evaluation/total_weights"])
+          if "evaluation/total_correct" in scalar:
+            correct_acc += float(scalar["evaluation/total_correct"])
+          else:
+            has_correct = False
+        per_dataset_eval[ds_name] = (xent_sum_acc, tokens_acc, correct_acc if has_correct else None)
+        max_logging.log(f"  eval[{ds_name}]: {eval_steps} steps, {int(tokens_acc)} loss-tokens")
+      metric_logger_instance.write_per_dataset_eval(per_dataset_eval, step)
+      mllog_utils.validation_time(completed_step, (datetime.datetime.now() - eval_loop_start).total_seconds())
+      total_eval_loss = sum(values[0] for values in per_dataset_eval.values())
+      total_eval_tokens = sum(values[1] for values in per_dataset_eval.values())
+      mllog_utils.eval_stop(config, completed_step, total_eval_loss / (total_eval_tokens + EPS), start_step=start_step)
+    else:
+      # Explicitly reset the eval iterator and counters before starting the eval loop
+      if hasattr(eval_data_iterator, "reset"):
+        eval_data_iterator.reset()
+      metric_logger_instance.reset_eval_metrics()
+      mllog_utils.eval_start(config, completed_step, start_step=start_step)
+      max_logging.log(f"Starting eval after train step {step}")
 
-    eval_step_count = 0
-    last_eval_step_completion = datetime.datetime.now()
-    metric_logger_instance.mark_eval_loop_start()
-    # pylint: disable=not-callable
-    for eval_batch in eval_data_iterator:
-      # Shard input eval data
-      eval_batch = jax.device_put(
-          eval_batch, sharding.get_input_data_sharding(config, mesh, rules=config.logical_axis_rules_for_eval)
-      )
-      with jax.set_mesh(mesh), logical_axis_rules(logical_axis_rules_for_eval):
-        eval_metrics = p_eval_step(state, eval_batch, *step_rng_args)
-        if (
-            config.moe_dropless_fallback == "step"
-            and p_eval_step_dropless is not None
-            and bool(eval_metrics.get("has_moe_overflow"))
-        ):
-          max_logging.log(
-              f"Eval step {eval_step_count}: MoE ragged buffer overflow detected! "
-              f"Replaying eval step with dropless buffer..."
-          )
-          eval_metrics = p_eval_step_dropless(state, eval_batch, *step_rng_args)
-      eval_step_time_delta = datetime.datetime.now() - last_eval_step_completion
+      eval_step_count = 0
       last_eval_step_completion = datetime.datetime.now()
-      metric_logger_instance.buffer_and_write_metrics(
-          eval_metrics, eval_step_count, step_time_delta=eval_step_time_delta, is_training=False
-      )
-      eval_step_count += 1
-      # Stop before fetching another batch: the extra fetch would reshard a batch that
-      # is never used, and the data loading hosts may already be out of data while the
-      # placeholder iterators of the other hosts keep going.
-      if 0 < eval_steps <= eval_step_count:
-        break
+      metric_logger_instance.mark_eval_loop_start()
+      # pylint: disable=not-callable
+      for eval_batch in eval_data_iterator:
+        # Shard input eval data
+        eval_batch = jax.device_put(
+            eval_batch, sharding.get_input_data_sharding(config, mesh, rules=config.logical_axis_rules_for_eval)
+        )
+        with jax.set_mesh(mesh), logical_axis_rules(logical_axis_rules_for_eval):
+          eval_metrics = p_eval_step(state, eval_batch, *step_rng_args)
+          if (
+              config.moe_dropless_fallback == "step"
+              and p_eval_step_dropless is not None
+              and bool(eval_metrics.get("has_moe_overflow"))
+          ):
+            max_logging.log(
+                f"Eval step {eval_step_count}: MoE ragged buffer overflow detected! "
+                f"Replaying eval step with dropless buffer..."
+            )
+            eval_metrics = p_eval_step_dropless(state, eval_batch, *step_rng_args)
+        eval_step_time_delta = datetime.datetime.now() - last_eval_step_completion
+        last_eval_step_completion = datetime.datetime.now()
+        metric_logger_instance.buffer_and_write_metrics(
+            eval_metrics, eval_step_count, step_time_delta=eval_step_time_delta, is_training=False
+        )
+        eval_step_count += 1
+        # Stop before fetching another batch: the extra fetch would reshard a batch that
+        # is never used, and the data loading hosts may already be out of data while the
+        # placeholder iterators of the other hosts keep going.
+        if 0 < eval_steps <= eval_step_count:
+          break
 
   prof.maybe_deactivate_profiler(step, state)
 
@@ -1009,6 +1132,7 @@ def training_loop_iteration(
   metric_logger_instance.buffer_and_write_metrics(metrics, step, step_time_delta)
   if not ran_eval:
     mllog_utils.step_end(config, completed_step)
+  metric_logger_instance.maybe_log_text_samples(example_batch, step)
 
   # Pack mutated state back to dicts
   jax_device_state["state"] = state

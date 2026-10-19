@@ -626,7 +626,12 @@ def make_c4_mlperf_train_iterator(
 
   train_ds = rekey(train_ds, {"inputs": None, "targets": train_col})
   sp_tokenizer = get_tokenizer(
-      config.tokenizer_path, config.tokenizer_type, config.add_bos, config.add_eos, config.hf_access_token
+      config.tokenizer_path,
+      config.tokenizer_type,
+      config.add_bos,
+      config.add_eos,
+      config.hf_access_token,
+      tokenizer_revision=getattr(config, "tokenizer_revision", "") or None,
   )
   use_stream_chunking = getattr(config, "use_stream_chunking", None)
   train_ds = preprocess_train_dataset(
@@ -688,7 +693,12 @@ def make_c4_mlperf_eval_iterator(
   eval_ds = rekey(eval_ds, {"inputs": None, "targets": eval_col})
 
   sp_tokenizer = get_tokenizer(
-      config.tokenizer_path, config.tokenizer_type, config.add_bos, config.add_eos, config.hf_access_token
+      config.tokenizer_path,
+      config.tokenizer_type,
+      config.add_bos,
+      config.add_eos,
+      config.hf_access_token,
+      tokenizer_revision=getattr(config, "tokenizer_revision", "") or None,
   )
 
   # Only the first `global_batch_size_to_eval_on` rows of the loaded global batch are

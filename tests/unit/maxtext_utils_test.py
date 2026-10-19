@@ -1136,6 +1136,7 @@ class TestGetShapedBatch(unittest.TestCase):
       use_mrope=False,
       model_name="llama3.1-8b",
       training_objective="causal_lm",
+      per_dataset_metrics=False,
   ):
     """Builds the config subset consumed by get_shaped_batch."""
     cfg = MagicMock()
@@ -1147,6 +1148,7 @@ class TestGetShapedBatch(unittest.TestCase):
     cfg.use_mrope = use_mrope
     cfg.model_name = model_name
     cfg.training_objective = training_objective
+    cfg.per_dataset_metrics = per_dataset_metrics
     cfg.video_max_grid_t = None
     cfg.video_max_grid_h = None
     cfg.video_max_grid_w = None
@@ -1165,6 +1167,23 @@ class TestGetShapedBatch(unittest.TestCase):
         "targets_segmentation",
     ):
       self.assertIn(key, batch)
+
+  def test_dataset_id_is_present_only_when_metrics_are_enabled(self):
+    expected_keys = {
+        "inputs",
+        "inputs_position",
+        "inputs_segmentation",
+        "targets",
+        "targets_position",
+        "targets_segmentation",
+    }
+    for enabled in (False, True):
+      with self.subTest(per_dataset_metrics=enabled):
+        batch = maxtext_utils.get_shaped_batch(self._make_cfg(per_dataset_metrics=enabled))
+        self.assertEqual(set(batch), expected_keys | ({"dataset_id"} if enabled else set()))
+        if enabled:
+          self.assertEqual(batch["dataset_id"].shape, (4, 16))
+          self.assertEqual(batch["dataset_id"].dtype, jnp.int32)
 
   def test_standard_shape(self):
     cfg = self._make_cfg()
@@ -1502,6 +1521,22 @@ class TestAddConfigToSummaryWriter(unittest.TestCase):
       # Should have been called once per config key (process_index==0 in tests)
       if jax.process_index() == 0:
         self.assertEqual(mock_add.call_count, 2)
+
+  def test_excludes_keys_marked_no_logging(self):
+    sentinel = "not-for-summary"
+    cfg = MagicMock()
+    cfg.get_keys.return_value = {
+        "learning_rate": 0.001,
+        "hf_access_token": sentinel,
+    }
+    mock_writer = MagicMock()
+
+    with unittest.mock.patch("maxtext.utils.max_utils.add_text_to_summary_writer") as mock_add:
+      maxtext_utils.add_config_to_summary_writer(cfg, mock_writer)
+
+    if jax.process_index() == 0:
+      mock_add.assert_called_once_with("learning_rate", "0.001", mock_writer)
+      self.assertNotIn(sentinel, str(mock_add.call_args_list))
 
 
 class TestMaybeDumpJaxpr(unittest.TestCase):
