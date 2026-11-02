@@ -14,9 +14,13 @@
 
 """Trainer abstractions.
 
-Defines the core Trainer interface, republishes the data types shared with
-Tunix (WeightedMetric, LossOutput, TrainerPayload), and defines the on-device
-MetricsBuffer used by the training loop.
+Defines the core Trainer interface (`AbstractTrainingEngine`), the on-device
+`MetricsBuffer` used by the training loop, and `TrainingConfig`.
+
+The trainer data types shared with Tunix -- `WeightedMetric`, `LossOutput`,
+`TrainerPayload` and `RLTrainerPayload` -- are not declared here. They are
+imported from Tunix and re-exported through `__all__`, so that MaxText and Tunix
+name one class object per type; see the comment above those imports for why.
 
 Note: this module imports Tunix, so `training_engine` requires MaxText's
 post-training dependency bundle (`google-tunix`, declared in
@@ -52,6 +56,12 @@ import jax
 # of MaxText's identically-named class, so the annotation described a type that
 # never appeared.
 #
+# `RLTrainerPayload` is re-exported alongside it because `TrainerPayload` is now an empty
+# base -- the arrays live on the subclasses, so anything reading a payload must name this
+# one. It is prompt/completion-split, not whole-row. Do not add a whole-row class here to
+# avoid the concatenation: that is the duplicate-class problem described above, and it
+# drifts the moment Tunix changes a field.
+#
 # WeightedMetric must come from `tunix.sft.utils`, NOT from
 # `tunix.experimental.metrics.metrics` -- the latter declares a same-named class
 # whose `compute()` and `compute_scale()` raise NotImplementedError.
@@ -60,6 +70,7 @@ import jax
 # keeps pylint from reporting them as unused imports. Do not use the redundant-alias
 # form (`X as X`) instead: MaxText's pylint config does not recognise that convention
 # and reports `C0414 useless-import-alias` for every one of them.
+from tunix.experimental.common.datatypes import RLTrainerPayload
 from tunix.experimental.common.datatypes import TrainerPayload
 from tunix.sft.utils import LossOutput
 from tunix.sft.utils import WeightedMetric
@@ -68,6 +79,7 @@ __all__ = [
     "AbstractTrainingEngine",
     "LossOutput",
     "MetricsBuffer",
+    "RLTrainerPayload",
     "TrainerPayload",
     "TrainingConfig",
     "WeightedMetric",
@@ -152,7 +164,7 @@ class AbstractTrainingEngine(abc.ABC):
     """
 
   @abc.abstractmethod
-  def compile(self, dummy_data: TrainerPayload) -> None:
+  def compile(self, dummy_data: TrainerPayload | None = None) -> None:
     """Triggers JAX compilation. `with_loss_fn` must be called first.
 
     Args:
@@ -188,6 +200,24 @@ class AbstractTrainingEngine(abc.ABC):
     Args:
       payload: Packed micro-batch payload for evaluation.
       **kwargs: Additional evaluation keyword arguments.
+    """
+
+  @abc.abstractmethod
+  def fwd_only(self, fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+    """Read-only.
+
+    Runs a forward pass with the trainer model and caller-supplied function.
+
+    The engine owns model access and shards `args`/`kwargs` on its data axis;
+    `fn` owns the computation and must not mutate the model.
+
+    Args:
+      fn: Called as `fn(model, *args, **kwargs)`.
+      *args: Positional arguments forwarded to `fn` after sharding.
+      **kwargs: Keyword arguments forwarded to `fn` after sharding.
+
+    Returns:
+      Whatever `fn` returns.
     """
 
   @abc.abstractmethod

@@ -40,7 +40,7 @@ from typing import Any, Callable, overload
 from etils import epath
 from flax import nnx
 from flax.core.meta import Partitioned
-import flax.linen as nn
+from flax.core.spmd import logical_axis_rules
 from huggingface_hub import get_token
 import jax
 import jax.numpy as jnp
@@ -48,11 +48,14 @@ from jax.sharding import Mesh
 from maxtext.common import checkpointing
 from maxtext.common.common_types import MODEL_MODE_AUTOREGRESSIVE, MODEL_MODE_TRAIN
 from maxtext.configs import pyconfig
+from maxtext.experimental.lineage import lineage_adapter
 from maxtext.integration.tunix.tunix_adapter import TunixMaxTextAdapter
+from maxtext.integration.vllm.convert_utils import _partition_size
+from maxtext.layers import nnx_wrappers
 from maxtext.layers import quantizations
 from maxtext.models import models
 from maxtext.utils import max_logging
-from maxtext.utils import max_utils, maxtext_utils, maxtext_utils_nnx, sharding
+from maxtext.utils import maxtext_utils, maxtext_utils_nnx, sharding
 import numpy as np
 from orbax import checkpoint as ocp
 
@@ -179,6 +182,9 @@ def _align_checkpoint_to_model_shapes(ckpt_arr, model_arr, logical_axes=None):
         "If the checkpoint was saved with scan_layers=True (stacked layers), convert it to "
         "unscanned format before loading with vLLM (vllm.yml sets scan_layers=False)."
     )
+  if len(ckpt_shape) == 2 and ckpt_shape == model_shape[::-1]:
+    return jax.device_put(jnp.transpose(ckpt_arr), model_arr.sharding)
+
   axes = _normalize_logical_axes(logical_axes)
   if axes is None or len(axes) != len(model_shape):
     axes = (None,) * len(model_shape)
@@ -212,6 +218,19 @@ def _align_checkpoint_to_model_shapes(ckpt_arr, model_arr, logical_axes=None):
         )
       result = jnp.repeat(result, model_dim // ckpt_dim, axis=axis)
   return jax.device_put(result, model_arr.sharding)
+
+
+def _intersect_with_metadata(target, meta_tree):
+  """Returns the sub-tree of `target` whose paths exist in checkpoint `meta_tree`."""
+  if not hasattr(target, "items"):
+    return target
+  out = {}
+  for k, v in target.items():
+    if hasattr(meta_tree, "items") and k in meta_tree:
+      sub_tree = _intersect_with_metadata(v, meta_tree[k])
+      if not hasattr(sub_tree, "items") or sub_tree:
+        out[k] = sub_tree
+  return out
 
 
 def _fuse_moe_weights(ckpt_tree, model_arrays_tree):
@@ -308,21 +327,6 @@ def _fuse_moe_weights(ckpt_tree, model_arrays_tree):
     return new_node
 
   return jax.tree_util.tree_map_with_path(_maybe_fuse, ckpt_tree, is_leaf=_is_fusion_site)
-
-
-def _partition_size(partition, mesh):
-  """Total mesh-axis size used to shard a single tensor axis.
-
-  ``partition`` is a single PartitionSpec entry: ``None`` (unsharded), a single
-  mesh-axis name (str), or a tuple of mesh-axis names.
-  """
-  if partition is None:
-    return 1
-  names = (partition,) if isinstance(partition, str) else tuple(partition)
-  size = 1
-  for n in names:
-    size *= mesh.shape[n]
-  return size
 
 
 def _stored_shape_evenly_shardable(restore_arg, stored_shape):
@@ -488,7 +492,7 @@ def from_config(
     model_mode: str = MODEL_MODE_TRAIN,
     rngs: None = None,
     quant_mode_str: str = "train",
-) -> nn.Module:
+) -> nnx_wrappers.ToLinen:
   ...
 
 
@@ -513,8 +517,11 @@ def from_config(
     model_mode: str = MODEL_MODE_TRAIN,
     rngs: nnx.Rngs | None = None,
     quant_mode_str: str = "train",
-) -> nn.Module | models.Transformer:
+) -> nnx_wrappers.ToLinen | models.Transformer:
   """Load a pretrained MaxText model from checkpoint.
+
+  With `rngs` this returns the NNX `Transformer`. Without it, it returns the
+  Linen-wrapped model from `models.transformer_as_linen`, which is deprecated.
 
   `quant_mode_str` is one of "train", "convert", "serve" — controls the AQT
   quantization mode at model construction time. NNX layers freeze their
@@ -531,6 +538,8 @@ def from_config(
 
 def get_transformer_model(config, mesh, quant, model_mode: str = MODEL_MODE_TRAIN, rngs: nnx.Rngs | None = None):
   """Returns the transformer model based on the configuration."""
+  if rngs is not None and lineage_adapter.is_native(config):
+    return lineage_adapter.LineageTransformer(config, mesh, quant=quant, rngs=rngs, model_mode=model_mode)
   if rngs is not None:
     return models.Transformer(config, mesh, quant=quant, rngs=rngs, model_mode=model_mode)
   else:
@@ -541,6 +550,11 @@ def create_model(
     config, mesh, model_mode: str = MODEL_MODE_TRAIN, rngs: nnx.Rngs | None = None, *, quant_mode_str: str = "train"
 ):
   """Instantiates and returns the model object, sharded across the mesh."""
+  if config.use_m3_model:
+    from maxtext.m3 import models as m3_models  # pylint: disable=import-outside-toplevel
+
+    return m3_models.create_model(config, mesh, rngs=rngs, quant_mode_str=quant_mode_str)
+
   # Model definition
   quant = quantizations.configure_quantization(config, quant_mode_str=quant_mode_str)
   model = get_transformer_model(config, mesh, quant, model_mode=model_mode, rngs=rngs)
@@ -573,7 +587,7 @@ def create_nnx_abstract_model(
       abstract_model: The stateful NNX model instance in an abstract state.
   """
 
-  with nn.logical_axis_rules(config.logical_axis_rules):
+  with logical_axis_rules(config.logical_axis_rules):
     _create_model = get_nnx_create_model_fn(config, mesh, devices, model_mode, rng_key, quant_mode_str=quant_mode_str)
     # Use nnx.eval_shape + our scan-axis-aware sharding helper instead of
     # nnx.get_abstract_model, which uses get_var_pspec internally and ignores
@@ -594,60 +608,6 @@ def create_nnx_abstract_model(
         named_sharding_state,
     )
     return _create_model, nnx.merge(graphdef, abstract_state)
-
-
-def create_nnx_sharded_model_hybrid(config, mesh=None, devices=None, model_mode=MODEL_MODE_TRAIN, rng_key=None):
-  """Creates a sharded model for hybrid NNX modules containing Linen sub-modules.
-
-  DEPRECATED: This function is a transitional utility for the Linen-to-NNX
-  migration. It should be removed once all model components are ported to
-  pure NNX modules.
-
-  This function specifically handles the complexity of "mixed" state initialization,
-  where logical sharding annotations must be resolved for both NNX native
-  Parameters and legacy Linen variables wrapped via the NNX-Linen bridge.
-  It ensures that both systems correctly respect the provided mesh and
-  logical axis rules during the abstraction/sharding planning phase.
-  """
-  _create_model_partial = get_nnx_create_model_fn(config, mesh, devices, model_mode, rng_key)
-
-  with nn.logical_axis_rules(config.logical_axis_rules):
-    abstract_model = nnx.eval_shape(_create_model_partial)
-  graphdef, abstract_state = nnx.split(abstract_model)
-  specs = nnx.get_partition_spec(abstract_state)
-
-  if mesh is None:
-    mesh = abstract_model.mesh
-
-  # JIT a function that creates the model state with proper sharding from the start.
-  # By providing out_shardings, we instruct JAX to produce sharded output directly,
-  # avoiding a large intermediate allocation on a single device.
-  with nn.logical_axis_rules(config.logical_axis_rules):
-    out_shardings = nn.logical_to_mesh_sharding(specs, mesh)
-
-  @partial(jax.jit, out_shardings=out_shardings)
-  def create_sharded_state():
-    # This will be JIT-compiled. JAX knows the output sharding and can
-    # initialize the parameters directly on the target devices in a sharded way.
-    model = _create_model_partial()
-    return nnx.state(model)
-
-  with mesh:
-    # Create the model with sharded parameters.
-    with nn.logical_axis_rules(config.logical_axis_rules):
-      sharded_state = create_sharded_state()
-    model = nnx.merge(graphdef, sharded_state)
-
-    # print weights sharding info under debug sharding mode
-    if config.debug_sharding:
-      max_utils.print_non_trivial_mesh_axis(model.mesh)
-      maxtext_utils.print_shardings_params(
-          params=sharded_state,
-          params_sharding=out_shardings,
-          mesh=model.mesh,
-          logical_annotations=specs,
-      )
-    return model
 
 
 def setup_configs_and_devices(
@@ -1086,15 +1046,23 @@ def from_pretrained(
             target_for_restore, metadata.item_metadata.tree["params"]["params"], False
         )
 
+        # Linen checkpoints keep non-trainable variables (e.g. `Tid2EidVar`) in
+        # collections beside "params"; restore the model leaves they hold too.
+        ckpt_collections = metadata.item_metadata.tree["params"]
         item_to_restore = {"params": {"params": target_for_restore}}
-        base_restore_args = ocp.checkpoint_utils.construct_restore_args(target_for_restore)
+        for col, col_meta in ckpt_collections.items():
+          if col != "params":
+            col_target = _intersect_with_metadata(target_for_restore, col_meta)
+            if col_target:
+              item_to_restore["params"][col] = col_target
         restore_args = {
             "params": {
-                "params": _fix_restore_args_for_shape_mismatch(
-                    base_restore_args,
-                    metadata.item_metadata.tree["params"]["params"],
+                col: _fix_restore_args_for_shape_mismatch(
+                    ocp.checkpoint_utils.construct_restore_args(col_target),
+                    ckpt_collections[col],
                     mesh,
                 )
+                for col, col_target in item_to_restore["params"].items()
             }
         }
       else:
@@ -1192,6 +1160,9 @@ def from_pretrained(
         )
       else:
         checkpoint = restored["params"]["params"]
+        for col, col_tree in restored["params"].items():
+          if col != "params":
+            checkpoint = checkpointing._deep_merge_dicts(checkpoint, col_tree)  # pylint: disable=protected-access
 
       if checkpoint:
         # Same QTensor caveat as `_build_value_target` / `_free_device_memory`:
@@ -1207,7 +1178,7 @@ def from_pretrained(
         )
         # ``specs`` (nnx.get_partition_spec(abstract_state) at the top of from_pretrained)
         # is the source of truth for logical axis names — it's the input to
-        # nn.logical_to_mesh_sharding.  Each leaf is a PartitionSpec whose entries are
+        # the logical-to-mesh sharding conversion.  Each leaf is a PartitionSpec whose entries are
         # logical axis names (or None / nested tuples).  Reuse it for repeat/zero-pad
         # dispatch in _align_checkpoint_to_model_shapes.
         # nnx.get_partition_spec returns Variables wrapping PartitionSpecs at the leaves;
@@ -1260,6 +1231,16 @@ def from_pretrained(
 
         checkpoint = _walk_align(checkpoint, model_arrays, logical_axes_tree)
         nnx.update(model, checkpoint)
+        unrestored = [
+            jax.tree_util.keystr(path)
+            for path, leaf in jax.tree_util.tree_flatten_with_path(nnx.state(model))[0]
+            if isinstance(leaf, jax.Array) and leaf.is_deleted()
+        ]
+        if unrestored:
+          raise ValueError(
+              f"Checkpoint '{config.load_parameters_path}' has no value for {len(unrestored)} model "
+              f"variables: {unrestored[:5]}"
+          )
       else:
         raise ValueError(
             f"Checkpoint restore from '{config.load_parameters_path}' yielded no parameters. "

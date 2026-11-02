@@ -31,6 +31,7 @@ from packaging.version import Version
 
 from etils import epath
 import flax
+from flax.core.spmd import get_logical_axis_rules
 import jax
 from pathlib import Path
 from contextlib import contextmanager
@@ -349,8 +350,8 @@ def initialize_jax_for_gpu(raw_keys):
 def initialize_jax_for_cpu(raw_keys):
   """Jax distributed initialize for CPUs. Includes retries until the coordinator is ready."""
   coordinator_ip_address = get_coordinator_ip_address()
-  coordinator_address = coordinator_ip_address + ":1234"  # JAX coordinator port used in XPK
-  # Env variables to be set in XPK or otherwise
+  coordinator_address = coordinator_ip_address + ":1234"  # JAX coordinator port (the port XPK exposes for CPU workloads)
+  # These env variables must be set by the launcher (XPK sets them for CPU workloads)
   job_index = int(os.environ.get("JOB_INDEX"))  # pyrefly: ignore[bad-argument-type]
   job_completion_index = int(os.environ.get("JOB_COMPLETION_INDEX"))  # pyrefly: ignore[bad-argument-type]
   processes_in_job = int(os.environ.get("PROCESSES_IN_JOB"))  # pyrefly: ignore[bad-argument-type]
@@ -802,10 +803,12 @@ def print_cpu_ram_stats(label: str):
     max_logging.log(f"\tRAM stats unavailable, error: {ex}")
 
 
-def print_compiled_memory_stats(compiled_stats):
+def print_compiled_memory_stats(compiled_stats, prefix: str = ""):
   """Prints a summary of the compiled memory statistics."""
   if compiled_stats is None:
     return
+
+  prefix_str = f"[{prefix}] " if prefix else ""
 
   def bytes_to_gb(num_bytes):
     return num_bytes / (1024**3)
@@ -818,12 +821,12 @@ def print_compiled_memory_stats(compiled_stats):
   total_gb = output_gb + temp_gb + argument_gb - alias_gb
 
   max_logging.log(
-      f"Total estimated memory size: {total_gb:.1f} GB, estimated output"
+      f"{prefix_str}Total estimated memory size: {total_gb:.1f} GB, estimated output"
       f" size: {output_gb:.1f} GB, estimated temp size: {temp_gb:.1f} GB, "
       f"estimated argument size: {argument_gb:.1f} GB, Estimated host temp"
       f" size: {host_temp_gb:.1f} GB."
   )
-  max_logging.log("Note that compiler could over-estimate the HBM usage.")
+  max_logging.log(f"{prefix_str}Note that compiler could over-estimate the HBM usage.")
 
 
 def print_system_information():
@@ -903,9 +906,11 @@ def reorder_sequence(tensor, cp_size: int, seq_dim: int = 1, to_contiguous: bool
     # Reshape squashes the [cp_size, 2] pair dimensions back into [2*cp_size]: [2*cp_size, b, group_size, h, d]
     permuted = stacked.reshape(2 * cp_size, *swapped.shape[1:])
   else:
-    # Strided slice extracts every other chunk natively: each [cp_size, b, group_size, h, d]
-    first_half = swapped[0::2, ...]
-    second_half_reversed = swapped[1::2, ...]
+    # Reshape into [cp_size, 2, ...] to extract interleaved chunks contiguously
+    # without strided slicing (which causes XLA backward adjoint interior padding).
+    reshaped_swapped = swapped.reshape(cp_size, 2, *swapped.shape[1:])
+    first_half = reshaped_swapped[:, 0, ...]
+    second_half_reversed = reshaped_swapped[:, 1, ...]
     second_half = second_half_reversed[::-1, ...]
     # Concatenate along axis 0: [2*cp_size, b, group_size, h, d]
     permuted = jnp.concatenate([first_half, second_half], axis=0)
@@ -1301,7 +1306,19 @@ def maybe_bootstrap_te_moe(config, mesh, shaped_batch):
   ep_size = mesh.shape.get(ep_axis, 1)
   fsdp_size = mesh.shape.get(fsdp_axis, 1)
 
-  batch_size, sequence_length = shaped_batch["inputs"].shape[:2]
+  loaded_batch_size, sequence_length = shaped_batch["inputs"].shape[:2]
+  ga_steps = config.gradient_accumulation_steps
+  if loaded_batch_size % ga_steps != 0:
+    raise ValueError(f"TE MoE EP loaded batch size ({loaded_batch_size}) must be divisible by GA steps ({ga_steps}).")
+  # Bootstrap for one model invocation, not the full accumulated batch.
+  # Cover both the loaded microbatch and the model-initialization batch.
+  batch_size = max(loaded_batch_size // ga_steps, config.micro_batch_size_to_train_on)
+  if config.eval_interval > 0:
+    batch_size = max(batch_size, config.micro_batch_size_to_eval_on)
+  if batch_size <= 0 or batch_size % (fsdp_size * ep_size) != 0:
+    raise ValueError(
+        f"TE MoE EP per-call batch size ({batch_size}) must be positive and divisible by FSDP * EP ({fsdp_size * ep_size})."
+    )
   if config.num_experts % ep_size != 0:
     raise ValueError(f"num_experts={config.num_experts} must be divisible by EP size={ep_size}.")
 
@@ -1378,6 +1395,28 @@ def maybe_pad(inputs, tile_size):
     inputs = jax.lax.pad(
         inputs,
         jnp.array(0.0, dtype=inputs.dtype),
-        [(0, padding_amount, 0), (0, 0, 0)],
+        [(0, padding_amount, 0)] + [(0, 0, 0)] * (inputs.ndim - 1),
     )
   return inputs, padding_amount
+
+
+def is_eval(config) -> bool:
+  """Returns True when evaluation-specific kernel tile sizes (`eval_*`) should be used.
+
+  Evaluation tile sizes (`eval_*`) take effect when evaluation runs under a
+  custom logical mesh/sharding rule (`logical_axis_rules_for_eval !=
+  logical_axis_rules`). Because `eval_step` executes inside
+  `logical_axis_rules(config.logical_axis_rules_for_eval)`, comparing the
+  active logical axis rules against `logical_axis_rules_for_eval` reliably
+  distinguishes evaluation from training without relying on batch size or
+  tensor sharding.
+
+  Args:
+    config: MaxText config object.
+
+  Returns:
+    True if executing under evaluation logical axis rules.
+  """
+  eval_rules = getattr(config, "logical_axis_rules_for_eval", None)
+  train_rules = getattr(config, "logical_axis_rules", None)
+  return bool(eval_rules and eval_rules != train_rules and get_logical_axis_rules() == eval_rules)

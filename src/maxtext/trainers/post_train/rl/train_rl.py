@@ -44,15 +44,14 @@ python3 -m maxtext.trainers.post_train.rl.train_rl src/maxtext/configs/post_trai
 """
 
 from __future__ import annotations
-import contextlib
-from functools import wraps
+import functools
+import inspect
 from typing import Any, Callable, Optional, Sequence
 
 import dataclasses
 import datasets
 import grain
 import jax
-import jax.numpy as jnp
 import json
 import logging
 import os
@@ -70,85 +69,25 @@ from maxtext.input_pipeline.instruction_data_processing import configure_tokeniz
 import maxtext.integration.vllm.maxtext_vllm_adapter as adapter
 
 adapter.register()
-import functools
 from tunix.rl import rl_cluster as rl_cluster_lib
 from tunix.rl.rollout import base_rollout
 from tunix.rl.grpo.grpo_learner import GrpoConfig, GrpoLearner
-from tunix.sft import metrics_logger, profiler
-import tunix.generate.utils as tunix_utils
-
-
-@contextlib.contextmanager
-def _tpu_inference_compat_patches():
-  """Tactical compat shims for tpu_inference.
-
-  tpu_inference has two call-site assumptions that no longer hold:
-    1. jax.lax.with_sharding_constraint: assumes silent reshard on mismatch,
-       but current jax asserts when all mesh axes are Explicit. Fall back to
-       jax.sharding.reshard on the AssertionError.
-    2. tunix._apply_dtype_cast: tpu_inference JaxEinsum defaults
-       param_dtype=float32 so its weights initialize as float32, but model
-       dtype is bfloat16; the cast upgraded synced bfloat16 weights to float32,
-       which then mismatched in the ragged paged attention kernel. Skip the
-       bf16->f32 upcast so synced weights stay bfloat16.
-
-  Scoped to rl_train() so the patches don't leak into other importers of this
-  module. Drop both once tpu_inference is updated upstream.
-  """
-  orig_wsc = jax.lax.with_sharding_constraint
-  orig_apply_dtype_cast = tunix_utils._apply_dtype_cast  # pylint: disable=protected-access
-  orig_bulk = tunix_utils._bulk_align_and_unstack  # pylint: disable=protected-access
-  orig_unstack = tunix_utils._unstack_scanned_param  # pylint: disable=protected-access
-
-  orig_moe_weights = getattr(tunix_utils, "_MOE_MLP_WEIGHTS", None)
-
-  def _compat_wsc(x, shardings):
-    try:
-      return orig_wsc(x, shardings)
-    except AssertionError:
-      return jax.sharding.reshard(x, shardings)
-
-  def _no_bf16_to_f32_cast(val, tgt_dtype, src_key):
-    if hasattr(val, "dtype") and val.dtype == jnp.bfloat16 and tgt_dtype == jnp.float32:
-      return val
-    return orig_apply_dtype_cast(val, tgt_dtype, src_key)
-
-  def _compat_bulk(arr, scan_axis, per_layer, key_path):
-    if hasattr(arr, "shape") and len(arr.shape) <= scan_axis:
-      scan_axis = len(arr.shape) - 1 if len(arr.shape) > 0 else 0
-    return orig_bulk(arr, scan_axis, per_layer, key_path)
-
-  def _compat_unstack(src_val, tgt_val, key_path, scan_axis=None):
-    if scan_axis is not None and hasattr(src_val, "shape") and len(src_val.shape) <= scan_axis:
-      scan_axis = len(src_val.shape) - 1 if len(src_val.shape) > 0 else 0
-    res = orig_unstack(src_val, tgt_val, key_path, scan_axis=scan_axis)
-    if isinstance(res, tuple) and len(res) == 1 and hasattr(src_val, "shape") and src_val.shape == tgt_val.shape:
-      return res * 256
-    return res
-
-  jax.lax.with_sharding_constraint = _compat_wsc
-  tunix_utils._apply_dtype_cast = _no_bf16_to_f32_cast  # pylint: disable=protected-access
-  tunix_utils._bulk_align_and_unstack = _compat_bulk  # pylint: disable=protected-access
-  tunix_utils._unstack_scanned_param = _compat_unstack  # pylint: disable=protected-access
-
-  if orig_moe_weights is not None:
-    tunix_utils._MOE_MLP_WEIGHTS = frozenset([*orig_moe_weights, "wo"])  # pylint: disable=protected-access
-
-  try:
-    yield
-  finally:
-    jax.lax.with_sharding_constraint = orig_wsc
-    tunix_utils._apply_dtype_cast = orig_apply_dtype_cast  # pylint: disable=protected-access
-    tunix_utils._bulk_align_and_unstack = orig_bulk  # pylint: disable=protected-access
-    tunix_utils._unstack_scanned_param = orig_unstack  # pylint: disable=protected-access
-    if orig_moe_weights is not None:
-      tunix_utils._MOE_MLP_WEIGHTS = orig_moe_weights  # pylint: disable=protected-access
-
+from tunix.sft import metrics_logger
 
 os.environ["TOKENIZERS_PARALLELISM"] = "0"
 
 from maxtext.common.common_types import DecoderBlockType
+from maxtext.common.managed_mldiagnostics import ManagedMLDiagnostics
 from maxtext.configs import pyconfig, types
+from maxtext.common.goodput import (
+    GoodputEvent,
+    RECORD_JOB_END_TIME,
+    RECORD_JOB_START_TIME,
+    create_goodput_recorder,
+    maybe_monitor_goodput,
+    maybe_record_goodput,
+    record_goodput,
+)
 from maxtext.utils.globals import MAXTEXT_CONFIGS_DIR
 from maxtext.integration.vllm.maxtext_vllm_rollout import MaxTextVllmRollout
 from maxtext.trainers.post_train.rl.evaluate_rl import evaluate
@@ -156,7 +95,6 @@ from maxtext.trainers.post_train.rl import utils_rl
 from maxtext.input_pipeline.instruction_data_processing import load_data_template_from_file
 from maxtext.utils import max_logging, max_utils, model_creation_utils
 from maxtext.utils.model_creation_utils import get_rollout_kwargs_for_parallelism
-
 
 _RECURRENT_ROLLOUT_DECODER_BLOCKS = frozenset((DecoderBlockType.QWEN3_NEXT, DecoderBlockType.QWEN3_5))
 
@@ -366,7 +304,9 @@ def build_reward_fns(trainer_config: Any, make_reward_fn: Callable) -> list:
   custom_rewards_names = getattr(trainer_config, "reward_functions", "") or ""
   if custom_rewards_path and custom_rewards_names:
     names = [n.strip() for n in custom_rewards_names.split(",") if n.strip()]
-    reward_fns = [make_reward_fn(utils_rl.load_custom_callable(custom_rewards_path, n)) for n in names]
+    reward_fns = [
+        make_reward_fn(utils_rl.load_custom_callable(custom_rewards_path, n, importable_by_workers=True)) for n in names
+    ]
     max_logging.log(f"reward_fns: using {len(reward_fns)} custom reward function(s) {names} from {custom_rewards_path}")
     return reward_fns
   return [
@@ -374,6 +314,88 @@ def build_reward_fns(trainer_config: Any, make_reward_fn: Callable) -> list:
       make_reward_fn(utils_rl.match_format_approximately),
       make_reward_fn(utils_rl.check_numbers),
   ]
+
+
+class _RewardFn:
+  """Binds `tmvp_config` to a reward function while staying picklable.
+
+  tunix's reward worker pool (`GrpoConfig.reward_num_workers`) pickles the
+  reward callable into every worker task. A nested closure cannot be pickled,
+  so wrapping the reward fns in one silently forces tunix's serial fallback
+  ("Reward fn ... failed in worker processes (PicklingError...)"). Instances
+  of this class pickle by reference to the module-level `fn` plus the config.
+  A class rather than `functools.partial` so the wrapper keeps the underlying
+  fn's `__name__` (via `update_wrapper`), which tunix's reward manager uses
+  for its logs and per-fn bookkeeping.
+  """
+
+  def __init__(self, fn: Callable, tmvp_config: Any):
+    functools.update_wrapper(self, fn)
+    self.fn = fn
+    self.tmvp_config = tmvp_config
+
+  def __call__(self, **kwargs: Any) -> Any:
+    return self.fn(tmvp_config=self.tmvp_config, **kwargs)
+
+
+def _kwargs_supported_by(cls: Any, **kwargs: Any) -> dict[str, Any]:
+  """Keeps only the kwargs that the installed tunix `cls` accepts.
+
+  Lets MaxText forward newer tunix knobs while still running against an older
+  pinned tunix that does not know them; dropped settings are logged. A `cls`
+  that itself takes `**kwargs`, or whose signature cannot be inspected (some
+  builtin/C-implemented callables), accepts anything, so every kwarg is
+  passed through unchanged.
+  """
+  try:
+    params = inspect.signature(cls).parameters
+  except (ValueError, TypeError):
+    return kwargs
+  if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()):
+    return kwargs
+  dropped = sorted(k for k in kwargs if k not in params)
+  if dropped:
+    max_logging.log(f"Installed tunix {cls.__name__} does not support {dropped}; those settings are ignored.")
+  return {k: v for k, v in kwargs.items() if k in params}
+
+
+def build_metrics_logging_options(
+    trainer_config: Any,
+) -> metrics_logger.MetricsLoggerOptions:
+  """Returns Tunix MetricsLoggerOptions configured for ML Diagnostics or defaults."""
+  backends = []
+  if trainer_config.managed_mldiagnostics:
+    from tunix.rl.metrics import mldiag_backend  # pylint: disable=import-outside-toplevel
+
+    backends.append(mldiag_backend.MLDiagScalarBackend)
+    if trainer_config.enable_tensorboard:
+      backends.append(
+          functools.partial(
+              metrics_logger.TensorboardBackend,
+              log_dir=trainer_config.tensorboard_dir,
+              flush_every_n_steps=trainer_config.log_period,
+          )
+      )
+  return metrics_logger.MetricsLoggerOptions(
+      log_dir=trainer_config.tensorboard_dir,
+      flush_every_n_steps=trainer_config.log_period,
+      backend_kwargs={"custom_backend": backends},
+  )
+
+
+def build_rl_profiler_config(
+    trainer_config: Any,
+) -> rl_cluster_lib.RLProfileConfig | None:
+  """Returns an RLProfileConfig if xplane profiling is enabled, else None."""
+  if trainer_config.profiler != "xplane":
+    return None
+  return rl_cluster_lib.RLProfileConfig(
+      start_invocation=trainer_config.rl.profiler_start_invocation,
+      num_invocations=trainer_config.rl.profiler_num_invocations,
+      output_dir=trainer_config.tensorboard_dir,
+      managed_mldiagnostics=trainer_config.managed_mldiagnostics,
+      timeout_secs=trainer_config.rl.profiler_timeout_secs,
+  )
 
 
 def create_rl_components(  # pylint: disable=too-many-positional-arguments
@@ -407,19 +429,11 @@ def create_rl_components(  # pylint: disable=too-many-positional-arguments
       None if trainer_config.rollout_micro_batch_size == -1 else trainer_config.rollout_micro_batch_size
   )
 
-  # Setup metrics logging
-  metrics_logging_options = metrics_logger.MetricsLoggerOptions(
-      log_dir=trainer_config.tensorboard_dir, flush_every_n_steps=trainer_config.log_period
-  )
-
-  profiler_options = None
-  if trainer_config.profiler == "xplane":
-    profiler_options = profiler.ProfilerOptions(
-        log_dir=trainer_config.tensorboard_dir,
-        skip_first_n_steps=trainer_config.skip_first_n_steps_for_profiler,
-        profiler_steps=trainer_config.profiler_steps,
-        set_profile_options=False,
-    )
+  # Setup metrics logging and targeted RL profiling. `profiler_options` stays
+  # None: tunix `RLTrainingConfig` forbids combining the SFT step profiler with
+  # `rl_profiler_config`, and only the latter traces the rollout role.
+  metrics_logging_options = build_metrics_logging_options(trainer_config)
+  rl_profiler_config = build_rl_profiler_config(trainer_config)
 
   # Parse vllm_additional_config
   rollout_additional_config = None
@@ -439,6 +453,18 @@ def create_rl_components(  # pylint: disable=too-many-positional-arguments
 
   rl_rollout_engine = functools.partial(MaxTextVllmRollout, maxtext_config=trainer_config)
 
+  rollout_vllm_kwargs = {
+      "hf_overrides": trainer_config.vllm_hf_overrides,
+      "enable_expert_parallel": sampler_config.enable_expert_parallel,
+      "enable_prefix_caching": rollout_prefix_caching_enabled(trainer_config),
+      # Ensures vLLM model initializes with correct dtype (not float32 default)
+      "dtype": trainer_config.weight_dtype.value,
+  }
+  if trainer_config.vllm_block_size is not None:
+    # Pin the KV-cache page size; left unset, the backend derives it from the
+    # engine shape, so unrelated engine changes can move it.
+    rollout_vllm_kwargs["block_size"] = trainer_config.vllm_block_size
+
   cluster_config = rl_cluster_lib.ClusterConfig(
       role_to_mesh={
           rl_cluster_lib.Role.ACTOR: actor_mesh,
@@ -452,6 +478,10 @@ def create_rl_components(  # pylint: disable=too-many-positional-arguments
       },
       rollout_engine=rl_rollout_engine,
       offload_to_cpu=False,
+      **_kwargs_supported_by(
+          rl_cluster_lib.ClusterConfig,
+          gc_collect_after_weight_sync=trainer_config.gc_collect_after_weight_sync,
+      ),
       training_config=rl_cluster_lib.RLTrainingConfig(
           actor_optimizer=optimizer,
           eval_every_n_steps=trainer_config.eval_interval,
@@ -459,8 +489,10 @@ def create_rl_components(  # pylint: disable=too-many-positional-arguments
           mini_batch_size=trainer_config.batch_size,
           train_micro_batch_size=train_micro_batch_size,
           rollout_micro_batch_size=rollout_micro_batch_size,
+          max_seq_token_per_tpu=trainer_config.max_seq_token_per_tpu or None,
           metrics_logging_options=metrics_logging_options,
-          profiler_options=profiler_options,
+          profiler_options=None,
+          rl_profiler_config=rl_profiler_config,
           checkpoint_root_directory=checkpoint_dir,
           checkpointing_options=checkpointing_options,
       ),
@@ -487,13 +519,7 @@ def create_rl_components(  # pylint: disable=too-many-positional-arguments
           rollout_vllm_async_scheduling=trainer_config.async_scheduling,
           rollout_vllm_server_mode=trainer_config.rl.use_agentic_rollout,
           rollout_vllm_reshard_chunk_size=trainer_config.rl.reshard_chunk_size,
-          rollout_vllm_kwargs={
-              "hf_overrides": trainer_config.vllm_hf_overrides,
-              "enable_expert_parallel": sampler_config.enable_expert_parallel,
-              "enable_prefix_caching": rollout_prefix_caching_enabled(trainer_config),
-              # Ensures vLLM model initializes with correct dtype (not float32 default)
-              "dtype": trainer_config.weight_dtype.value,
-          },
+          rollout_vllm_kwargs=rollout_vllm_kwargs,
           rollout_vllm_sampling_kwargs={
               "stop": trainer_config.stop_strings,
               "detokenize": trainer_config.stop_strings is not None,
@@ -503,6 +529,10 @@ def create_rl_components(  # pylint: disable=too-many-positional-arguments
           # to support off-policy filtering and multi-iteration training.
           **({"return_logprobs": True} if trainer_config.rl.use_agentic_rollout else {}),
           **get_rollout_kwargs_for_parallelism(sampler_config, len(sampler_devices)),
+          **_kwargs_supported_by(
+              base_rollout.RolloutConfig,
+              rollout_vllm_free_kv_cache_during_weight_sync=trainer_config.free_kv_cache_during_weight_sync,
+          ),
       ),
   )
 
@@ -531,12 +561,9 @@ def create_rl_components(  # pylint: disable=too-many-positional-arguments
   )
 
   def make_reward_fn(fn):
-    # pragma: no cover
-    @wraps(fn)
-    def _reward_fn(**kwargs):
-      return fn(tmvp_config=trainer_config, **kwargs)
-
-    return _reward_fn
+    # A picklable wrapper (not a closure) so tunix's reward worker pool can
+    # ship the reward fns to its workers when `reward_num_workers` is set.
+    return _RewardFn(fn, trainer_config)
 
   # Optional user-provided reward functions: when `reward_functions_path` and
   # `reward_functions` are both set the built-in stack is replaced entirely by
@@ -572,6 +599,11 @@ def create_rl_components(  # pylint: disable=too-many-positional-arguments
         use_rollout_logps=trainer_config.rl.use_rollout_logps,
         force_on_policy_ratio=trainer_config.rl.force_on_policy_ratio,
         log_sampler_trainer_agreement=(trainer_config.rl.log_sampler_trainer_agreement),
+        **_kwargs_supported_by(
+            AgenticGrpoConfig,
+            reward_num_workers=trainer_config.reward_num_workers,
+            reward_worker_timeout_seconds=trainer_config.reward_worker_timeout_seconds,
+        ),
     )
     max_logging.log(
         "GRPO config resolved:\n"
@@ -602,6 +634,15 @@ def create_rl_components(  # pylint: disable=too-many-positional-arguments
         epsilon=trainer_config.rl.grpo_epsilon,
         loss_algo=trainer_config.rl.loss_algo,
         loss_agg_mode=trainer_config.rl.loss_agg_mode,
+        **_kwargs_supported_by(
+            GrpoConfig,
+            reward_num_workers=trainer_config.reward_num_workers,
+            reward_worker_timeout_seconds=trainer_config.reward_worker_timeout_seconds,
+        ),
+    )
+    max_logging.log(
+        "GRPO config resolved:\n"
+        + "\n".join(f"  {k} = {v!r}" for k, v in sorted(dataclasses.asdict(grpo_config).items()))
     )
     rl_trainer = GrpoLearner(
         rl_cluster=rl_cluster,
@@ -622,18 +663,36 @@ def rl_train(argv: Sequence[str], kwargs: dict):
     trainer_devices: JAX devices for the trainer.
     sampler_devices: JAX devices for the sampler.
   """
-  with _tpu_inference_compat_patches():
-    _rl_train_impl(argv, kwargs)
-
-
-def _rl_train_impl(argv: Sequence[str], kwargs: dict):
-  """rl_train body — kept separate so _tpu_inference_compat_patches wraps it cleanly."""
   trainer_config, sampler_config, trainer_devices, sampler_devices = model_creation_utils.setup_configs_and_devices(
       argv,
       kwargs,
       config_class=types.RLConfig,
   )
+  install_pathways_multihost_profiler_patch(trainer_config.rl.profiler_max_num_hosts)
 
+  # Create the ML Diagnostics run before any tunix object: `RLCluster` builds
+  # `RLProfiler`, whose managed backend preflights `Xprof._ensure_initialized()`
+  # and raises if no MLRun is active. Both configs are uploaded (sampler keys
+  # that differ from the trainer's are recorded as `sampler.<key>`).
+  if trainer_config.managed_mldiagnostics:
+    ManagedMLDiagnostics(trainer_config, sampler_config=sampler_config)
+
+  goodput_recorder = create_goodput_recorder(trainer_config)
+  record_goodput(goodput_recorder, RECORD_JOB_START_TIME)
+  _job_completed_gracefully = False
+  try:
+    with maybe_monitor_goodput(trainer_config):
+      _rl_train_impl(trainer_config, sampler_config, trainer_devices, sampler_devices, goodput_recorder)
+      _job_completed_gracefully = True
+  finally:
+    if _job_completed_gracefully:
+      record_goodput(goodput_recorder, RECORD_JOB_END_TIME)
+
+
+def _rl_train_impl(
+    trainer_config: Any, sampler_config: Any, trainer_devices: Any, sampler_devices: Any, goodput_recorder: Any = None
+):
+  """rl_train execution body."""
   # Create model tokenizer first so we can plumb its pad_id into the model
   # adapter (used to synthesize segment_ids that mask pad positions from
   # attention — without this the trainer attends to pad tokens and produces
@@ -647,13 +706,16 @@ def _rl_train_impl(argv: Sequence[str], kwargs: dict):
   )
   configure_tokenizer_chat_template(model_tokenizer, trainer_config)
 
-  reference_model, reference_mesh, actor_model, actor_mesh, rollout_mesh = model_creation_utils.create_models_and_meshes(
-      trainer_config,
-      sampler_config,
-      trainer_devices,
-      sampler_devices,
-      tokenizer_pad_id=model_tokenizer.pad_token_id,
-  )
+  with maybe_record_goodput(goodput_recorder, GoodputEvent.TPU_INIT):
+    reference_model, reference_mesh, actor_model, actor_mesh, rollout_mesh = (
+        model_creation_utils.create_models_and_meshes(
+            trainer_config,
+            sampler_config,
+            trainer_devices,
+            sampler_devices,
+            tokenizer_pad_id=model_tokenizer.pad_token_id,
+        )
+    )
 
   if not trainer_config.debug:
     # Apply filter to suppress noisy logs
@@ -692,17 +754,18 @@ def _rl_train_impl(argv: Sequence[str], kwargs: dict):
     max_logging.log(f"Policy mesh shape: {actor_mesh.shape}")
     max_logging.log(f"Rollout_mesh shape: {rollout_mesh.shape}")
 
-  rl_cluster, rl_trainer, _, reward_fns = create_rl_components(
-      trainer_config,
-      sampler_config,
-      sampler_devices,
-      actor_model,
-      actor_mesh,
-      reference_model,
-      reference_mesh,
-      rollout_mesh,
-      model_tokenizer,
-  )
+  with maybe_record_goodput(goodput_recorder, GoodputEvent.TRAINING_PREPARATION):
+    rl_cluster, rl_trainer, _, reward_fns = create_rl_components(
+        trainer_config,
+        sampler_config,
+        sampler_devices,
+        actor_model,
+        actor_mesh,
+        reference_model,
+        reference_mesh,
+        rollout_mesh,
+        model_tokenizer,
+    )
 
   # Run evaluation before training
   if trainer_config.num_test_batches > 0:
@@ -735,7 +798,7 @@ def _rl_train_impl(argv: Sequence[str], kwargs: dict):
 
   # Wire intermediate eval: fire greedy `evaluate(...)` every `eval_interval`
   # outer steps. No-op when eval_interval <= 0 or num_test_batches <= 0.
-  utils_rl.install_training_hooks(rl_cluster, trainer_config, test_dataset, reward_fns)
+  utils_rl.install_training_hooks(rl_cluster, trainer_config, test_dataset, reward_fns, goodput_recorder=goodput_recorder)
 
   max_logging.warning("Starting RL training...")
   rl_trainer.train(train_dataset)
@@ -765,6 +828,42 @@ def _rl_train_impl(argv: Sequence[str], kwargs: dict):
         f"Post RL Training: {corr=}, {total=}, {accuracy=}%, {partial_accuracy=}%,"
         f" {format_accuracy=}%, {mean_reward=:.4f}"
     )
+
+
+def install_pathways_multihost_profiler_patch(max_hosts: int) -> None:
+  """Injects max_num_hosts into start_trace when unset by caller on Pathways."""
+  if max_hosts <= 1:
+    return
+
+  orig_start_trace = jax.profiler.start_trace
+  if getattr(orig_start_trace, "_is_pathways_multihost_patched", False):
+    orig_start_trace._max_hosts = max_hosts  # pylint: disable=protected-access
+    return
+
+  try:
+    sig = inspect.signature(orig_start_trace)
+    if "max_num_hosts" not in sig.parameters:
+      max_logging.warning(
+          "rl.profiler_max_num_hosts > 1 requested, but jax.profiler.start_trace "
+          "does not accept max_num_hosts. Skipping monkeypatch."
+      )
+      return
+  except (ValueError, TypeError):
+    return
+
+  @functools.wraps(orig_start_trace)
+  def start_trace_wrapper(*args, **kwargs):
+    if "max_num_hosts" not in kwargs and len(args) <= 4:
+      kwargs["max_num_hosts"] = getattr(start_trace_wrapper, "_max_hosts", max_hosts)
+    return orig_start_trace(*args, **kwargs)
+
+  start_trace_wrapper._is_pathways_multihost_patched = True  # pylint: disable=protected-access
+  start_trace_wrapper._max_hosts = max_hosts  # pylint: disable=protected-access
+
+  jax.profiler.start_trace = start_trace_wrapper
+  jax_src_profiler = getattr(getattr(jax, "_src", None), "profiler", None)
+  if jax_src_profiler is not None:
+    jax_src_profiler.start_trace = start_trace_wrapper
 
 
 def main(argv: Sequence[str], kwargs: dict = None) -> None:

@@ -22,6 +22,8 @@ Tests cover:
                 get_remat_policy, minimal_policy, and full forward pass)
 """
 
+# pylint: disable=unbalanced-tuple-unpacking
+import re
 import sys
 from types import SimpleNamespace
 import unittest
@@ -35,7 +37,7 @@ import jax.numpy as jnp
 import numpy as np
 from flax import linen as nn
 from flax import nnx
-from jax.sharding import Mesh
+from jax.sharding import Mesh, NamedSharding, PartitionSpec
 
 from maxtext.common.common_types import (
     DECODING_ACTIVE_SEQUENCE_INDICATOR,
@@ -45,17 +47,21 @@ from maxtext.common.common_types import (
     AttentionType,
     DecoderBlockType,
     MultimodalInput,
+    ShardMode,
 )
 from maxtext.configs import pyconfig
+from maxtext.layers import fsdp_prefetch
 from maxtext.layers import linears
+from maxtext.layers import nnx_decoders
+from maxtext.layers import quantizations
 from maxtext.layers.attentions import Attention
 from maxtext.layers.embeddings import Embed
 from maxtext.layers.nnx_decoders import NNXDecoder, NNXDecoderLayer, deepstack_process
 from maxtext.layers.normalizations import RMSNorm
-from maxtext.models import gemma4, gemma4_small, qwen3
+from maxtext.models import gemma4, gemma4_small, qwen3, qwen3_5
 from maxtext.models.gpt3 import Gpt3LayerNorm
 from maxtext.models.llama2 import LlamaDecoderLayer
-from maxtext.utils import maxtext_utils, maxtext_utils_nnx
+from maxtext.utils import maxtext_utils, maxtext_utils_nnx, model_creation_utils
 from tests.utils.test_helpers import get_test_config_path
 
 # ---------------------------------------------------------------------------
@@ -739,6 +745,98 @@ class TestNNXDecoderForwardPass(unittest.TestCase):
     self.assertEqual(logits.shape, (batch, seq_len, cfg.vocab_size))
 
 
+class TestNNXDecoderServeFp8WeightForwardPass(unittest.TestCase):
+  """End-to-end forward pass with quantization="serve_fp8_weight" (native, no-dequantize
+  FP8 compute -- see quantizations.native_fp8_dot_general / ServeFp8WeightQuantization).
+  """
+
+  # weight_block_size must divide contracted dims in _BASE_CONFIG.
+  _FP8_OVERRIDES = {
+      "weight_dtype": "float8_e4m3fn",
+      "weight_block_size": 16,
+  }
+
+  def setUp(self):
+    super().setUp()
+    self.rng = jax.random.PRNGKey(0)
+
+  def _make_token_inputs(self, cfg):
+    """Generates dummy token inputs for decoder test."""
+    batch = cfg.global_batch_size_to_train_on
+    seq_len = cfg.max_target_length
+    ids = jax.random.randint(self.rng, (batch, seq_len), 0, cfg.vocab_size)
+    segment_ids = jnp.full((batch, seq_len), DECODING_ACTIVE_SEQUENCE_INDICATOR)
+    positions = jnp.broadcast_to(jnp.arange(seq_len)[None], (batch, seq_len))
+    return ids, segment_ids, positions
+
+  def _build(self, cfg, mesh, rngs):
+    """Builds test decoder and shared embedding."""
+    quant = quantizations.configure_quantization(cfg)
+    decoder = NNXDecoder(config=cfg, mesh=mesh, model_mode=MODEL_MODE_TRAIN, quant=quant, rngs=rngs)
+    shared_embedding = Embed(
+        num_embeddings=cfg.vocab_size,
+        num_features=cfg.emb_dim,
+        dtype=cfg.dtype,
+        embedding_init=nn.initializers.normal(stddev=1.0),
+        config=cfg,
+        mesh=mesh,
+        rngs=rngs,
+    )
+    return decoder, shared_embedding
+
+  def test_forward_pass_shapes_and_finite(self):
+    """A serve_fp8_weight decoder must produce correctly-shaped, finite logits."""
+    cfg = _make_config(quantization="serve_fp8_weight", **self._FP8_OVERRIDES)
+    mesh = _make_mesh(cfg)
+    rngs = nnx.Rngs(params=0, dropout=1)
+    decoder, shared_embedding = self._build(cfg, mesh, rngs)
+    ids, segment_ids, positions = self._make_token_inputs(cfg)
+
+    logits, hidden_state, *_ = decoder(
+        shared_embedding,
+        ids,
+        positions,
+        decoder_segment_ids=segment_ids,
+        deterministic=True,
+        model_mode=MODEL_MODE_TRAIN,
+    )
+    self.assertEqual(logits.shape, (cfg.global_batch_size_to_train_on, cfg.max_target_length, cfg.vocab_size))
+    self.assertEqual(hidden_state.shape, (cfg.global_batch_size_to_train_on, cfg.max_target_length, cfg.emb_dim))
+    self.assertTrue(jnp.all(jnp.isfinite(logits)))
+
+  def test_matches_dequantize_baseline(self):
+    """Native fp8 compute must closely match the existing dequantize-then-matmul path.
+
+    Both decoders store the same fp8-quantized weights (weight_dtype=float8_e4m3fn);
+    only the compute strategy differs (quantization="serve_fp8_weight" vs unset). State
+    is explicitly synced after construction rather than relied on via matching RNG draws.
+    """
+    baseline_cfg = _make_config(**self._FP8_OVERRIDES)
+    native_cfg = _make_config(quantization="serve_fp8_weight", **self._FP8_OVERRIDES)
+    mesh = _make_mesh(baseline_cfg)
+
+    baseline_decoder, baseline_embedding = self._build(baseline_cfg, mesh, nnx.Rngs(params=0, dropout=1))
+    native_decoder, native_embedding = self._build(native_cfg, mesh, nnx.Rngs(params=0, dropout=1))
+    nnx.update(native_decoder, nnx.state(baseline_decoder))
+    nnx.update(native_embedding, nnx.state(baseline_embedding))
+
+    ids, segment_ids, positions = self._make_token_inputs(baseline_cfg)
+    call_kwargs = {
+        "decoder_segment_ids": segment_ids,
+        "deterministic": True,
+        "model_mode": MODEL_MODE_TRAIN,
+    }
+    baseline_logits, _, *_ = baseline_decoder(baseline_embedding, ids, positions, **call_kwargs)
+    native_logits, _, *_ = native_decoder(native_embedding, ids, positions, **call_kwargs)
+
+    baseline_logits = np.asarray(baseline_logits, dtype=np.float32)
+    native_logits = np.asarray(native_logits, dtype=np.float32)
+    self.assertEqual(baseline_logits.shape, native_logits.shape)
+    relerr = float(np.max(np.abs(baseline_logits - native_logits)) / (np.max(np.abs(baseline_logits)) + 1e-12))
+    # Loose tolerance: compares native FP8 forward pass against dequantized baseline.
+    self.assertLess(relerr, 0.1, f"serve_fp8_weight vs dequantize baseline relerr={relerr:.3e}")
+
+
 class _StatefulGemma4DecoderLayer(nnx.Module):
   """Small stand-in that exposes cache ordering and mutable-state updates."""
 
@@ -793,12 +891,15 @@ class TestGemma4ScannableBlock(unittest.TestCase):
         param_scan_axis=1,
         remat_policy="none",
         scan_layers=True,
+        shard_mode=ShardMode.AUTO,
+        debug_sharding=False,
     )
 
   def _make_block(self):
     return gemma4.Gemma4ScannableBlock(
         config=self.config,
-        mesh=None,
+        # The block pins its input with maybe_shard_with_logical, which needs a real mesh.
+        mesh=Mesh(np.array(jax.devices()[:1]), ("data",)),
         model_mode=MODEL_MODE_AUTOREGRESSIVE,
         rngs=nnx.Rngs(0),
     )
@@ -1066,39 +1167,6 @@ class TestNNXDecoderQwen3Next(unittest.TestCase):
     )
 
 
-class TestQwen3NextDecoderParity(unittest.TestCase):
-  """The Linen `Decoder` and the pure-NNX `NNXDecoder` must emit the same parameter tree.
-
-  One checkpoint mapping (`QWEN3_NEXT_MAXTEXT_TO_HF_PARAM_MAPPING`) serves both
-  decoders, so a name or shape that differs between them silently breaks
-  conversion on whichever side the mapping was not written against.
-  """
-
-  def _param_tree(self, num_decoder_layers, pure_nnx_decoder):
-    """Returns {parameter key: shape} for the chosen decoder implementation."""
-    # pylint: disable=import-outside-toplevel
-    from maxtext.checkpoint_conversion.to_maxtext import get_maxtext_model_info
-
-    cfg = _make_config(
-        **{
-            **_QWEN3_NEXT_CONFIG,
-            "base_num_decoder_layers": num_decoder_layers,
-            "scan_layers": True,
-            "pure_nnx_decoder": pure_nnx_decoder,
-        }
-    )
-    model_info, _ = get_maxtext_model_info(cfg)
-    return {key: shape for key, (_, shape) in model_info.items()}
-
-  def test_decoders_agree_on_whole_periods(self):
-    self.assertEqual(self._param_tree(8, True), self._param_tree(8, False))
-
-  def test_decoders_agree_with_a_remainder(self):
-    """6 layers is one whole period plus a two-layer remainder, which both decoders
-    have to put in a `layers_remainder` block rather than spell out layer by layer."""
-    self.assertEqual(self._param_tree(6, True), self._param_tree(6, False))
-
-
 class TestNNXDecoderDeepseekAndGemma4(unittest.TestCase):
   """Tests for Deepseek and Gemma4 specific decoder logic."""
 
@@ -1331,6 +1399,48 @@ class TestNNXDecoderDeepseekAndGemma4(unittest.TestCase):
     self.assertEqual(y_external.shape, inputs.shape)
     self.assertEqual(len(updated_kvs), num_layers)
     np.testing.assert_allclose(y_external, y_scanned, rtol=1e-5, atol=1e-5)
+
+  def test_gemma4_decoder_layer_sharding_by_shard_mode(self):
+    """Under ShardMode.AUTO, Gemma4 decoder layers must leave out_sharding as None."""
+    # pylint: disable=protected-access
+    for shard_mode, expect_none in ((ShardMode.AUTO, True), (ShardMode.EXPLICIT, False)):
+      cfg_gemma4 = _make_config(
+          decoder_block="gemma4",
+          shard_mode=shard_mode.value,
+      )
+      layer = gemma4.Gemma4DecoderLayer(
+          config=cfg_gemma4,
+          mesh=self.mesh,
+          model_mode=MODEL_MODE_TRAIN,
+          rngs=nnx.Rngs(params=0),
+      )
+      cfg_small = _make_config(
+          decoder_block="gemma4_small",
+          model_name="gemma4-e2b",
+          hidden_size_per_layer_input=64,
+          vocab_size_per_layer_input=256,
+          shard_mode=shard_mode.value,
+      )
+      small_layer = gemma4_small.Gemma4SmallDecoderLayer(
+          config=cfg_small,
+          mesh=self.mesh,
+          model_mode=MODEL_MODE_TRAIN,
+          rngs=nnx.Rngs(params=0),
+      )
+      if expect_none:
+        self.assertIsNone(layer.out_sharding)
+        self.assertIsNone(layer.mlp_intermediate_sharding)
+        self.assertIs(layer._maybe_shard_with_logical, gemma4.with_logical_constraint)
+        self.assertIsNone(small_layer.out_sharding)
+        self.assertIsNone(small_layer.mlp_intermediate_sharding)
+        self.assertIsNone(small_layer.ple_sharding)
+        self.assertIs(small_layer._maybe_shard_with_logical, gemma4_small.with_logical_constraint)
+      else:
+        self.assertIsNotNone(layer.out_sharding)
+        self.assertIsNotNone(layer.mlp_intermediate_sharding)
+        self.assertIsNotNone(small_layer.out_sharding)
+        self.assertIsNotNone(small_layer.mlp_intermediate_sharding)
+        self.assertIsNotNone(small_layer.ple_sharding)
 
 
 @pytest.mark.tpu_only
@@ -1572,6 +1682,757 @@ class TestApplyLayersSequentiallyMetadataAxisName(unittest.TestCase):
       )
     finally:
       maxtext_utils_nnx.nnx_add_and_sync_scan_axis = original_add_scan_axis
+
+
+class TestNNXDecoderFP8WeightOnly(unittest.TestCase):
+  """Tests for NNXDecoder with FP8 weight-only storage and dynamic dequantization."""
+
+  def setUp(self):
+    super().setUp()
+    self.cfg = _make_config(
+        weight_dtype="float8_e4m3fn",
+        dtype="bfloat16",
+        unquantized_modules=["token_embedder", "logits_dense"],
+    )
+    self.mesh = _make_mesh(self.cfg)
+    self.rngs = nnx.Rngs(params=0, dropout=1)
+    self.decoder = NNXDecoder(
+        config=self.cfg,
+        mesh=self.mesh,
+        rngs=self.rngs,
+    )
+    self.shared_embedding = Embed(
+        num_embeddings=self.cfg.vocab_size,
+        num_features=self.cfg.emb_dim,
+        dtype=self.cfg.dtype,
+        embedding_init=jax.nn.initializers.normal(stddev=1.0),
+        config=self.cfg,
+        mesh=self.mesh,
+        rngs=self.rngs,
+    )
+
+  def test_fp8_weights_and_unquantized_layers(self):
+    """Verifies that dense linear weights are FP8 while embedding and norms are BF16."""
+    layer_0 = self.decoder.layers_0
+    self.assertEqual(layer_0.self_attention.query.kernel[...].dtype, jnp.float8_e4m3fn)
+    self.assertIsNotNone(layer_0.self_attention.query.kernel_scale)
+    self.assertEqual(layer_0.mlp.wi_0.kernel[...].dtype, jnp.float8_e4m3fn)
+    self.assertEqual(self.shared_embedding.embedding[...].dtype, jnp.bfloat16)
+    self.assertEqual(self.decoder.decoder_norm.scale[...].dtype, jnp.bfloat16)
+
+  def test_fp8_forward_pass_execution(self):
+    """Verifies that an end-to-end forward pass with dynamic FP8 dequantization executes and produces valid logits."""
+    cfg = self.cfg
+    batch = cfg.global_batch_size_to_train_on
+    seq_len = cfg.max_target_length
+    ids = jax.random.randint(jax.random.PRNGKey(0), (batch, seq_len), 0, cfg.vocab_size)
+    segment_ids = jnp.full((batch, seq_len), DECODING_ACTIVE_SEQUENCE_INDICATOR)
+    positions = jnp.broadcast_to(jnp.arange(seq_len)[None], (batch, seq_len))
+
+    logits, hidden_state, _ = self.decoder(
+        self.shared_embedding,
+        ids,
+        positions,
+        decoder_segment_ids=segment_ids,
+        deterministic=True,
+        model_mode=MODEL_MODE_TRAIN,
+    )
+
+    self.assertEqual(logits.shape, (batch, seq_len, cfg.vocab_size))
+    self.assertEqual(hidden_state.shape, (batch, seq_len, cfg.emb_dim))
+    self.assertTrue(jnp.all(jnp.isfinite(logits)))
+
+
+# Unbound forward of the Qwen3.5 scannable block. It is invoked below against a
+# stand-in `self` rather than a real instance, so it is bound here once instead
+# of being called as a dunder at each call site.
+_QWEN3_5_BLOCK_FORWARD = qwen3_5.Qwen3_5ScannableBlock.__call__
+
+
+class Qwen3_5ScannableBlockKVCacheTest(unittest.TestCase):
+  """Qwen3.5 must thread vLLM's externally-managed KV caches through its block.
+
+  `Qwen3_5ScannableBlock.__call__` only touches `self.config` and its
+  `layer_{i}` attributes, so it is exercised here against a stand-in `self`.
+  That keeps the test on CPU and focused on the cache plumbing rather than on
+  building a real MoE block.
+  """
+
+  CYCLE = 4
+
+  def _fake_block(self):
+    """Builds a stand-in block whose sub-layers record the kwargs they receive."""
+    calls = []
+
+    def make_layer(idx):
+      def layer(x, *args, **kwargs):
+        calls.append({"idx": idx, "args": args, "kwargs": kwargs})
+        return x + 1, f"updated_kv_{idx}"
+
+      return layer
+
+    block = SimpleNamespace(config=SimpleNamespace(inhomogeneous_layer_cycle_interval=self.CYCLE))
+    for i in range(self.CYCLE):
+      setattr(block, f"layer_{i}", make_layer(i))
+    return block, calls
+
+  def _call(self, block, **kwargs):
+    return _QWEN3_5_BLOCK_FORWARD(
+        block,
+        0,  # carry
+        None,  # decoder_segment_ids
+        None,  # decoder_positions
+        True,  # deterministic
+        MODEL_MODE_AUTOREGRESSIVE,
+        **kwargs,
+    )
+
+  @pytest.mark.cpu_only
+  def test_each_sublayer_gets_its_own_cache_and_updates_are_returned(self):
+    block, calls = self._fake_block()
+    kv_cache = tuple(f"kv_{i}" for i in range(self.CYCLE))
+
+    carry, updated = self._call(block, kv_cache=kv_cache, attention_metadata={"meta": 1})
+
+    self.assertEqual(carry, self.CYCLE)  # every sub-layer ran exactly once
+    self.assertEqual(updated, tuple(f"updated_kv_{i}" for i in range(self.CYCLE)))
+    self.assertEqual([c["kwargs"]["kv_cache"] for c in calls], list(kv_cache))
+    # attention_metadata must reach the sub-layers; without it the attention
+    # kernel cannot address vLLM's paged cache.
+    self.assertTrue(all(c["kwargs"]["attention_metadata"] == {"meta": 1} for c in calls))
+
+  @pytest.mark.cpu_only
+  def test_training_path_returns_none_and_passes_no_cache(self):
+    block, calls = self._fake_block()
+
+    carry, updated = self._call(block)
+
+    self.assertEqual(carry, self.CYCLE)
+    self.assertIsNone(updated)
+    self.assertTrue(all(c["kwargs"]["kv_cache"] is None for c in calls))
+
+  @pytest.mark.cpu_only
+  def test_shorter_cache_does_not_index_out_of_range(self):
+    block, calls = self._fake_block()
+
+    _, updated = self._call(block, kv_cache=("kv_0",))
+
+    self.assertEqual([c["kwargs"]["kv_cache"] for c in calls], ["kv_0", None, None, None])
+    self.assertEqual(len(updated), self.CYCLE)
+
+  @pytest.mark.cpu_only
+  def test_flat_per_layer_caches_survive_the_per_block_round_trip(self):
+    """vLLM hands over one cache per layer; the scan runs over 4-layer blocks."""
+    num_layers = 8
+    scan_length = num_layers // self.CYCLE
+    kv_caches = [f"kv_{i}" for i in range(num_layers)]
+
+    grouped = maxtext_utils.prepare_kv_caches_for_scan(kv_caches, scan_length, self.CYCLE, stack=False)
+    self.assertEqual(grouped, [("kv_0", "kv_1", "kv_2", "kv_3"), ("kv_4", "kv_5", "kv_6", "kv_7")])
+
+    # Mimic _apply_layers_sequentially replacing each block entry with the
+    # tuple the block returned.
+    for block_idx in range(scan_length):
+      fake_block, _ = self._fake_block()
+      _, updated = self._call(fake_block, kv_cache=grouped[block_idx])
+      grouped[block_idx] = tuple(f"{kv}_b{block_idx}" for kv in updated)
+
+    maxtext_utils.update_kv_caches_after_scan(kv_caches, grouped, scan_length, self.CYCLE, stacked=False)
+
+    self.assertEqual(
+        kv_caches,
+        [f"updated_kv_{i % self.CYCLE}_b{i // self.CYCLE}" for i in range(num_layers)],
+    )
+
+
+class ScannedCycleLayerCountTest(unittest.TestCase):
+  """A scanned decoder with a repeating layer cycle needs a whole number of cycles."""
+
+  def _build(self, num_layers):
+    cfg = _make_config(
+        model_name="olmo3-7b-pt",
+        scan_layers=True,
+        base_num_decoder_layers=num_layers,
+        head_dim=64,
+        vocab_size=256,
+    )
+    mesh = maxtext_utils.get_mesh_from_config(cfg)
+    return model_creation_utils.create_nnx_abstract_model(cfg, mesh)
+
+  def test_partial_cycle_is_rejected(self):
+    # olmo3 repeats a 4-layer cycle; 6 layers used to build 4 and drop the rest.
+    with self.assertRaisesRegex(ValueError, "must be a multiple of inhomogeneous_layer_cycle_interval"):
+      self._build(6)
+
+  def test_fewer_layers_than_one_cycle_is_rejected(self):
+    with self.assertRaisesRegex(ValueError, "must be a multiple of inhomogeneous_layer_cycle_interval"):
+      self._build(2)
+
+  def test_whole_cycles_build(self):
+    self._build(8)
+
+
+class TestNNXDecoderPrefetching(unittest.TestCase):
+  """Unit and integration tests for FSDP weight prefetching (`prefetch_fsdp_weights`)."""
+
+  def setUp(self):
+    super().setUp()
+    # The CPU test mesh has a single device, so no FSDP axis spans more than one device. Force the
+    # prefetch path so that these tests exercise it.
+    patcher = mock.patch.object(fsdp_prefetch, "mesh_uses_fsdp", return_value=True)
+    patcher.start()
+    self.addCleanup(patcher.stop)
+    self.cfg = _make_config(scan_layers=True, prefetch_fsdp_weights=True, num_decoder_layers=3)
+    self.mesh = _make_mesh(self.cfg)
+    self.rng = jax.random.PRNGKey(0)
+    self.rngs = nnx.Rngs(params=0, dropout=1)
+
+  def _make_token_inputs(self):
+    batch = self.cfg.global_batch_size_to_train_on
+    seq_len = self.cfg.max_target_length
+    ids = jax.random.randint(self.rng, (batch, seq_len), 0, self.cfg.vocab_size)
+    segment_ids = jnp.full((batch, seq_len), DECODING_ACTIVE_SEQUENCE_INDICATOR)
+    positions = jnp.broadcast_to(jnp.arange(seq_len)[None], (batch, seq_len))
+    return ids, segment_ids, positions
+
+  def _get_sharded_params_and_state(self, decoder, with_fsdp=False, use_partition_specs=False):
+    """Splits decoder and applies NamedSharding with partition specs to parameters."""
+    nnx.pop(decoder, nnx.RngState, nnx.RngCount)
+    graphdef, params, state = nnx.split(decoder, nnx.Param, ...)
+
+    def _shard_arr(arr):
+      if isinstance(arr, jax.Array):
+        if with_fsdp and arr.ndim >= 2:
+          fsdp_size = self.mesh.shape.get("fsdp", 1)
+          data_size = self.mesh.shape.get("data", 1)
+          axis_0 = "fsdp" if arr.shape[0] % fsdp_size == 0 else None
+          axis_1 = "data" if arr.ndim > 2 and arr.shape[1] % data_size == 0 else None
+          spec = PartitionSpec(axis_0, axis_1)
+        else:
+          spec = PartitionSpec()
+        if use_partition_specs:
+          # Directly return the array with sharding attribute set as PartitionSpec string/spec for testing
+          return jax.lax.with_sharding_constraint(arr, NamedSharding(self.mesh, spec))
+        return jax.lax.with_sharding_constraint(arr, NamedSharding(self.mesh, spec))
+      return arr
+
+    params = jax.tree.map(_shard_arr, params)
+    return graphdef, params, state
+
+  def test_prefetch_forward_pass_no_grad(self):
+    """Exercises _custom_vjp_prefetch_pipeline outside autodiff (is_fwd=False)."""
+    decoder = NNXDecoder(config=self.cfg, mesh=self.mesh, model_mode=MODEL_MODE_TRAIN, rngs=self.rngs)
+    shared_emb = Embed(
+        num_embeddings=self.cfg.vocab_size,
+        num_features=self.cfg.emb_dim,
+        dtype=self.cfg.dtype,
+        embedding_init=nn.initializers.normal(stddev=1.0),
+        config=self.cfg,
+        mesh=self.mesh,
+        rngs=self.rngs,
+    )
+    ids, segment_ids, positions = self._make_token_inputs()
+    graphdef, params, state = self._get_sharded_params_and_state(decoder, with_fsdp=False)
+    m = nnx.merge(graphdef, params, state)
+    logits, _, kv = m(
+        shared_emb,
+        ids,
+        positions,
+        decoder_segment_ids=segment_ids,
+        deterministic=True,
+        model_mode=MODEL_MODE_TRAIN,
+    )
+    self.assertEqual(
+        logits.shape,
+        (
+            self.cfg.global_batch_size_to_train_on,
+            self.cfg.max_target_length,
+            self.cfg.vocab_size,
+        ),
+    )
+    self.assertIsNone(kv)
+
+  def test_prefetch_value_and_grad(self):
+    """Exercises _custom_vjp_prefetch_pipeline_fwd and _custom_vjp_prefetch_pipeline_bwd."""
+    decoder = NNXDecoder(config=self.cfg, mesh=self.mesh, model_mode=MODEL_MODE_TRAIN, rngs=self.rngs)
+    shared_emb = Embed(
+        num_embeddings=self.cfg.vocab_size,
+        num_features=self.cfg.emb_dim,
+        dtype=self.cfg.dtype,
+        embedding_init=nn.initializers.normal(stddev=1.0),
+        config=self.cfg,
+        mesh=self.mesh,
+        rngs=self.rngs,
+    )
+    ids, segment_ids, positions = self._make_token_inputs()
+    graphdef, params, state = self._get_sharded_params_and_state(decoder, with_fsdp=False)
+
+    # pylint: disable=too-many-positional-arguments
+    def loss_fn(p, s, emb, token_ids, pos, seg_ids):
+      m = nnx.merge(graphdef, p, s)
+      out_logits, _, _ = m(
+          emb,
+          token_ids,
+          pos,
+          decoder_segment_ids=seg_ids,
+          deterministic=True,
+          model_mode=MODEL_MODE_TRAIN,
+      )
+      return jnp.sum(out_logits**2)
+
+    loss_val, (grad_params, grad_emb) = jax.value_and_grad(loss_fn, argnums=(0, 2))(
+        params, state, shared_emb, ids, positions, segment_ids
+    )
+    self.assertTrue(jnp.isfinite(loss_val))
+    self.assertIsNotNone(grad_params)
+    self.assertIsNotNone(grad_emb)
+
+  def test_prefetch_sharding_hints_and_fsdp_spec(self):
+    """Exercises PartitionSpec stripping, NamedSharding branches, and reduce-scatter collective helpers."""
+    decoder = NNXDecoder(config=self.cfg, mesh=self.mesh, model_mode=MODEL_MODE_TRAIN, rngs=self.rngs)
+    shared_emb = Embed(
+        num_embeddings=self.cfg.vocab_size,
+        num_features=self.cfg.emb_dim,
+        dtype=self.cfg.dtype,
+        embedding_init=nn.initializers.normal(stddev=1.0),
+        config=self.cfg,
+        mesh=self.mesh,
+        rngs=self.rngs,
+    )
+    ids, segment_ids, positions = self._make_token_inputs()
+    graphdef, params_sharded, state = self._get_sharded_params_and_state(decoder, with_fsdp=True)
+
+    def loss_fn(p, s):
+      m = nnx.merge(graphdef, p, s)
+      out_logits, _, _ = m(
+          shared_emb,
+          ids,
+          positions,
+          decoder_segment_ids=segment_ids,
+          deterministic=True,
+          model_mode=MODEL_MODE_TRAIN,
+      )
+      return jnp.sum(out_logits)
+
+    loss_val, grad_params = jax.value_and_grad(loss_fn)(params_sharded, state)
+    self.assertTrue(jnp.isfinite(loss_val))
+    self.assertIsNotNone(grad_params)
+
+  def test_prefetch_tuple_and_nontuple_layer_output(self):
+    """Exercises layer output unpacking branches for tuple and non-tuple return types in fwd and bwd."""
+    decoder = NNXDecoder(config=self.cfg, mesh=self.mesh, model_mode=MODEL_MODE_TRAIN, rngs=self.rngs)
+    shared_emb = Embed(
+        num_embeddings=self.cfg.vocab_size,
+        num_features=self.cfg.emb_dim,
+        dtype=self.cfg.dtype,
+        embedding_init=nn.initializers.normal(stddev=1.0),
+        config=self.cfg,
+        mesh=self.mesh,
+        rngs=self.rngs,
+    )
+    ids, segment_ids, positions = self._make_token_inputs()
+    graphdef, params, state = self._get_sharded_params_and_state(decoder, with_fsdp=False)
+
+    with unittest.mock.patch.object(
+        NNXDecoderLayer,
+        "__call__",
+        return_value=jnp.zeros(
+            (
+                self.cfg.global_batch_size_to_train_on,
+                self.cfg.max_target_length,
+                self.cfg.emb_dim,
+            )
+        ),
+    ):
+
+      def loss_fn(p, s):
+        m = nnx.merge(graphdef, p, s)
+        out_logits, _, _ = m(
+            shared_emb,
+            ids,
+            positions,
+            decoder_segment_ids=segment_ids,
+            deterministic=True,
+            model_mode=MODEL_MODE_TRAIN,
+        )
+        return jnp.sum(out_logits)
+
+      loss_val, grad_params = jax.value_and_grad(loss_fn)(params, state)
+      self.assertTrue(jnp.isfinite(loss_val))
+      self.assertIsNotNone(grad_params)
+
+  def test_prefetch_zero_length(self):
+    """Exercises length == 0 fast return inside _apply_layers_sequentially_prefetch."""
+    decoder = NNXDecoder(config=self.cfg, mesh=self.mesh, model_mode=MODEL_MODE_TRAIN, rngs=self.rngs)
+    hidden = jnp.zeros(
+        (
+            self.cfg.global_batch_size_to_train_on,
+            self.cfg.max_target_length,
+            self.cfg.emb_dim,
+        )
+    )
+    # pylint: disable=protected-access
+    out, _, kv = decoder._apply_layers_sequentially_prefetch(decoder.layers, hidden, length=0)
+    self.assertEqual(out.shape, hidden.shape)
+    self.assertIsNone(kv)
+
+  def test_prefetch_unnamed_sharding_and_none_specs(self):
+    """Exercises non-NamedSharding branches and None specs inside prefetch pipeline fwd/bwd helpers."""
+    # 1) Exercise non-NamedSharding branches by mocking getattr for 'sharding' attribute on params
+    rngs1 = nnx.Rngs(params=0, dropout=1)
+    cfg_auto = _make_config(
+        scan_layers=True,
+        prefetch_fsdp_weights=True,
+        num_decoder_layers=2,
+        shard_mode="auto",
+    )
+    decoder = NNXDecoder(config=cfg_auto, mesh=self.mesh, model_mode=MODEL_MODE_TRAIN, rngs=rngs1)
+    shared_emb = Embed(
+        num_embeddings=cfg_auto.vocab_size,
+        num_features=cfg_auto.emb_dim,
+        dtype=cfg_auto.dtype,
+        embedding_init=nn.initializers.normal(stddev=1.0),
+        config=cfg_auto,
+        mesh=self.mesh,
+        rngs=rngs1,
+    )
+    ids, segment_ids, positions = self._make_token_inputs()
+    nnx.pop(decoder, nnx.RngState, nnx.RngCount)
+    graphdef, params, state = nnx.split(decoder, nnx.Param, ...)
+
+    s_dev = NamedSharding(self.mesh, PartitionSpec())
+    orig_getattr = getattr
+
+    def _mock_getattr(obj, name, default=None):
+      if name == "sharding":
+        return s_dev
+      return orig_getattr(obj, name, default)
+
+    def loss_fn(p, s):
+      m = nnx.merge(graphdef, p, s)
+      out_logits, _, _ = m(
+          shared_emb,
+          ids,
+          positions,
+          decoder_segment_ids=segment_ids,
+          deterministic=True,
+          model_mode=MODEL_MODE_TRAIN,
+      )
+      return jnp.sum(out_logits)
+
+    with unittest.mock.patch.object(fsdp_prefetch, "getattr", side_effect=_mock_getattr, create=True):
+      loss_val, grad_params = jax.value_and_grad(loss_fn)(params, state)
+    self.assertTrue(jnp.isfinite(loss_val))
+    self.assertIsNotNone(grad_params)
+
+    # 2) Exercise shard_mode='auto' branches with explicit NamedSharding and PartitionSpec
+    rngs2 = nnx.Rngs(params=0, dropout=1)
+    cfg_auto_pspec = _make_config(
+        scan_layers=True,
+        prefetch_fsdp_weights=True,
+        num_decoder_layers=2,
+        shard_mode="auto",
+    )
+    decoder_pspec = NNXDecoder(
+        config=cfg_auto_pspec,
+        mesh=self.mesh,
+        model_mode=MODEL_MODE_TRAIN,
+        rngs=rngs2,
+    )
+    shared_emb_pspec = Embed(
+        num_embeddings=cfg_auto_pspec.vocab_size,
+        num_features=cfg_auto_pspec.emb_dim,
+        dtype=cfg_auto_pspec.dtype,
+        embedding_init=nn.initializers.normal(stddev=1.0),
+        config=cfg_auto_pspec,
+        mesh=self.mesh,
+        rngs=rngs2,
+    )
+    nnx.pop(decoder_pspec, nnx.RngState, nnx.RngCount)
+    graphdef_pspec, params_pspec, state_pspec = nnx.split(decoder_pspec, nnx.Param, ...)
+
+    def _to_named_sharding_pspec(arr):
+      if isinstance(arr, jax.Array):
+        return jax.lax.with_sharding_constraint(
+            arr,
+            jax.sharding.NamedSharding(self.mesh, jax.sharding.PartitionSpec()),
+        )
+      return arr
+
+    params_pspec = jax.tree.map(_to_named_sharding_pspec, params_pspec)
+
+    def loss_fn_pspec(p, s):
+      m = nnx.merge(graphdef_pspec, p, s)
+      out_logits, _, _ = m(
+          shared_emb_pspec,
+          ids,
+          positions,
+          decoder_segment_ids=segment_ids,
+          deterministic=True,
+          model_mode=MODEL_MODE_TRAIN,
+      )
+      return jnp.sum(out_logits)
+
+    loss_val_pspec, grad_params_pspec = jax.value_and_grad(loss_fn_pspec)(params_pspec, state_pspec)
+    self.assertTrue(jnp.isfinite(loss_val_pspec))
+    self.assertIsNotNone(grad_params_pspec)
+
+  def test_prefetch_with_param_scan_axis_nonzero(self):
+    """Exercises param_scan_axis != 0 inside _apply_layers_sequentially_prefetch."""
+    cfg_scan_1 = _make_config(
+        scan_layers=True,
+        prefetch_fsdp_weights=True,
+        num_decoder_layers=2,
+        param_scan_axis=1,
+    )
+    decoder = NNXDecoder(
+        config=cfg_scan_1,
+        mesh=self.mesh,
+        model_mode=MODEL_MODE_TRAIN,
+        rngs=self.rngs,
+    )
+    shared_emb = Embed(
+        num_embeddings=cfg_scan_1.vocab_size,
+        num_features=cfg_scan_1.emb_dim,
+        dtype=cfg_scan_1.dtype,
+        embedding_init=nn.initializers.normal(stddev=1.0),
+        config=cfg_scan_1,
+        mesh=self.mesh,
+        rngs=self.rngs,
+    )
+    ids, segment_ids, positions = self._make_token_inputs()
+    graphdef, params, state = self._get_sharded_params_and_state(decoder, with_fsdp=False)
+
+    def loss_fn(p, s):
+      m = nnx.merge(graphdef, p, s)
+      out_logits, _, _ = m(
+          shared_emb,
+          ids,
+          positions,
+          decoder_segment_ids=segment_ids,
+          deterministic=True,
+          model_mode=MODEL_MODE_TRAIN,
+      )
+      return jnp.sum(out_logits)
+
+    loss_val, grad_params = jax.value_and_grad(loss_fn)(params, state)
+    self.assertTrue(jnp.isfinite(loss_val))
+    self.assertIsNotNone(grad_params)
+
+  def test_prefetch_skipped_without_fsdp(self):
+    """Without FSDP sharding there is nothing to prefetch, so the regular scan is used."""
+    decoder = NNXDecoder(config=self.cfg, mesh=self.mesh, model_mode=MODEL_MODE_TRAIN, rngs=self.rngs)
+    hidden = jnp.zeros((self.cfg.global_batch_size_to_train_on, self.cfg.max_target_length, self.cfg.emb_dim))
+    with (
+        mock.patch.object(fsdp_prefetch, "mesh_uses_fsdp", return_value=False),
+        mock.patch.object(NNXDecoder, "_apply_layers_sequentially_prefetch") as prefetch,
+        mock.patch.object(nnx_decoders.max_logging, "info") as log_info,
+    ):
+      # pylint: disable=protected-access
+      out, _, kv = decoder._apply_layers_sequentially(decoder.layers, hidden, length=0, kv_caches_stacked=None)
+    prefetch.assert_not_called()
+    self.assertIn("using the regular scan", log_info.call_args[0][0])
+    self.assertEqual(out.shape, hidden.shape)
+    self.assertIsNone(kv)
+
+  def test_apply_layers_sequentially_zero_length_no_prefetch(self):
+    """Exercises length == 0 fast return inside _apply_layers_sequentially when prefetch_fsdp_weights is False."""
+    cfg_no_prefetch = _make_config(scan_layers=True, prefetch_fsdp_weights=False, num_decoder_layers=2)
+    decoder = NNXDecoder(
+        config=cfg_no_prefetch,
+        mesh=self.mesh,
+        model_mode=MODEL_MODE_TRAIN,
+        rngs=self.rngs,
+    )
+    hidden = jnp.zeros(
+        (
+            self.cfg.global_batch_size_to_train_on,
+            self.cfg.max_target_length,
+            self.cfg.emb_dim,
+        )
+    )
+    # pylint: disable=protected-access
+    out, _, kv = decoder._apply_layers_sequentially(decoder.layers, hidden, length=0, kv_caches_stacked=None)
+    self.assertEqual(out.shape, hidden.shape)
+    self.assertIsNone(kv)
+
+  def test_prefetch_pipeline_non_array_state_leaf(self):
+    """Runs value_and_grad through the prefetch pipeline with an extra non-parameter (BatchStat) state leaf."""
+    cfg_auto = _make_config(
+        scan_layers=True,
+        prefetch_fsdp_weights=True,
+        num_decoder_layers=2,
+        shard_mode="auto",
+    )
+    decoder = NNXDecoder(config=cfg_auto, mesh=self.mesh, model_mode=MODEL_MODE_TRAIN, rngs=self.rngs)
+    shared_emb = Embed(
+        num_embeddings=cfg_auto.vocab_size,
+        num_features=cfg_auto.emb_dim,
+        dtype=cfg_auto.dtype,
+        embedding_init=nn.initializers.normal(stddev=1.0),
+        config=cfg_auto,
+        mesh=self.mesh,
+        rngs=self.rngs,
+    )
+    ids, segment_ids, positions = self._make_token_inputs()
+
+    decoder.dummy = nnx.BatchStat(np.array([1.0, 2.0]))
+    graphdef, params, state = self._get_sharded_params_and_state(decoder, with_fsdp=False)
+
+    def loss_fn(p, s):
+      m = nnx.merge(graphdef, p, s)
+      out_logits, _, _ = m(
+          shared_emb,
+          ids,
+          positions,
+          decoder_segment_ids=segment_ids,
+          deterministic=True,
+          model_mode=MODEL_MODE_TRAIN,
+      )
+      return jnp.sum(out_logits)
+
+    loss_val, grad_params = jax.value_and_grad(loss_fn)(params, state)
+    self.assertTrue(jnp.isfinite(loss_val))
+    self.assertIsNotNone(grad_params)
+
+
+class TestNNXDecoderPrefetchGradParity(unittest.TestCase):
+  """The prefetch pipeline must produce the same loss and gradients as the plain scanned stack."""
+
+  def setUp(self):
+    super().setUp()
+    # Force the prefetch path on the single-device CPU test mesh (see TestNNXDecoderPrefetching).
+    patcher = mock.patch.object(fsdp_prefetch, "mesh_uses_fsdp", return_value=True)
+    patcher.start()
+    self.addCleanup(patcher.stop)
+
+  def _loss_and_grads(self, num_layers, prefetch, **overrides):
+    """Returns (loss, grads w.r.t. the decoder params) of a small float32 decoder, jitted."""
+    cfg_kwargs = {
+        "scan_layers": True,
+        "prefetch_fsdp_weights": prefetch,
+        "num_decoder_layers": num_layers,
+        "base_num_decoder_layers": num_layers,
+        "dtype": "float32",
+        "weight_dtype": "float32",
+        "matmul_precision": "highest",
+        "remat_policy": "full",
+    }
+    cfg_kwargs.update(overrides)
+    cfg = _make_config(**cfg_kwargs)
+    mesh = _make_mesh(cfg)
+    decoder = NNXDecoder(config=cfg, mesh=mesh, model_mode=MODEL_MODE_TRAIN, rngs=nnx.Rngs(params=0, dropout=1))
+    shared_emb = Embed(
+        num_embeddings=cfg.vocab_size,
+        num_features=cfg.emb_dim,
+        dtype=cfg.dtype,
+        embedding_init=nn.initializers.normal(stddev=1.0),
+        config=cfg,
+        mesh=mesh,
+        rngs=nnx.Rngs(params=1),
+    )
+    batch, seq_len = cfg.global_batch_size_to_train_on, cfg.max_target_length
+    ids = jax.random.randint(jax.random.PRNGKey(0), (batch, seq_len), 0, cfg.vocab_size)
+    segment_ids = jnp.full((batch, seq_len), DECODING_ACTIVE_SEQUENCE_INDICATOR)
+    positions = jnp.broadcast_to(jnp.arange(seq_len)[None], (batch, seq_len))
+    nnx.pop(decoder, nnx.RngState, nnx.RngCount)
+    graphdef, params, state = nnx.split(decoder, nnx.Param, ...)
+
+    def loss_fn(p):
+      m = nnx.merge(graphdef, p, state)
+      logits, _, _ = m(
+          shared_emb,
+          ids,
+          positions,
+          decoder_segment_ids=segment_ids,
+          deterministic=True,
+          model_mode=MODEL_MODE_TRAIN,
+      )
+      return jnp.mean(logits.astype(jnp.float32) ** 2)
+
+    return jax.jit(jax.value_and_grad(loss_fn))(params)
+
+  def _assert_parity(self, num_layers, **overrides):
+    """Asserts the prefetch pipeline matches the plain scanned stack in loss and every gradient leaf."""
+    ref_loss, ref_grads = self._loss_and_grads(num_layers, prefetch=False, **overrides)
+    loss, grads = self._loss_and_grads(num_layers, prefetch=True, **overrides)
+    np.testing.assert_allclose(loss, ref_loss, rtol=1e-5, atol=1e-6)
+    ref_leaves, ref_def = jax.tree_util.tree_flatten(ref_grads)
+    leaves, tree_def = jax.tree_util.tree_flatten(grads)
+    self.assertEqual(ref_def, tree_def)
+    for ref, got in zip(ref_leaves, leaves):
+      self.assertEqual(ref.shape, got.shape)
+      np.testing.assert_allclose(np.asarray(got), np.asarray(ref), rtol=2e-4, atol=2e-5)
+
+  def test_grad_parity_one_layer(self):
+    self._assert_parity(num_layers=1)
+
+  def test_grad_parity_two_layers(self):
+    self._assert_parity(num_layers=2)
+
+  def test_grad_parity_four_layers(self):
+    self._assert_parity(num_layers=4)
+
+  def test_grad_parity_five_layers(self):
+    self._assert_parity(num_layers=5)
+
+  def test_grad_parity_seven_layers(self):
+    # Two or more layer pairs per loop in both passes, so the loops order their second prefetch.
+    self._assert_parity(num_layers=7)
+
+  def test_grad_parity_eight_layers(self):
+    self._assert_parity(num_layers=8)
+
+  def test_grad_parity_param_scan_axis_zero(self):
+    self._assert_parity(num_layers=4, param_scan_axis=0)
+
+  def _assert_parity_saved_residuals(self, num_layers, **overrides):
+    """Asserts parity and returns how many residuals per layer the prefetch remat policy saves."""
+    with unittest.mock.patch.object(fsdp_prefetch.max_logging, "info") as log_info:
+      self._assert_parity(num_layers=num_layers, **overrides)
+    counts = [
+        int(m.group(1))
+        for c in log_info.call_args_list
+        for m in [re.search(r"remat policy saves (\d+) residual", str(c))]
+        if m
+    ]
+    self.assertTrue(counts, "the prefetch pipeline did not apply the remat policy")
+    return counts[0]
+
+  def test_grad_parity_remat_minimal(self):
+    # The forward pass saves the policy's named activations and the backward pass reuses them.
+    self.assertGreater(self._assert_parity_saved_residuals(num_layers=3, remat_policy="minimal"), 0)
+
+  def test_grad_parity_remat_minimal_seven_layers(self):
+    # Two or more layer pairs per loop, so saved residuals ride through both ordered unroll=2 loops.
+    self.assertGreater(self._assert_parity_saved_residuals(num_layers=7, remat_policy="minimal"), 0)
+
+  def test_grad_parity_remat_save_dot_except_mlp(self):
+    self.assertGreater(self._assert_parity_saved_residuals(num_layers=5, remat_policy="save_dot_except_mlp"), 0)
+
+  def test_grad_parity_remat_minimal_one_layer(self):
+    self.assertGreater(self._assert_parity_saved_residuals(num_layers=1, remat_policy="minimal"), 0)
+
+  def test_remat_custom_decoder_layer_input_saves_nothing_extra(self):
+    # `decoder_layer_input` is the layer input under a checkpoint name; the pipeline already keeps
+    # each layer's input, so the policy must not save it a second time.
+    saved = self._assert_parity_saved_residuals(num_layers=4, remat_policy="custom", decoder_layer_input="device")
+    self.assertEqual(saved, 0)
+
+  def test_full_remat_skips_residual_tracing(self):
+    with unittest.mock.patch.object(fsdp_prefetch.max_logging, "info") as log_info:
+      self._assert_parity(num_layers=3, remat_policy="full")
+    self.assertFalse(any("remat policy saves" in str(c) for c in log_info.call_args_list))
+
+  def test_grad_parity_remat_custom_offload(self):
+    # Offloaded residuals live in pinned host memory; they must survive the custom_vjp boundary and the
+    # forward scan stacking, and be brought back for the backward pass.
+    try:
+      jax.devices()[0].memory("pinned_host")
+    except Exception:  # pylint: disable=broad-exception-caught
+      self.skipTest("backend has no pinned_host memory")
+    saved = self._assert_parity_saved_residuals(num_layers=5, remat_policy="custom", mlpwo="offload", query_proj="device")
+    self.assertGreater(saved, 0)
 
 
 if __name__ == "__main__":

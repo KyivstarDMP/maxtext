@@ -18,6 +18,7 @@ import argparse
 import glob
 import json
 import os
+import re
 import sys
 import xml.etree.ElementTree as ET
 
@@ -28,17 +29,86 @@ REL_REGRESSION_OTHER_RATIO = 1.20
 ABS_INCREASE_UNIT_SEC = 15.0
 ABS_INCREASE_INTEGRATION_SEC = 30.0
 
+# TODO: Remove a module from this list once a few nightly runs with the class-level shard split
+# (tests/utils/class_split.py, TPU unit flavors) show no more PER-TEST REGRESSION ALERT warnings for it.
+# Modules excluded from per-test regression enforcement.
+# These modules have heavy XLA compilation costs that are shared across tests within the same
+# CI shard. Before the class-level split (tests/utils/class_split.py), pytest-split dealt single
+# tests, and its deal changed whenever the set of selected tests or their recorded durations
+# changed (PR runs deselect scheduled_only tests, so a PR's shards never matched the nightly's).
+# The first test in each shard pays a cold-compile penalty (~30-130s) while subsequent tests reuse
+# the cache (~4-25s), which created massive false-positive duration swings (e.g. 5s -> 130s)
+# depending on shard position, not code changes. Per-test regressions in these modules are logged
+# as warnings for visibility but do not fail the CI run.
+# See: https://github.com/AI-Hypercomputer/maxtext/pull/5308
+EXCLUDED_MODULES_PER_TEST = {
+    "tests.unit.moe_test",
+    "tests.unit.attention_test",
+    "tests.unit.megablox_gmm_3d_test",
+    "tests.unit.megablox_relayout_test",
+    "tests.unit.m3.qwen3_vl_comparison_test",
+    "tests.unit.tiling_test",
+    "tests.integration.pipeline_parallelism_test",
+}
+
 
 def extract_job_name(xml_file):
   """Extracts job/flavor name from XML filename."""
   basename = os.path.basename(xml_file)
-  parts = basename.replace(".xml", "").split("-")
+  parts = basename.removesuffix(".xml").split("-")
   if len(parts) >= 4 and parts[0] == "test" and parts[1] == "results":
     return "-".join(parts[2:-1])
   elif len(parts) >= 3:
     return parts[2]
   else:
     return "unknown"
+
+
+_SHARD_SUFFIX_RE = re.compile(r"^(\d+)(?:of(\d+))?$")
+
+
+def extract_shard_layout(xml_file):
+  """Extracts (worker_group, total_workers) from a shard result filename.
+
+  'test-results-<flavor>-<G>of<N>.xml' gives (G, N) and 'test-results-<flavor>-<G>.xml' gives
+  (G, None). Any other name gives None.
+  """
+  parts = os.path.basename(xml_file).removesuffix(".xml").split("-")
+  if len(parts) < 4 or parts[0] != "test" or parts[1] != "results":
+    return None
+  match = _SHARD_SUFFIX_RE.match(parts[-1])
+  if not match:
+    return None
+  group = int(match.group(1))
+  total = int(match.group(2)) if match.group(2) else None
+  return group, total
+
+
+def find_missing_shards(xml_files):
+  """Returns {job_name: [missing worker groups]} for jobs whose result files do not cover 1..N.
+
+  A shard that was cancelled or timed out never uploads its XML, so the total N carried by the
+  'GofN' suffix of its sibling files is larger than the number of groups seen. Files without a
+  'GofN' suffix carry no expectation and are never reported.
+  """
+  expected_total = {}
+  seen_groups = {}
+  for xml_file in xml_files:
+    layout = extract_shard_layout(xml_file)
+    if layout is None:
+      continue
+    group, total = layout
+    job_name = extract_job_name(xml_file)
+    seen_groups.setdefault(job_name, set()).add(group)
+    if total is not None:
+      expected_total[job_name] = max(expected_total.get(job_name, 0), total)
+
+  missing = {}
+  for job_name, total in sorted(expected_total.items()):
+    missing_groups = [g for g in range(1, total + 1) if g not in seen_groups[job_name]]
+    if missing_groups:
+      missing[job_name] = missing_groups
+  return missing
 
 
 def process_testcase(testcase, xml_file, job_name, baseline_data, new_baseline_data):
@@ -91,7 +161,16 @@ def process_testcase(testcase, xml_file, job_name, baseline_data, new_baseline_d
       ratio = time_val / base_time
       increase = time_val - base_time
       if ratio >= rel_regression_ratio and increase > abs_noise_threshold:
-        print(f"::error::[REGRESSION ALERT] {test_type} significantly degraded!")
+        # classname is "<module>.<Class>" for a test method and "<module>" for a test function.
+        is_excluded = any(classname == m or classname.startswith(m + ".") for m in EXCLUDED_MODULES_PER_TEST)
+        if is_excluded:
+          print(
+              f"::warning::[PER-TEST REGRESSION ALERT] {test_type} significantly degraded"
+              + " (Warn-only: module excluded due to shard-position noise)."
+          )
+        else:
+          print(f"::error::[REGRESSION ALERT] {test_type} significantly degraded!")
+          failed = True
         print(f"  Test: {full_name}")
         print(f"  Flavor: {job_name}")
         print(f"  File: {os.path.basename(xml_file)}")
@@ -100,7 +179,6 @@ def process_testcase(testcase, xml_file, job_name, baseline_data, new_baseline_d
         print(f"  Increase: +{increase:.2f}s ({(ratio - 1) * 100:.1f}%)")
         print(f"  Thresholds: >{(rel_regression_ratio - 1) * 100:.0f}% AND >{abs_noise_threshold}s")
         print("-" * 50)
-        failed = True
 
   return failed
 
@@ -131,7 +209,7 @@ def main():
   )
   args = parser.parse_args()
 
-  xml_files = glob.glob(os.path.join(args.xml_dir, "*.xml"))
+  xml_files = sorted(glob.glob(os.path.join(args.xml_dir, "*.xml")))
   if not xml_files:
     print(f"No XML files found in {args.xml_dir}")
     sys.exit(0)
@@ -145,12 +223,25 @@ def main():
       print(f"Error loading baseline {args.baseline}: {e}")
 
   # Initialize with existing baseline data, filtering out old legacy keys without flavor separator '::'
-  new_baseline_data = {k: v for k, v in baseline_data.items() if "::" in k and isinstance(v, (int, float))}
+  new_baseline_data = {
+      k: v for k, v in baseline_data.items() if "::" in k and "::MODULE::" not in k and isinstance(v, (int, float))
+  }
   has_regression = False
   has_errors = False
 
   total_times_by_job = {}
   total_tests_by_job = {}
+
+  # A shard that was cancelled or timed out leaves no result file. Its tests keep their previous baseline
+  # entries and the tests that ran are recorded as usual, but the flavor's totals would be short, so they
+  # stay off the dashboard.
+  missing_shards = find_missing_shards(xml_files)
+  for job_name, groups in missing_shards.items():
+    missing_groups = ", ".join(str(g) for g in groups)
+    print(
+        f"::warning::[PARTIAL RESULTS] Flavor {job_name} has no result file for worker group(s) {missing_groups}. "
+        "Its totals stay off the dashboard; the tests of the missing group(s) keep their previous baseline entries."
+    )
 
   for xml_file in xml_files:
     job_name = extract_job_name(xml_file)
@@ -167,7 +258,7 @@ def main():
         time_val = float(testcase.get("time", 0.0))
         job_time += time_val
 
-        # Micro-level regression check
+        # Micro-level regression check (enforced for non-excluded modules, warn-only for excluded)
         if process_testcase(testcase, xml_file, job_name, baseline_data, new_baseline_data):
           has_regression = True
 
@@ -182,9 +273,9 @@ def main():
   # Output macro-level benchmark JSON if requested
   if args.output_benchmark:
     benchmarks = []
-    for job, total_time in total_times_by_job.items():
-      # Exclude CPU suites from macro-level dashboard tracking to avoid false alerts from CPU runner noise
-      if "cpu" in job.lower():
+    for job, total_time in sorted(total_times_by_job.items()):
+      # Exclude CPU and decoupled suites (runner noise) and flavors with a missing shard (short totals) from the dashboard
+      if "cpu" in job.lower() or "decoupled" in job.lower() or job in missing_shards:
         continue
       benchmarks.append(
           {
@@ -201,16 +292,20 @@ def main():
           }
       )
 
-    try:
-      dirname = os.path.dirname(args.output_benchmark)
-      if dirname:
-        os.makedirs(dirname, exist_ok=True)
-      with open(args.output_benchmark, "w", encoding="utf-8") as f:
-        json.dump(benchmarks, f, indent=2)
-      print(f"Saved benchmark results to {args.output_benchmark}")
-    except Exception as e:  # pylint: disable=broad-exception-caught
-      print(f"Error saving benchmark results: {e}")
-      has_errors = True
+    if not benchmarks:
+      # github-action-benchmark fails on an empty list. Without the file, track_performance.yml skips that step.
+      print(f"No flavor has dashboard totals in this run; {args.output_benchmark} is not written.")
+    else:
+      try:
+        dirname = os.path.dirname(args.output_benchmark)
+        if dirname:
+          os.makedirs(dirname, exist_ok=True)
+        with open(args.output_benchmark, "w", encoding="utf-8") as f:
+          json.dump(benchmarks, f, indent=2)
+        print(f"Saved benchmark results to {args.output_benchmark}")
+      except Exception as e:  # pylint: disable=broad-exception-caught
+        print(f"Error saving benchmark results: {e}")
+        has_errors = True
 
   # Save baseline only if no critical execution/parsing errors occurred
   if args.save_baseline:

@@ -61,8 +61,8 @@ KERNEL_NAMES = maxtext_engine.KERNEL_NAMES
 # kernels lower as `jit_first_kernel`, `jit_accum_kernel` and `jit__update_kernel`, so on those
 # defaults the dump comes back empty.
 HLO_DUMP_DEFAULTS = {
-    "dump_hlo_local_module_name": "jit_.*kernel",
-    "dump_hlo_module_name": "kernel",
+    "dump_hlo_local_module_name": f"jit_({'|'.join(KERNEL_NAMES)})",
+    "dump_hlo_module_name": "jit_",
 }
 
 
@@ -197,6 +197,9 @@ class AbstractMaxTextEngine(maxtext_engine.MaxTextTrainingEngine):
 
   def update(self, **kwargs: Any) -> int:
     raise self._cannot_run("update")
+
+  def fwd_only(self, fn: Any, *args: Any, **kwargs: Any) -> Any:
+    raise self._cannot_run("fwd_only")
 
   def save_checkpoint(self, metadata: Any, **kwargs: Any) -> None:
     raise self._cannot_run("save_checkpoint")

@@ -163,6 +163,7 @@ vllm_model_name_mapping = {
     "qwen3-235b-a22b": "Qwen/Qwen3-235B-A22B",
     "gemma4-26b": "google/gemma-4-26B-A4B",
     "qwen3.5-35b-a3b": "Qwen/Qwen3.5-35B-A3B",
+    "qwen3.5-35b-a3b-fp8": "Qwen/Qwen3.5-35B-A3B-FP8",
     # Add more mappings as needed
 }
 
@@ -926,11 +927,10 @@ def validate_converter(argv) -> None:
   sampler = MaxTextVllmSampler(
       tokenizer=tokenizer,
       config=vllm_config,
-      converter=converter,
       direct_maxtext_sync=direct_maxtext_sync,
-      scan_axis=getattr(trainer_config, "param_scan_axis", 1),
-      layer_pattern_length=getattr(trainer_config, "inhomogeneous_layer_cycle_interval", None),
+      model_name=trainer_config.model_name,
   )
+  sampler.converter = converter
   golden_llm_state = sampler.transformer_state
   # Captured before any sync so a post-sync structural change (which will
   # otherwise surface only as an opaque PyTreeDef mismatch during generation)

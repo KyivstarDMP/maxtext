@@ -22,8 +22,8 @@ import re
 from typing import Any
 import warnings
 
-from flax import linen as nn
 from flax import nnx
+from flax.core.spmd import logical_axis_rules
 import jax
 from jax.ad_checkpoint import checkpoint_name
 import jax.numpy as jnp
@@ -36,10 +36,11 @@ from maxtext.common.common_types import (
     MODEL_MODE_TRAIN,
     MultimodalInput,
     ShardMode,
+    get_weight_dtype,
 )
 from maxtext.configs.types import check_forced_routing_support
-from maxtext.layers import initializers, linears, mhc, moe, normalizations, quantizations
-from maxtext.layers import nnx_scan, nnx_wrappers
+from maxtext.layers import linears, mhc, moe, normalizations, quantizations
+from maxtext.layers import fsdp_prefetch, nnx_scan
 from maxtext.layers.attentions import Attention
 from maxtext.layers.embeddings import Embed, PositionalEmbedding, attend_on_embedding
 from maxtext.layers.normalizations import RMSNorm
@@ -68,7 +69,9 @@ from maxtext.models import (
     qwen3_5,
     qwen3_custom,
     simple_layer,
+    weaver,
 )
+
 from maxtext.multimodal import utils as mm_utils
 from maxtext.utils import max_logging, max_utils, maxtext_utils, maxtext_utils_nnx, sharding
 from maxtext.utils.sharding import create_sharding
@@ -76,6 +79,96 @@ from maxtext.utils.sharding import create_sharding
 # ------------------------------------------------------------------------------
 # The network: Decoder Definitions
 # ------------------------------------------------------------------------------
+
+_FSDP_MESH_AXES = ("fsdp", "fsdp_transpose")
+_GATHERED_FSDP_WEIGHT = "gathered_fsdp_weight"
+
+
+def _drop_fsdp_mesh_axes(entry):
+  """Return one PartitionSpec entry with the FSDP mesh axes removed."""
+  if entry is None:
+    return None
+  if isinstance(entry, str):
+    return None if entry in _FSDP_MESH_AXES else entry
+  rest = tuple(a for a in entry if a not in _FSDP_MESH_AXES)
+  if not rest:
+    return None
+  return rest[0] if len(rest) == 1 else rest
+
+
+def save_gathered_fsdp_weights_policy(policy):
+  """Extend a remat policy so the hoisted FSDP weight gathers survive as residuals."""
+  keep = jax.checkpoint_policies.save_only_these_names(_GATHERED_FSDP_WEIGHT)
+  return keep if policy is None else jax.checkpoint_policies.save_from_both_policies(policy, keep)
+
+
+def hoist_fsdp_weight_gather(params, mesh, config):
+  """Gather each FSDP-sharded layer kernel once, in compute dtype, at the top of a scan body.
+
+  Left alone, the FSDP all-gather of a weight is emitted wherever the weight is first
+  read, which under remat means once in the forward pass and again in the recomputed
+  backward pass. Doing it explicitly here gives the gather a name, so the remat policy
+  can keep the gathered value as a residual and the backward pass reads it instead of
+  re-gathering. See `save_fsdp_gathered_weights` in base.yml.
+
+  Numerics are unchanged: the only arithmetic difference is that the cast to
+  `config.dtype` happens before the gather rather than inside the consuming dot, and
+  only kernels (rank >= 2 float arrays) are touched, never the rank-1 norm scales.
+  """
+  if not config.save_fsdp_gathered_weights:
+    return params
+
+  def gathered(value, spec):
+    """(pspec, cast value) for a kernel worth gathering here, or None to leave it be."""
+    new_spec = tuple(_drop_fsdp_mesh_axes(e) for e in spec)
+    if tuple(spec) == new_spec:
+      return None
+    if getattr(value, "ndim", 0) < 2 or not jnp.issubdtype(value.dtype, jnp.floating):
+      return None
+    # Every consumer casts its kernel to config.dtype before the dot, so doing it here
+    # instead is arithmetically identical -- but it halves both the bytes on the wire
+    # and the bytes the residual costs in HBM. That halving is what makes the residual
+    # pay for itself: kept at f32 it is a wash (see the guide, section 4.11).
+    return jax.sharding.PartitionSpec(*new_spec), jnp.asarray(value, config.dtype)
+
+  if config.shard_mode == ShardMode.EXPLICIT:
+
+    def hoist(x):
+      if not hasattr(x, "shape") or getattr(x, "ndim", 0) < 2:
+        return x
+      spec = getattr(jax.typeof(x).sharding, "spec", None)
+      if spec is None:
+        return x
+      out = gathered(x, tuple(spec))
+      if out is None:
+        return x
+      pspec, value = out
+      return checkpoint_name(jax.sharding.reshard(value, pspec), _GATHERED_FSDP_WEIGHT)
+
+    return jax.tree.map(hoist, params)
+
+  # Under shard_mode: auto jax.typeof(x).sharding.spec is all-None inside the traced
+  # body, so the logical axis names have to be read off the nnx.Variable metadata and
+  # lowered through the logical axis rules by hand.
+  rules = sharding.get_logical_axis_rules() or config.logical_axis_rules
+
+  def hoist_auto(x):
+    if not isinstance(x, nnx.Variable) or x.type.__name__ == "_overwrite_with_gradient":
+      return x
+    metadata = x.get_metadata()
+    # Same precedence `variable_to_logically_partitioned` uses, so both read the same names.
+    names = next((metadata[k] for k in ("out_sharding", "sharding_names", "sharding") if metadata.get(k)), None)
+    value = x.get_value()
+    if not names or not hasattr(value, "shape") or len(names) != getattr(value, "ndim", 0):
+      return x
+    out = gathered(value, tuple(sharding.logical_to_mesh_axes(tuple(names), mesh, rules=rules)))
+    if out is None:
+      return x
+    pspec, value = out
+    pinned = jax.lax.with_sharding_constraint(value, jax.sharding.NamedSharding(mesh, pspec))
+    return x.replace(checkpoint_name(pinned, _GATHERED_FSDP_WEIGHT))
+
+  return jax.tree.map(hoist_auto, params, is_leaf=lambda x: isinstance(x, nnx.Variable))
 
 
 class NNXDecoderLayer(nnx.Module):
@@ -386,7 +479,7 @@ class NNXScannedPipelineStage(nnx.Module):
 
     scan_axis = self.config.param_scan_axis
     if scan_axis != 0:
-      params = jax.tree.map(lambda x: jnp.moveaxis(x, scan_axis, 0), params)
+      params = jax.tree.map(lambda x: jnp.moveaxis(x, scan_axis, 0) if x.ndim > scan_axis else x, params)
 
     def layer_fn(carry, scanned_vars):
       current_params, current_state = scanned_vars
@@ -410,7 +503,9 @@ class NNXScannedPipelineStage(nnx.Module):
     if scan_axis != 0:
       scanned_params, scanned_other = scanned_state.split(nnx.Param, ...)
       if scanned_params:
-        scanned_params = jax.tree.map(lambda x: jnp.moveaxis(x, 0, scan_axis), scanned_params)
+        scanned_params = jax.tree.map(
+            lambda x: jnp.moveaxis(x, 0, scan_axis) if x.ndim > scan_axis else x, scanned_params
+        )
       scanned_state = nnx.State.merge(scanned_params, scanned_other)
 
     nnx.update(self.scanned_layers, scanned_state)
@@ -445,7 +540,7 @@ class NNXDecoder(nnx.Module):
           num_embeddings=config.trainable_position_size,
           num_features=config.emb_dim,
           dtype=config.dtype,
-          embedding_init=nn.initializers.normal(stddev=1.0),
+          embedding_init=jax.nn.initializers.normal(stddev=1.0),
           config=config,
           mesh=self.mesh,
           rngs=rngs,
@@ -461,16 +556,21 @@ class NNXDecoder(nnx.Module):
         kernel_axes=("norm",),
         parameter_memory_host_offload=config.parameter_memory_host_offload,
     )
+    # The head's kernel is created here rather than on the first call, so its orientation is
+    # fixed by the module's own model_mode.
+    self.lm_head_axes = sharding.lm_head_logical_axes(config.lm_head_fsdp_as_vocab_tp and model_mode == MODEL_MODE_TRAIN)
     if not config.logits_via_embedding:
       self.logits_dense = linears.DenseGeneral(
           in_features_shape=config.emb_dim,
           out_features_shape=config.vocab_size,
-          weight_dtype=config.weight_dtype,
+          weight_dtype=get_weight_dtype(config, "logits_dense"),
           dtype=jnp.float32 if config.logits_dot_in_fp32 else config.dtype,
-          kernel_axes=("embed_vocab", "vocab"),
+          kernel_axes=self.lm_head_axes[1],
           shard_mode=config.shard_mode,
           matmul_precision=self.config.matmul_precision,
           parameter_memory_host_offload=config.parameter_memory_host_offload,
+          weight_quant=quantizations.get_weight_quant_config(config, "logits_dense"),
+          weight_grad_in_kernel_order=config.lm_head_weight_grad_in_kernel_order,
           rngs=rngs,
       )
 
@@ -481,6 +581,7 @@ class NNXDecoder(nnx.Module):
     self.is_gemma4 = self.config.decoder_block == DecoderBlockType.GEMMA4
     self.is_gemma4_small = self.config.decoder_block == DecoderBlockType.GEMMA4_SMALL
     self.is_qwen3_next = self.config.decoder_block == DecoderBlockType.QWEN3_NEXT
+    self.is_qwen3_5 = self.config.decoder_block == DecoderBlockType.QWEN3_5
 
     if config.mhc_expansion_rate > 1 and config.decoder_block == DecoderBlockType.DEEPSEEK4:
       self.hc_head = mhc.DeepSeek4HyperHead(
@@ -497,7 +598,7 @@ class NNXDecoder(nnx.Module):
 
     if self.is_gemma4_small:
       # Gemma4 E2B/E4B: per-layer-index KV-share donor threading and a distinct attention_type
-      # per layer are not expressible inside nn.scan; pipeline parallelism is also unsupported.
+      # per layer are not expressible inside jax.lax.scan; pipeline parallelism is also unsupported.
       if getattr(config, "using_pipeline_parallelism", False) or getattr(config, "scan_layers", False):
         raise ValueError("gemma4_small (Gemma4 E2B/E4B) does not support pipeline parallelism or scan_layers.")
       self._init_gemma4_small_layers(rngs)
@@ -573,7 +674,7 @@ class NNXDecoder(nnx.Module):
         self.layers_outside_pipeline = self._create_scanned_layers(
             base_cls,
             length=remaining_layers,
-            metadata_axis_name="layers",
+            metadata_axis_name="layers_outside_pipeline",
             rngs=rngs,
         )
       else:
@@ -612,12 +713,25 @@ class NNXDecoder(nnx.Module):
     num_remaining_layers = config.num_decoder_layers - num_hash_layers
     num_full_blocks = num_remaining_layers // 2
     if num_full_blocks > 0:
+      remat_policy_fn, prevent_cse_in_remat = self._get_deepseek4_remat_policy_and_cse()
       self.scanned_blocks = self._create_scanned_layers(
           deepseek4.DeepSeek4ScannableBlock,
           length=num_full_blocks,
           metadata_axis_name="scanned_blocks",
           rngs=rngs,
+          remat_policy_fn=remat_policy_fn,
+          prevent_cse_in_remat=prevent_cse_in_remat,
       )
+
+  def _get_deepseek4_remat_policy_and_cse(self):
+    """Returns the scan-safe per-layer remat policy and prevent_cse flag for DeepSeek-V4."""
+    # Offloaded residuals cannot cross the trip-count-one boundary, so keep them on device.
+    save_names, offload_names = maxtext_utils.get_save_and_offload_names(self.config)
+    if save_names or offload_names:
+      policy = jax.checkpoint_policies.save_only_these_names(*(save_names + offload_names))
+    else:
+      policy = self.get_remat_policy()
+    return policy, maxtext_utils.should_prevent_cse_in_remat(self.config)
 
   def _init_scanned_deepseek(self, decoder_block_classes, rngs):
     """Initializes scanned DeepSeek layers with optional Engram support."""
@@ -809,7 +923,14 @@ class NNXDecoder(nnx.Module):
     """Initializes scanned generic decoder layers."""
     config = self.config
     layer_cls = decoder_block_classes[0]
-    num_layers = int(config.num_decoder_layers / config.inhomogeneous_layer_cycle_interval)
+    cycle_interval = config.inhomogeneous_layer_cycle_interval
+    if config.num_decoder_layers % cycle_interval:
+      raise ValueError(
+          f"num_decoder_layers ({config.num_decoder_layers}) must be a multiple of"
+          f" inhomogeneous_layer_cycle_interval ({cycle_interval}) to scan {config.decoder_block.value} layers:"
+          " each scan step builds one whole cycle, so the remaining layers would be dropped."
+      )
+    num_layers = config.num_decoder_layers // cycle_interval
     layer_kwargs = {}
     if config.decoder_block == DecoderBlockType.LLAMA4:
       layer_kwargs = {
@@ -944,25 +1065,15 @@ class NNXDecoder(nnx.Module):
     setattr(self, attr_name, layer)
 
   def _create_single_layer(self, decoder_layer_class, rngs, **kwargs):
-    """Helper to create a single layer (Linen or NNX)."""
-    if issubclass(decoder_layer_class, nnx.Module):
-      return decoder_layer_class(
-          config=self.config,
-          mesh=self.mesh,
-          quant=self.quant,
-          model_mode=self.model_mode,
-          rngs=rngs,
-          **kwargs,
-      )
-    else:
-      layer_linen = decoder_layer_class(
-          config=self.config,
-          mesh=self.mesh,
-          quant=self.quant,
-          model_mode=self.model_mode,
-          **kwargs,
-      )
-      return nnx_wrappers.ToNNX(layer_linen, rngs=rngs)
+    """Helper to create a single layer."""
+    return decoder_layer_class(
+        config=self.config,
+        mesh=self.mesh,
+        quant=self.quant,
+        model_mode=self.model_mode,
+        rngs=rngs,
+        **kwargs,
+    )
 
   def _create_scanned_layers(
       self,
@@ -1053,6 +1164,16 @@ class NNXDecoder(nnx.Module):
       (final_carry, updated_layers) when kv_caches_stacked is None.
       (final_carry, updated_layers, returned_kv_stacked) otherwise.
     """
+    if self.config.prefetch_fsdp_weights and not fsdp_prefetch.mesh_uses_fsdp(self.mesh):
+      max_logging.info("prefetch_fsdp_weights: no FSDP mesh axis spans more than one device; using the regular scan.")
+    elif (
+        self.config.prefetch_fsdp_weights
+        and kv_caches_stacked is None
+        and forced_routed_experts_scanned is None
+        and not self.config.parameter_memory_host_offload
+        and not getattr(self, "disable_quant_stats_update", False)
+    ):
+      return self._apply_layers_sequentially_prefetch(layers, x_in, *args, length=length, **kwargs)
     if length == 0:
       return (
           x_in,
@@ -1060,12 +1181,14 @@ class NNXDecoder(nnx.Module):
           kv_caches_stacked if kv_caches_stacked is not None else None,
       )
     policy = self.get_remat_policy()
+    if self.config.save_fsdp_gathered_weights:
+      policy = save_gathered_fsdp_weights_policy(policy)
     prevent_cse = maxtext_utils.should_prevent_cse_in_remat(self.config)
     graphdef, params, state = nnx.split(layers, nnx.Param, ...)
 
     scan_axis = self.config.param_scan_axis
     if scan_axis != 0:
-      params = jax.tree.map(lambda x: jnp.moveaxis(x, scan_axis, 0), params)
+      params = jax.tree.map(lambda x: jnp.moveaxis(x, scan_axis, 0) if x.ndim > scan_axis else x, params)
 
     layer_cls = layers.__class__
     sig = inspect.signature(layer_cls.__call__)
@@ -1105,6 +1228,8 @@ class NNXDecoder(nnx.Module):
             lambda x: jax.device_put(x, max_utils.device_space()),
             current_params,
         )
+      else:
+        current_params = hoist_fsdp_weight_gather(current_params, self.mesh, self.config)
 
       layer = nnx.merge(graphdef, current_params, current_state)
 
@@ -1202,6 +1327,20 @@ class NNXDecoder(nnx.Module):
 
     return final_carry, out_layers, returned_kv_stacked if use_kv else None
 
+  def _apply_layers_sequentially_prefetch(self, layers, x_in, *args, length: int, **kwargs):
+    """Runs the scanned layer stack with FSDP weight prefetching (see `fsdp_prefetch`)."""
+    return fsdp_prefetch.apply_layers_with_fsdp_prefetch(
+        layers,
+        x_in,
+        *args,
+        length=length,
+        mesh=self.mesh,
+        config=self.config,
+        remat_policy=self.get_remat_policy(),
+        prevent_cse=maxtext_utils.should_prevent_cse_in_remat(self.config),
+        **kwargs,
+    )
+
   def get_decoder_layers(self):
     """Retrieves decoder layer classes based on config using a dictionary lookup."""
     cfg = self.config
@@ -1237,6 +1376,7 @@ class NNXDecoder(nnx.Module):
         DecoderBlockType.LLAMA4: get_scannable(llama4.Llama4DecoderLayer, llama4.Llama4ScannableBlock),
         DecoderBlockType.OLMO3: get_scannable(olmo3.Olmo3DecoderLayer, olmo3.Olmo3ScannableBlock),
         DecoderBlockType.ENVY: get_scannable(envy.EnvyDecoderLayer, envy.EnvyScannableBlock),
+        DecoderBlockType.WEAVER: [weaver.WeaverMoTDecoderLayer],
     }
 
     if cfg.decoder_block not in layer_map:
@@ -1410,6 +1550,7 @@ class NNXDecoder(nnx.Module):
       return functools.partial(
           gpt3.Gpt3LayerNorm,
           num_features=num_features,
+          shard_mode=self.config.shard_mode,
           reductions_in_fp32=False,
           use_bias=True,
           rngs=rngs,
@@ -1447,7 +1588,7 @@ class NNXDecoder(nnx.Module):
     y = (
         decoder_input_embeddings
         if decoder_input_embeddings is not None
-        else shared_embedding(decoder_input_tokens.astype("int32"), model_mode=model_mode)
+        else self.embed_tokens(shared_embedding, decoder_input_tokens, model_mode)
     )
 
     # Precomputed embeddings are complete (including any multimodal replacements),
@@ -1477,11 +1618,15 @@ class NNXDecoder(nnx.Module):
             "qwen3-vl-2b",
             "qwen3-vl-4b",
             "qwen3-vl-30b-a3b",
+            "qwen3.5-9b",
             "qwen3.5-35b-a3b",
+            "qwen3.5-35b-a3b-fp8",
+            "qwen3.5-35b-fp8",
             "qwen3.5-397b-a17b",
+            "qwen3.5-397b-a17b-fp8",
             "maxtext-omni-gemma3-qwen3",
-            "cosmos3-nano-reasoner",
-            "cosmos3-super-reasoner",
+            "weaver-mini",
+            "weaver-max",
         }:
           y = mm_utils.merge_mm_embeddings(
               text_embeddings=y,
@@ -1498,10 +1643,14 @@ class NNXDecoder(nnx.Module):
             "qwen3-vl-2b",
             "qwen3-vl-4b",
             "qwen3-vl-30b-a3b",
+            "qwen3.5-9b",
             "qwen3.5-35b-a3b",
+            "qwen3.5-35b-a3b-fp8",
+            "qwen3.5-35b-fp8",
             "qwen3.5-397b-a17b",
-            "cosmos3-nano-reasoner",
-            "cosmos3-super-reasoner",
+            "qwen3.5-397b-a17b-fp8",
+            "weaver-mini",
+            "weaver-max",
         }:
           y = mm_utils.merge_mm_embeddings(
               text_embeddings=y,
@@ -1534,42 +1683,92 @@ class NNXDecoder(nnx.Module):
 
     return y
 
-  def apply_output_head(self, shared_embedding, y, deterministic, model_mode):
-    """Applies final normalization and projects hidden states to logits."""
+  def embed_tokens(self, shared_embedding, decoder_input_tokens, model_mode):
+    """Looks up the token embeddings, before dropout and positional embeddings."""
+    return shared_embedding(decoder_input_tokens.astype("int32"), model_mode=model_mode)
 
+  def _reduce_mhc_streams(self, y):
+    """Collapses a 4D mHC hidden state down to 3D.
+
+    `[batch, length, mhc_expansion_rate, emb_dim]` --> `[batch, length, emb_dim]`.
+
+    This is a no-op for non-mHC models and for states that are already collapsed, so it
+    is safe to call on any path that requires a 3D state.
+
+    Args:
+      y: Hidden state tensor, either already 3D or an expanded 4D mHC state.
+
+    Returns:
+      The hidden state with the parallel-stream axis removed.
+    """
     cfg = self.config
-    if cfg.shard_mode == ShardMode.EXPLICIT:
+    if cfg.mhc_expansion_rate <= 1 or y.ndim < 4:
+      return y
+    if self.is_deepseek4:
+      return self.hc_head(y)
+    # (batch, length, mhc_expansion_rate, emb_dim) --> (batch, length, emb_dim)
+    _, mhc_reduce_fn = mhc.get_functions(cfg.mhc_expansion_rate)
+    return mhc_reduce_fn(y)
+
+  def apply_decoder_norm(self, y, reduce_mhc=True):
+    """Applies the decoder's final normalization (`decoder_norm`) to a hidden state.
+
+    Args:
+      y: Hidden state tensor, either 3D or an expanded 4D mHC state.
+      reduce_mhc: If True (default), collapses the parallel hyper-connection streams to 3D
+        before normalizing.
+
+    Returns:
+      The normalized hidden state.
+    """
+    if reduce_mhc:
+      y = self._reduce_mhc_streams(y)
+    if self.config.shard_mode == ShardMode.EXPLICIT:
       norm_out_sharding = create_sharding(
           self.mesh,
           ("activation_batch", "activation_length", "activation_embed"),
       )
     else:
       norm_out_sharding = None
+    return self.decoder_norm(y, out_sharding=norm_out_sharding)
 
-    y = self.decoder_norm(y, out_sharding=norm_out_sharding)
+  def apply_output_head(self, shared_embedding, y, deterministic, model_mode, normalize_y=True, reduce_mhc=True):
+    """Applies final normalization and projects hidden states to logits.
+
+    Args:
+      shared_embedding: Shared token embedding layer for tied logit projection.
+      y: Input hidden state tensor to project to logits.
+      deterministic: Whether dropout is disabled.
+      model_mode: Operational mode (e.g. MODEL_MODE_TRAIN, MODEL_MODE_PREFILL).
+      normalize_y: If True (default), applies the main decoder final normalization
+        (decoder_norm) before projecting to logits. Set to False when `y` is already
+        normalized: when called from Multi-Token Prediction (MTP), which applies its
+        own dedicated final norm (mtp_k_final_norm), or when the decoder has already
+        applied `decoder_norm` because `mtp_norm_main_hidden_state` is enabled.
+      reduce_mhc: If True (default), collapses the parallel hyper-connection (mHC)
+        streams of a 4D `[batch, seq, mhc_expansion_rate, emb]` hidden state down to
+        3D before normalizing. Set to False when the caller has already reduced the
+        state itself (MTP applies its own per-depth `hc_head`).
+    """
+
+    cfg = self.config
+    if reduce_mhc:
+      y = self._reduce_mhc_streams(y)
+
+    if normalize_y:
+      y = self.apply_decoder_norm(y, reduce_mhc=False)
     y = self.dropout(y, deterministic=deterministic)  # NNX call
 
+    head_in_axes, _, head_out_axes = self.lm_head_axes
     if model_mode in {MODEL_MODE_PREFILL, MODEL_MODE_AUTOREGRESSIVE}:
       out_sharding = create_sharding(self.mesh, (None, None, "activation_vocab"))
     else:
-      out_sharding = create_sharding(
-          self.mesh,
-          (
-              "activation_embed_and_logits_batch",
-              "activation_length",
-              "activation_vocab",
-          ),
-      )
+      out_sharding = create_sharding(self.mesh, head_out_axes)
 
     # [batch, length, emb_dim] -> [batch, length, vocab_size]
     if cfg.logits_via_embedding:
       # Use the transpose of embedding matrix for logit transform.
-      if isinstance(shared_embedding, nnx.Module):
-        embedding_table = shared_embedding.embedding[...]
-      else:
-        embedding_table = shared_embedding.variables["params"]["embedding"]
-      if isinstance(embedding_table, nn.spmd.LogicallyPartitioned):
-        embedding_table = embedding_table.unbox()
+      embedding_table = shared_embedding.embedding[...]
       attend_dtype = jnp.float32 if cfg.logits_dot_in_fp32 else cfg.dtype
       logits = attend_on_embedding(y, embedding_table, attend_dtype, self.config, out_sharding)
 
@@ -1580,6 +1779,11 @@ class NNXDecoder(nnx.Module):
         logits = logits / cfg.final_logits_soft_cap
         logits = jnp.tanh(logits) * cfg.final_logits_soft_cap
     else:
+      if head_in_axes is not None:
+        # Gather the hidden state off the FSDP axes; the kernel stays put.
+        y = sharding.maybe_shard_with_logical(
+            y, head_in_axes, self.mesh, cfg.shard_mode, debug_sharding=cfg.debug_sharding
+        )
       logits = self.logits_dense(y, out_sharding=out_sharding)
 
     if self.config.cast_logits_to_fp32:
@@ -1609,6 +1813,7 @@ class NNXDecoder(nnx.Module):
         "post_self_attention_layer_norm": state_dict["post_self_attention_layer_norm"],
         "self_attention": state_dict["self_attention"],
         "DeepSeekMoeBlock_0": moe_block,
+        "mlp": state_dict.get("mlp"),
     }
 
   def _find_next_boundary(self, current_idx, end_idx, engram_indices):
@@ -1769,9 +1974,8 @@ class NNXDecoder(nnx.Module):
         decoder_input_embeddings=decoder_input_embeddings,
     )
 
-    mhc_reduce = None
     if hasattr(cfg, "mhc_expansion_rate"):
-      mhc_expand, mhc_reduce = mhc.get_functions(cfg.mhc_expansion_rate)
+      mhc_expand, _ = mhc.get_functions(cfg.mhc_expansion_rate)
       if cfg.mhc_expansion_rate > 1:
         # (batch, length, emb_dim) --> (batch, length, mhc_expansion_rate, emb_dim)
         y = mhc_expand(y)
@@ -1813,7 +2017,7 @@ class NNXDecoder(nnx.Module):
       if self.is_deepseek:
         # Pre-pipeline: dense layers + outside-pipeline MoE layers under PP-as-DP axis rules.
         logical_axis_rules_pp_as_dp = sharding.logical_axis_rules_pp_act_as_dp(cfg.logical_axis_rules)
-        with self.mesh, nn.partitioning.axis_rules(logical_axis_rules_pp_as_dp):
+        with self.mesh, logical_axis_rules(logical_axis_rules_pp_as_dp):
           if cfg.scan_layers:
             if getattr(self, "dense_layers", None) is not None and cfg.first_num_dense_layers > 0:
               y, self.dense_layers, _ = self._apply_layers_sequentially(
@@ -1888,7 +2092,7 @@ class NNXDecoder(nnx.Module):
           logical_axis_rules_pp_as_dp = sharding.logical_axis_rules_pp_act_as_dp(cfg.logical_axis_rules)
           with (
               self.mesh,
-              nn.partitioning.axis_rules(logical_axis_rules_pp_as_dp),
+              logical_axis_rules(logical_axis_rules_pp_as_dp),
           ):
             if cfg.scan_layers and hasattr(self, "layers_outside_pipeline"):
               remaining = cfg.num_decoder_layers - cfg.pipeline_parallel_layers
@@ -2065,14 +2269,30 @@ class NNXDecoder(nnx.Module):
             # Pass the kv_caches list directly to avoid copying in jnp.stack,
             # which breaks vLLM PagedAttention in-place memory updates.
             # The _apply_layers_sequentially function will handle it by statically unrolling.
+            #
+            # Qwen3.5 is the exception: one scan step is a Qwen3_5ScannableBlock
+            # spanning `cycle_interval` decoder layers, while vLLM hands us one
+            # cache per layer. Group them per block before the scan and write the
+            # returned per-block tuples back afterwards, as
+            # _apply_qwen3_next_scanned_blocks does for Qwen3-Next.
+            group_blocks = self.is_qwen3_5 and cycle_interval > 1
+            grouped_kv_caches = (
+                maxtext_utils.prepare_kv_caches_for_scan(kv_caches, scan_length, cycle_interval, stack=False)
+                if group_blocks
+                else kv_caches
+            )
             y, self.layers, _ = self._apply_layers_sequentially(
                 self.layers,
                 y,
                 *layer_args,
                 length=scan_length,
-                kv_caches_stacked=kv_caches,
+                kv_caches_stacked=grouped_kv_caches,
                 **layer_kwargs,
             )
+            if group_blocks:
+              maxtext_utils.update_kv_caches_after_scan(
+                  kv_caches, grouped_kv_caches, scan_length, cycle_interval, stacked=False
+              )
             # kv_caches list is updated in-place inside _apply_layers_sequentially
           else:
             y, self.layers, _ = self._apply_layers_sequentially(
@@ -2152,6 +2372,8 @@ class NNXDecoder(nnx.Module):
             layer_kwargs["decoder_input_tokens"] = input_tokens
 
           current_kwargs = dict(layer_kwargs)
+          if isinstance(attention_metadata, dict):
+            current_kwargs["attention_metadata"] = attention_metadata.get(f"layer.{lyr}", attention_metadata.get(lyr))
 
           routed_experts = current_kwargs.pop("forced_routed_experts", None)
           if routed_experts is not None:
@@ -2219,17 +2441,21 @@ class NNXDecoder(nnx.Module):
     assert isinstance(y, jax.Array)
 
     # After the final transformer layer, `y` holds the raw, un-normalized hidden state.
-    if getattr(cfg, "mhc_expansion_rate", 1) > 1:
-      if cfg.decoder_block == DecoderBlockType.DEEPSEEK4:
-        hidden_state = self.hc_head(y)
-      else:
-        # (batch, length, mhc_expansion_rate, emb_dim) --> (batch, length, emb_dim)
-        hidden_state = mhc_reduce(y)
-    else:
-      hidden_state = y
+    # For DeepSeek-V4 it is deliberately left in its expanded 4D
+    # `[batch, length, mhc_expansion_rate, emb_dim]` form: the DeepSeek-V4 MTP block consumes this
+    # return value directly and needs the full parallel-stream state to stay faithful to the
+    # reference architecture. Every consumer that instead requires a collapsed 3D state reduces it
+    # explicitly: `apply_output_head` does so for the logit paths, and the two branches below
+    # do so for the consumers that bypass `apply_output_head`. Other mHC models have a generic MTP
+    # block that expects a 3D state, so their streams are collapsed here (a no-op for non-mHC models).
+    hidden_state = y if self.is_deepseek4 else self._reduce_mhc_streams(y)
 
     # When invoking from vLLM with RPA attention, logit computation is deferred to a later stage.
     if cfg.attention in ("vllm_rpa", "vllm_batched_rpa"):
+      # The vLLM adapter immediately flattens this to `[tokens, emb]` and only later feeds it
+      # back through `apply_output_head`, by which point the stream axis is indistinguishable
+      # from the token axis. So the collapse has to happen here, before we hand the state out.
+      hidden_state = self._reduce_mhc_streams(hidden_state)
       logits = None
 
     # When in the Indexer Dense Warm-up stage, skip the expensive output head projection
@@ -2245,7 +2471,20 @@ class NNXDecoder(nnx.Module):
     # Instead, we keep track on the hidden states, which has smaller size compared to full logits
     elif cfg.num_vocab_tiling > 1 and model_mode == MODEL_MODE_TRAIN:
       logits = None
-      self.sow(nnx.Intermediate, "hidden_states", hidden_state)
+      # The tiled loss reshapes on exactly three axes and differentiates only the output-head
+      # params, so the collapse belongs out here rather than inside the tiled region. Note we
+      # sow a collapsed copy and leave `hidden_state` itself 4D, so MTP still receives the
+      # full stream state when both features are enabled.
+      self.sow(nnx.Intermediate, "hidden_states", self._reduce_mhc_streams(hidden_state))
+
+    elif cfg.mtp_norm_main_hidden_state:
+      # Megatron-LM applies the decoder's final norm once and feeds that tensor to both the LM
+      # head and the MTP block, so normalize here and hand the normalized state out to MTP.
+      # (`num_vocab_tiling > 1` and `mhc_expansion_rate > 1` are rejected by the config validator.)
+      hidden_state = self.apply_decoder_norm(hidden_state)
+      logits = self.apply_output_head(
+          shared_embedding, hidden_state, deterministic, model_mode, normalize_y=False, reduce_mhc=False
+      )
 
     else:
       logits = self.apply_output_head(shared_embedding, hidden_state, deterministic, model_mode)
@@ -2302,16 +2541,34 @@ class NNXDecoder(nnx.Module):
     }
 
     # 1. Unrolled prefix layers (0, 1, 2)
+    is_training = model_mode == MODEL_MODE_TRAIN
+    has_remat_policy = cfg.remat_policy is not None and cfg.remat_policy != "none"
+    use_remat = is_training and has_remat_policy
+    remat_policy_fn, prevent_cse = self._get_deepseek4_remat_policy_and_cse() if use_remat else (None, None)
     for layer_idx in range(num_hash_layers):
       layer = getattr(self, f"layers_{layer_idx}")
-      y, _ = layer(
-          y,
-          decoder_segment_ids,
-          decoder_positions,
-          deterministic,
-          model_mode,
-          **layer_call_kwargs,
-      )
+      if use_remat:
+        y = deepseek4._run_deepseek4_layer_remat(  # pylint: disable=protected-access
+            layer,
+            y,
+            config=cfg,
+            policy=remat_policy_fn,
+            prevent_cse=prevent_cse,
+            decoder_segment_ids=decoder_segment_ids,
+            decoder_positions=decoder_positions,
+            deterministic=deterministic,
+            model_mode=model_mode,
+            **layer_call_kwargs,
+        )
+      else:
+        y, _ = layer(
+            y,
+            decoder_segment_ids,
+            decoder_positions,
+            deterministic,
+            model_mode,
+            **layer_call_kwargs,
+        )
 
     # 2. Scanned blocks
     num_remaining_layers = cfg.num_decoder_layers - num_hash_layers
@@ -2326,6 +2583,7 @@ class NNXDecoder(nnx.Module):
           model_mode,
           length=num_full_blocks,
           metadata_axis_name="scanned_blocks",
+          skip_block_remat=True,
           **layer_call_kwargs,
       )
 
@@ -2725,25 +2983,3 @@ class NNXDecoder(nnx.Module):
           _add(m)
 
     return layers
-
-
-def decoder_as_linen(
-    config: Config,
-    mesh: Mesh,
-    rngs: nnx.Rngs,
-    model_mode: str,
-    quant: None | Quant = None,
-):
-  """Creates a Decoder module"""
-  module = nnx_wrappers.to_linen(
-      NNXDecoder,
-      config=config,
-      mesh=mesh,
-      model_mode=model_mode,
-      rngs=rngs,
-      quant=quant,
-      name="decoder",
-      abstract_init=False,
-      metadata_fn=initializers.variable_to_logically_partitioned,
-  )
-  return module

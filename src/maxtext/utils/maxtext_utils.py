@@ -19,8 +19,8 @@ import functools
 import os
 from typing import Sequence
 
-from flax import linen as nn, nnx, traverse_util
-from flax.linen import partitioning as nn_partitioning
+from flax import nnx, traverse_util
+from flax.core.spmd import logical_axis_rules as axis_rules
 from flax.training.train_state import TrainState
 import jax
 from jax.experimental import mesh_utils
@@ -31,13 +31,12 @@ from maxtext.common import checkpointing
 from maxtext.common.common_types import (
     AttentionType,
     DecoderBlockType,
-    MODEL_MODE_AUTOREGRESSIVE,
-    MODEL_MODE_PREFILL,
     ReorderStrategy,
     ShardMode,
 )
 from maxtext.configs import pyconfig
 from maxtext.configs import types
+from maxtext.experimental.lineage import lineage_adapter
 from maxtext.multimodal import processor as mm_processor
 from maxtext.trainers.diloco import diloco
 from maxtext.trainers.diloco import utils as diloco_utils
@@ -101,10 +100,7 @@ def get_functional_train_with_signature(
   in_shardings = (state_mesh_shardings, data_sharding)  # State, batch
   out_shardings = (state_mesh_shardings, None)  # State, metrics
   static_argnums = ()  # We partial out the static argnums of model and config
-  if getattr(config, "retry_when_tokens_dropped", False) is True:
-    donate_argnums = ()  # Preserve state so it can be replayed if an overflow occurs
-  else:
-    donate_argnums = 0  # This is the index of the state - we allow the compiler to make use of this memory.
+  donate_argnums = 0  # This is the index of the state - we allow the compiler to make use of this memory.
   return functional_train, in_shardings, out_shardings, static_argnums, donate_argnums
 
 
@@ -142,17 +138,18 @@ def get_reorder_callable(cp_size, shard_mode, reorder_strategy=ReorderStrategy.D
   )
 
 
-def get_shaped_batch(config, batch_sharding=None):
+def get_shaped_batch(config, batch_sharding=None, is_eval=False):
   """Return the shape of the batch - this is what eval_shape would return for the
   output of create_data_iterator, but eval_shape doesn't work, see b/306901078."""
+  global_batch_size = config.global_batch_size_to_load_eval if is_eval else config.global_batch_size_to_load
   if config.enable_diloco:
     batch_shape = (
         config.num_diloco_replicas,
-        config.global_batch_size_to_load // config.num_diloco_replicas,
+        global_batch_size // config.num_diloco_replicas,
         config.max_target_length,
     )
   else:
-    batch_shape = (config.global_batch_size_to_load, config.max_target_length)
+    batch_shape = (global_batch_size, config.max_target_length)
   shaped_batch = {}
   shaped_batch["inputs"] = jax.ShapeDtypeStruct(batch_shape, jnp.int32, sharding=batch_sharding)
   # MRoPE uses (batch, seq, 3); same batch/seq axes as 1D positions so batch_sharding applies as-is.
@@ -169,6 +166,7 @@ def get_shaped_batch(config, batch_sharding=None):
   if config.per_dataset_metrics:
     shaped_batch["dataset_id"] = jax.ShapeDtypeStruct(batch_shape, jnp.int32, sharding=batch_sharding)
   if config.use_multimodal:
+    batch_size = config.micro_batch_size_to_eval_on if is_eval else config.micro_batch_size_to_train_on
     is_video = getattr(config, "video_max_grid_t", None) is not None
     if is_video:
       max_t = config.video_max_grid_t
@@ -177,16 +175,13 @@ def get_shaped_batch(config, batch_sharding=None):
       tps = config.temporal_patch_size_for_vit
       patch = config.patch_size_for_vit
       channels = config.num_channels_for_vit
-      batch_size = config.micro_batch_size_to_train_on
       video_shape = (batch_size, channels, max_t * tps, max_h * patch, max_w * patch)
       video_mask_shape = (batch_size, 1, max_t * tps, max_h * patch, max_w * patch)
       shaped_batch["images"] = jax.ShapeDtypeStruct(video_shape, jnp.float32, sharding=batch_sharding)
       shaped_batch["image_masks"] = jax.ShapeDtypeStruct(video_mask_shape, jnp.int32, sharding=batch_sharding)
       shaped_batch["video_grid_thw"] = jax.ShapeDtypeStruct((batch_size, 3), jnp.int32, sharding=batch_sharding)
     else:
-      image_shape = mm_processor.get_dummy_image_shape_for_init(
-          config.model_name, batch_size=config.micro_batch_size_to_train_on
-      )
+      image_shape = mm_processor.get_dummy_image_shape_for_init(config.model_name, batch_size=batch_size)
       shaped_batch["images"] = jax.ShapeDtypeStruct(image_shape, jnp.int32, sharding=batch_sharding)
       # Image masks are only used by Llama4 (shape (B*N, num_tiles)) for empty tiles.
       # Other multimodal models (Gemma, Qwen, ...) leave masks unset.
@@ -261,7 +256,7 @@ def get_save_and_offload_names(config) -> tuple[list[str], list[str]]:
   return [], []
 
 
-def load_compiled(config, partial_train, state, execution_devices):
+def load_compiled(config, partial_train, state, execution_devices, data_sharding=None):
   """# Loading a serialized compiled train step function."""
 
   # Currently partial_train and state  are needed to reconstruct
@@ -278,7 +273,7 @@ def load_compiled(config, partial_train, state, execution_devices):
     return in_tree_recreated, out_tree_recreated
 
   serialized_compiled = load_serialized_compiled(config.compiled_trainstep_file)
-  shaped_batch = get_shaped_batch(config)
+  shaped_batch = get_shaped_batch(config, batch_sharding=data_sharding)
   shaped_input_args = (state, shaped_batch)
   shaped_input_kwargs = {}
   in_tree, out_tree = get_train_input_output_trees(partial_train, shaped_input_args, shaped_input_kwargs)
@@ -764,7 +759,7 @@ def get_dense_moe_layers(config):
     num_moe_layers = config.num_decoder_layers // config.interleave_moe_layer_step
     num_dense_layers = config.num_decoder_layers - num_moe_layers
     return num_dense_layers, num_moe_layers
-  elif config.decoder_block in (DecoderBlockType.QWEN3_NEXT, DecoderBlockType.QWEN3_5, DecoderBlockType.DEEPSEEK4):
+  elif config.decoder_block in (DecoderBlockType.QWEN3_NEXT, DecoderBlockType.DEEPSEEK4):
     return 0, config.num_decoder_layers
   elif config.decoder_block == DecoderBlockType.DEFAULT:
     raise ValueError("Unsupported decoder block for dense/MoE layer calculation")
@@ -1331,6 +1326,7 @@ def calculate_tflops_training_per_device(config, log=True):
       gate_flops = 2 * config.per_device_batch_size * config.max_target_length * config.emb_dim * config.num_experts
       if config.decoder_block in (
           DecoderBlockType.DEEPSEEK,
+          DecoderBlockType.DEEPSEEK4,
           DecoderBlockType.LLAMA4,
           DecoderBlockType.QWEN3_NEXT,
           DecoderBlockType.GEMMA4,
@@ -1476,7 +1472,7 @@ def get_nested_value(dictionary, nested_key, default=None):
   return current_level
 
 
-def collect_intermediates_by_suffix(intermediate_outputs, *suffix_keys: str) -> list:
+def collect_intermediates_by_suffix(intermediate_outputs, *suffix_keys: str, ravel: bool = True) -> list:
   """Collects intermediate leaf values whose dict-key path ends with suffix_keys.
 
   Works regardless of model architecture (scanned, scannable blocks, or standard),
@@ -1486,9 +1482,11 @@ def collect_intermediates_by_suffix(intermediate_outputs, *suffix_keys: str) -> 
     intermediate_outputs: The intermediates dict returned by model.apply().
     *suffix_keys: One or more key names forming the expected path suffix,
       e.g. ``("moe_lb_loss",)`` or ``("self_attention", "indexer_loss")``.
+    ravel: Flatten each leaf to 1-D. Pass False for leaves that are sharded
+      across the mesh, where flattening would force a reshard collective.
 
   Returns:
-    A list of 1-D JAX arrays, one per matching leaf (already ravelled).
+    A list of JAX arrays, one per matching leaf (1-D unless ``ravel=False``).
   """
   suffix = tuple(suffix_keys)
   n = len(suffix)
@@ -1496,7 +1494,7 @@ def collect_intermediates_by_suffix(intermediate_outputs, *suffix_keys: str) -> 
   for path, val in jax.tree_util.tree_leaves_with_path(intermediate_outputs):
     path_keys = tuple(k.key for k in path if hasattr(k, "key"))
     if len(path_keys) >= n and path_keys[-n:] == suffix:
-      values.append(jnp.ravel(val))
+      values.append(jnp.ravel(val) if ravel else val)
   return values
 
 
@@ -1603,7 +1601,7 @@ def init_initial_state(model, tx, config, is_training, key):
 
 def get_abstract_param(model, config):
   """Get abstract model structure (name, shape) without materializing the weights to save memory"""
-  with model.mesh, nn_partitioning.axis_rules(config.logical_axis_rules):
+  with model.mesh, axis_rules(config.logical_axis_rules):
     key = jax.random.PRNGKey(0)
     input_shape = (config.micro_batch_size_to_train_on, config.max_target_length)
 
@@ -1651,7 +1649,7 @@ def setup_decode_state(config, mesh, checkpoint_manager, init_state_fn):
     # Load params from checkpoint
     max_logging.log(f"Loading decode params from {config.load_parameters_path}")
     unboxed_abstract_state, state_mesh_annotations, _ = get_abstract_state(config, mesh, init_state_fn, False)
-    with nn_partitioning.axis_rules(config.logical_axis_rules):
+    with axis_rules(config.logical_axis_rules):
       params = checkpointing.load_params_from_path(
           config.load_parameters_path,
           unboxed_abstract_state.params,
@@ -1665,7 +1663,7 @@ def setup_decode_state(config, mesh, checkpoint_manager, init_state_fn):
   return state, state_mesh_annotations
 
 
-def setup_training_state(data_iterator, config, mesh, checkpoint_manager, init_state_fn):
+def setup_training_state(data_iterator, config, mesh, checkpoint_manager, init_state_fn, snapshotter=None):
   is_training = True
   return setup_initial_state(
       data_iterator,
@@ -1674,6 +1672,7 @@ def setup_training_state(data_iterator, config, mesh, checkpoint_manager, init_s
       checkpoint_manager,
       init_state_fn,
       is_training,
+      snapshotter=snapshotter,
   )
 
 
@@ -1684,6 +1683,7 @@ def setup_initial_state(
     checkpoint_manager,
     init_state_fn,
     is_training=True,
+    snapshotter=None,
 ):
   """We initialize the model and optimizer state, and optionally load from a
   checkpoint as necessary.
@@ -1695,6 +1695,9 @@ def setup_initial_state(
     checkpoint_manager: an Orbax checkpointing.CheckpointManager object
     init_state_fn: function to initialize the training state
     is_training: True to initialize training state, False for decode state
+    snapshotter: Optional `snapshotting.Snapshotter` of an elastic run in snapshot mode. When it holds a snapshot
+      that is at least as recent as the latest checkpoint, the state and the data iterator position are restored
+      from it instead of from the checkpoint.
 
   Returns:
     train_state: the initialized train state. For NNX, this is a TrainStateNNX instance
@@ -1709,11 +1712,12 @@ def setup_initial_state(
   )
 
   # Initialization
-  with nn_partitioning.axis_rules(config.logical_axis_rules):
+  with axis_rules(config.logical_axis_rules):
+    native = lineage_adapter.is_native(config)
     restored, raw_params = checkpointing.load_state_if_possible(
         checkpoint_manager,
         data_iterator,
-        config.load_parameters_path,
+        "" if native else config.load_parameters_path,
         config.load_full_state_path,
         config.checkpoint_storage_concurrent_gb,
         unboxed_abstract_state,
@@ -1726,134 +1730,111 @@ def setup_initial_state(
         source_checkpoint_layout=config.source_checkpoint_layout,
         expansion_factor_real_data=config.expansion_factor_real_data,
         maxtext_config=config,
+        snapshotter=snapshotter,
     )
+    if native and restored is None and raw_params is None and config.load_parameters_path:
+      # The Lineage-native model restores MaxText-layout params against its own abstract target.
+      raw_params = checkpointing.load_params_from_path(
+          config.load_parameters_path,
+          lineage_adapter.maxtext_restore_target(config, mesh),
+          config.checkpoint_storage_concurrent_gb,
+          use_ocdbt=config.checkpoint_storage_use_ocdbt,
+          use_zarr3=config.checkpoint_storage_use_zarr3,
+          enable_single_replica_ckpt_restoring=bool(config.enable_single_replica_ckpt_restoring),
+          colocated_python_checkpointing=bool(config.enable_single_controller and config.colocated_python_checkpointing),
+      )
     # Partial or fully restored
     was_restored = bool(restored is not None or raw_params is not None)
 
     init_state_partial = init_state_fn
     init_state_partial.__name__ = "initialize_state"
 
-    if config.pure_nnx:
-      # Always build the concrete init state, then overlay whatever we loaded. Anything the
-      # checkpoint didn't carry (or a params-only load didn't touch) keeps its real init
-      # value, so restore doesn't depend on knowing exactly what was saved.
-      state = jax.jit(
-          lambda: nnx.state(init_state_partial()),  # Get state only, mapping to out_sharding structure
-          in_shardings=None,
-          out_shardings=state_mesh_shardings,
-      )()
-      if raw_params:
-        # Params-only load (base model weights): overlay restored weights, keep init for everything else.
-        target_model = (
-            state["model"]
-            if (isinstance(state, (nnx.State, dict)) and "model" in state)
-            else getattr(state, "model", state)
-        )
-        raw_model_params = (
-            raw_params["model"] if (isinstance(raw_params, (nnx.State, dict)) and "model" in raw_params) else raw_params
-        )
-        if hasattr(raw_model_params, "to_pure_dict"):
-          raw_model_params = raw_model_params.to_pure_dict()
-        if isinstance(raw_model_params, dict) and "params" in raw_model_params:
-          raw_model_params = raw_model_params["params"]
-        target_pure = target_model.to_pure_dict() if hasattr(target_model, "to_pure_dict") else target_model
+    # Always build the concrete init state, then overlay whatever we loaded. Anything the
+    # checkpoint didn't carry (or a params-only load didn't touch) keeps its real init
+    # value, so restore doesn't depend on knowing exactly what was saved.
+    state = jax.jit(
+        lambda: nnx.state(init_state_partial()),  # Get state only, mapping to out_sharding structure
+        in_shardings=None,
+        out_shardings=state_mesh_shardings,
+    )()
+    if raw_params and native:
+      # Lineage-native model: convert the MaxText-layout params into the Lineage layout.
+      lineage_adapter.restore_params(state["model"], raw_params, config, mesh)
+    elif raw_params:
+      # Params-only load (base model weights): overlay restored weights, keep init for everything else.
+      target_model = (
+          state["model"]
+          if (isinstance(state, (nnx.State, dict)) and "model" in state)
+          else getattr(state, "model", state)
+      )
+      raw_model_params = (
+          raw_params["model"] if (isinstance(raw_params, (nnx.State, dict)) and "model" in raw_params) else raw_params
+      )
+      if hasattr(raw_model_params, "to_pure_dict"):
+        raw_model_params = raw_model_params.to_pure_dict()
+      if isinstance(raw_model_params, dict) and "params" in raw_model_params:
+        raw_model_params = raw_model_params["params"]
+      target_pure = target_model.to_pure_dict() if hasattr(target_model, "to_pure_dict") else target_model
 
-        def _reshard_aligned(target, raw):
-          """Aligns raw arrays with target device shardings using Flax's native flatten_dict utilities."""
-          target_flat = traverse_util.flatten_dict(target)
-          raw_flat = traverse_util.flatten_dict(raw)
+      def _reshard_aligned(target, raw):
+        """Aligns raw arrays with target device shardings using Flax's native flatten_dict utilities."""
+        target_flat = traverse_util.flatten_dict(target)
+        raw_flat = traverse_util.flatten_dict(raw)
 
-          res_flat = {}
-          for k, target_val in target_flat.items():
-            if k in raw_flat and not isinstance(raw_flat[k], jax.ShapeDtypeStruct):
-              raw_val = raw_flat[k]
-              if hasattr(target_val, "sharding") and target_val.sharding is not None:
-                res_flat[k] = jax.device_put(raw_val, target_val.sharding)
-              else:
-                res_flat[k] = raw_val
+        res_flat = {}
+        for k, target_val in target_flat.items():
+          if k in raw_flat and not isinstance(raw_flat[k], jax.ShapeDtypeStruct):
+            raw_val = raw_flat[k]
+            if hasattr(target_val, "sharding") and target_val.sharding is not None:
+              res_flat[k] = jax.device_put(raw_val, target_val.sharding)
             else:
-              res_flat[k] = target_val
-
-          return traverse_util.unflatten_dict(res_flat)
-
-        sharded_aligned = _reshard_aligned(target_pure, raw_model_params)
-        nnx.update(target_model, sharded_aligned)
-
-      if restored:
-        is_emergency = isinstance(
-            checkpoint_manager,
-            (
-                emergency_checkpoint_manager.CheckpointManager,
-                emergency_replicator_checkpoint_manager.ReplicatorCheckpointManager,
-            ),
-        )
-        overlay = restored if is_emergency else restored["items"]
-        if not (config.enable_diloco and isinstance(overlay, diloco.DiLoCoTrainState)):
-          # Standard Flax NNX branch: overlay weights into the initialized TrainStateNNX.
-          overlay_pure_dict = overlay.to_pure_dict() if hasattr(overlay, "to_pure_dict") else overlay
-
-          def _has_shape_dtype_struct(tree):
-            return any(isinstance(x, jax.ShapeDtypeStruct) for x in jax.tree_util.tree_leaves(tree))
-
-          def _merge_restored_overlay(ckpt_node, init_node):
-            """Merges checkpoint overlay with initialized state, replacing ShapeDtypeStruct placeholders."""
-            if _has_shape_dtype_struct(ckpt_node):
-              if isinstance(ckpt_node, dict) and isinstance(init_node, dict):
-                res = {}
-                for k in init_node:
-                  if k in ckpt_node:
-                    res[k] = _merge_restored_overlay(ckpt_node[k], init_node[k])
-                  else:
-                    res[k] = init_node[k]
-                return res
-              else:
-                return init_node
-            return ckpt_node
-
-          merged = _merge_restored_overlay(overlay_pure_dict, state.to_pure_dict())
-          nnx.replace_by_pure_dict(state, merged)
-        else:
-          # DiLoCo branch: The restored checkpoint for DiLoCo is already a complete DiLoCoTrainState
-          # (containing inner_state, outer_opt_state, params, step) rather than a bare parameter mapping.
-          state = overlay
-    else:
-      if restored:
-        if isinstance(
-            checkpoint_manager,
-            (
-                emergency_checkpoint_manager.CheckpointManager,
-                emergency_replicator_checkpoint_manager.ReplicatorCheckpointManager,
-            ),
-        ):
-          state = restored
-        else:
-          # The update of data_iterator state happens in place, no need to assign explicitly
-          state = restored["items"]
-      else:
-        # pylint: disable=not-callable
-        state = jax.jit(
-            init_state_partial,
-            in_shardings=None,
-            out_shardings=state_mesh_shardings,
-        )()
-        if raw_params:  # If we loaded a partial state, we need to merge it.
-          sparsity_enabled = config.weight_sparsity_n and config.weight_sparsity_m
-          if sparsity_enabled:
-            # Sparsity-init keeps freshly initialized params for any leaf still
-            # represented as an abstract ShapeDtypeStruct in raw_params (i.e. not
-            # actually restored), and uses the restored value otherwise.
-            def _merge_params(p_raw, p_init):
-              if isinstance(p_raw, jax.ShapeDtypeStruct):
-                return p_init
-              return p_raw
-
-            merged_params = jax.tree_util.tree_map(_merge_params, raw_params, state.params)
-            state = state.replace(params=merged_params)
+              res_flat[k] = raw_val
           else:
-            state = state.replace(params=raw_params)
+            res_flat[k] = target_val
 
-  if not config.pure_nnx:
-    state = max_utils.unbox_logicallypartioned(state)
+        return traverse_util.unflatten_dict(res_flat)
+
+      sharded_aligned = _reshard_aligned(target_pure, raw_model_params)
+      nnx.update(target_model, sharded_aligned)
+
+    if restored:
+      is_emergency = isinstance(
+          checkpoint_manager,
+          (
+              emergency_checkpoint_manager.CheckpointManager,
+              emergency_replicator_checkpoint_manager.ReplicatorCheckpointManager,
+          ),
+      )
+      overlay = restored if is_emergency else restored["items"]
+      if not (config.enable_diloco and isinstance(overlay, diloco.DiLoCoTrainState)):
+        # Standard Flax NNX branch: overlay weights into the initialized TrainStateNNX.
+        overlay_pure_dict = overlay.to_pure_dict() if hasattr(overlay, "to_pure_dict") else overlay
+
+        def _has_shape_dtype_struct(tree):
+          return any(isinstance(x, jax.ShapeDtypeStruct) for x in jax.tree_util.tree_leaves(tree))
+
+        def _merge_restored_overlay(ckpt_node, init_node):
+          """Merges checkpoint overlay with initialized state, replacing ShapeDtypeStruct placeholders."""
+          if _has_shape_dtype_struct(ckpt_node):
+            if isinstance(ckpt_node, dict) and isinstance(init_node, dict):
+              res = {}
+              for k in init_node:
+                if k in ckpt_node:
+                  res[k] = _merge_restored_overlay(ckpt_node[k], init_node[k])
+                else:
+                  res[k] = init_node[k]
+              return res
+            else:
+              return init_node
+          return ckpt_node
+
+        merged = _merge_restored_overlay(overlay_pure_dict, state.to_pure_dict())
+        nnx.replace_by_pure_dict(state, merged)
+      else:
+        # DiLoCo branch: The restored checkpoint for DiLoCo is already a complete DiLoCoTrainState
+        # (containing inner_state, outer_opt_state, params, step) rather than a bare parameter mapping.
+        state = overlay
+
   if config.enable_diloco:
     state = diloco_utils.setup_diloco_initial_state(
         state=state,
@@ -1863,15 +1844,6 @@ def setup_initial_state(
         restored=restored,
     )
   return state, state_mesh_annotations, state_mesh_shardings, data_iterator, was_restored
-
-
-def get_logical_annotations(config, mesh, init_state_fn):
-  init_state_partial = init_state_fn
-
-  with jax.set_mesh(mesh), nn_partitioning.axis_rules(config.logical_axis_rules):
-    abstract_state = jax.eval_shape(init_state_partial)
-    logical_annotations = nn.get_partition_spec(abstract_state)
-  return logical_annotations
 
 
 def get_abstract_state(config, mesh, init_state_fn, is_training=True):
@@ -1907,7 +1879,7 @@ def get_abstract_state_nnx(config, mesh, nnx_init_trainstate_fn, is_training=Tru
   """
   assert nnx_init_trainstate_fn is not None, "get_abstract_state_nnx: init function must be given."
 
-  with nn_partitioning.axis_rules(config.logical_axis_rules):
+  with axis_rules(config.logical_axis_rules):
     # Use nnx.eval_shape + nnx.split instead of nnx.get_abstract_model, so we can apply
     # nnx_construct_named_sharding which correctly inserts the stacked-layers
     # axis into the partition spec. nnx.get_abstract_model uses get_var_pspec internally
@@ -2005,69 +1977,6 @@ def get_abstract_state_nnx(config, mesh, nnx_init_trainstate_fn, is_training=Tru
   )
 
 
-def get_prefill_kv_cache_annotations(model, config, rng, mesh):
-  """Get a shaped abstraction of the state (including optimizer)"""
-
-  def init_kv_cache(model, config):
-    input_shape = (
-        config.micro_batch_size_to_train_on,
-        config.max_prefill_predict_length,
-    )
-    image_shape = mm_processor.get_dummy_image_shape_for_init(
-        config.model_name, batch_size=config.micro_batch_size_to_train_on
-    )
-    audio_shape = mm_processor.get_dummy_audio_shape_for_init(config)
-
-    model_vars = model.init(
-        {"params": rng, "dropout": rng, "aqt": rng},
-        jnp.ones(input_shape),
-        jnp.ones(input_shape),
-        encoder_images=jnp.ones(image_shape) if config.use_multimodal else None,
-        encoder_audios=jnp.ones(audio_shape) if config.use_audio else None,
-        model_mode=MODEL_MODE_PREFILL,
-        slot=0,
-    )
-    return model_vars["cache"]
-
-  with nn_partitioning.axis_rules(config.logical_axis_rules):
-    init_kv_cache_partial = functools.partial(init_kv_cache, model, config)
-    abstract_state = jax.eval_shape(init_kv_cache_partial)
-  state_logical_annotations = nn.get_partition_spec(abstract_state)
-  with jax.set_mesh(mesh), nn_partitioning.axis_rules(config.logical_axis_rules):
-    state_mesh_annotations = nn.logical_to_mesh(state_logical_annotations)
-  return state_mesh_annotations
-
-
-def get_kv_cache_annotations(model, config, rng, mesh):
-  """Get a shaped abstraction of the state (including optimizer)"""
-
-  def init_kv_cache(model, config):
-    input_shape = (config.micro_batch_size_to_train_on, 1)
-    image_shape = mm_processor.get_dummy_image_shape_for_init(
-        config.model_name, batch_size=config.micro_batch_size_to_train_on
-    )
-    audio_shape = mm_processor.get_dummy_audio_shape_for_init(config)
-
-    model_vars = model.init(
-        {"params": rng, "dropout": rng, "aqt": rng},
-        jnp.ones(input_shape),
-        jnp.ones(input_shape),
-        encoder_images=jnp.ones(image_shape) if config.use_multimodal else None,
-        encoder_audios=jnp.ones(audio_shape) if config.use_audio else None,
-        model_mode=MODEL_MODE_AUTOREGRESSIVE,
-        slot=0,
-    )
-    return model_vars["cache"]
-
-  with nn_partitioning.axis_rules(config.logical_axis_rules):
-    init_kv_cache_partial = functools.partial(init_kv_cache, model, config)
-    abstract_state = jax.eval_shape(init_kv_cache_partial)
-  state_logical_annotations = nn.get_partition_spec(abstract_state)
-  with jax.set_mesh(mesh), nn_partitioning.axis_rules(config.logical_axis_rules):
-    state_mesh_annotations = nn.logical_to_mesh(state_logical_annotations)
-  return state_mesh_annotations
-
-
 def _nnx_cache_partition_specs(abstract_model, config, mesh):
   """Per-leaf PartitionSpec tree for the abstract model's nnx.Cache vars.
 
@@ -2077,7 +1986,7 @@ def _nnx_cache_partition_specs(abstract_model, config, mesh):
   _, cache_state, _ = nnx.split(abstract_model, nnx.Cache, ...)
   # nnx_construct_named_sharding reads logical axis rules from the
   # active flax partitioning context, so wrap.
-  with nn_partitioning.axis_rules(config.logical_axis_rules):
+  with axis_rules(config.logical_axis_rules):
     named_state = sharding.nnx_construct_named_sharding(cache_state, mesh)
   return jax.tree.map(lambda s: s.spec, named_state.to_pure_dict())
 
@@ -2159,7 +2068,17 @@ def create_device_mesh(config, devices=None):
 
   allow_split_physical_axes = config.allow_split_physical_axes if config.allow_split_physical_axes else False
 
-  if num_slices > 1:
+  if getattr(config, "use_lineage", False):
+    dcn_parallelism = (
+        max_utils.fill_unspecified_mesh_axes(config.dcn_parallelism.copy(), num_slices, "DCN") if num_slices > 1 else None
+    )
+    mesh = lineage_adapter.create_device_mesh(
+        ici_parallelism,
+        devices,
+        dcn_parallelism=dcn_parallelism,
+        allow_split_physical_axes=allow_split_physical_axes,
+    )
+  elif num_slices > 1:
     dcn_parallelism = config.dcn_parallelism.copy()
     dcn_parallelism = max_utils.fill_unspecified_mesh_axes(dcn_parallelism, num_slices, "DCN")
 

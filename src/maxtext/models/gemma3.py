@@ -25,13 +25,10 @@ from flax import nnx
 
 from maxtext.common.common_types import Config, AttentionType, MODEL_MODE_PREFILL
 from maxtext.layers import quantizations
-from maxtext.layers import nnx_wrappers
-from maxtext.layers import initializers
 from maxtext.layers.attentions import Attention
 from maxtext.layers.linears import DenseGeneral, MlpBlock, Dropout
 from maxtext.layers.normalizations import RMSNorm
 from maxtext.layers.quantizations import AqtQuantization as Quant
-from maxtext.layers.initializers import variable_to_logically_partitioned
 from maxtext.utils import max_utils
 from maxtext.utils.sharding import create_sharding, maybe_shard_with_logical
 
@@ -189,7 +186,6 @@ class Gemma3DecoderLayer(nnx.Module):
         mesh=self.mesh,
         shard_mode=config.shard_mode,
         debug_sharding=config.debug_sharding,
-        extra_stack_level=1,
     )
 
   def __call__(
@@ -287,12 +283,6 @@ class Gemma3DecoderLayer(nnx.Module):
       return layer_output, kv_cache
 
 
-Gemma3DecoderLayerToLinen = nnx_wrappers.to_linen_class(
-    Gemma3DecoderLayer,
-    base_metadata_fn=initializers.variable_to_logically_partitioned,
-)
-
-
 class Gemma3ScannableBlock(nnx.Module):
   """A repeatable block of Gemma3 decoder layers."""
 
@@ -340,7 +330,6 @@ class Gemma3ScannableBlock(nnx.Module):
         mesh=self.mesh,
         shard_mode=config.shard_mode,
         debug_sharding=config.debug_sharding,
-        extra_stack_level=1,
     )
 
   def __call__(
@@ -387,12 +376,6 @@ class Gemma3ScannableBlock(nnx.Module):
       return y, None
     else:
       return y
-
-
-Gemma3ScannableBlockToLinen = nnx_wrappers.to_linen_class(
-    Gemma3ScannableBlock,
-    base_metadata_fn=initializers.variable_to_logically_partitioned,
-)
 
 
 def _posemb_sincos_2d(
@@ -606,21 +589,6 @@ class VisionEmbedder(nnx.Module):
     return x
 
 
-def visionembedder_as_linen(
-    config: Config,
-    mesh: Mesh,
-):
-  """Creates a VisionEmbedder module."""
-  return nnx_wrappers.to_linen(
-      VisionEmbedder,
-      config,
-      mesh=mesh,
-      name="VisionEmbedder_0",
-      abstract_init=False,
-      metadata_fn=variable_to_logically_partitioned,
-  )
-
-
 class VisionExit(nnx.Module):
   """The vision exit layer.
 
@@ -651,11 +619,6 @@ class VisionExit(nnx.Module):
     x = nnx.avg_pool(x, window_shape=window_shape, strides=window_shape)
     batch_size, height, width, embed_dim = x.shape
     return jnp.reshape(x, (batch_size, height * width, embed_dim))
-
-
-def vision_exit_as_linen(x: jax.Array, output_length: int) -> jax.Array:
-  """A wrapper to use VisionExit as a function."""
-  return nnx.bridge.to_linen(VisionExit, output_length=output_length)(x)
 
 
 class Gemma3VisionEncoderLayer(nnx.Module):
@@ -744,19 +707,3 @@ class Gemma3VisionEncoderLayer(nnx.Module):
     bn, l, c = x.shape
     x = jnp.reshape(x, [b, n, l, c])
     return x
-
-
-def gemma3visionencoder_as_linen(
-    config: Config,
-    mesh: Mesh,
-):
-  """Creates a Gemma3VisionEncoder module."""
-  module = nnx_wrappers.to_linen(
-      Gemma3VisionEncoderLayer,
-      config=config,
-      mesh=mesh,
-      name="Gemma3VisionEncoderLayer_0",
-      abstract_init=False,
-      metadata_fn=variable_to_logically_partitioned,
-  )
-  return module

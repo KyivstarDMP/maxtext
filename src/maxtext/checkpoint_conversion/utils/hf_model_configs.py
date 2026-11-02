@@ -1608,6 +1608,86 @@ except AttributeError:
   qwen3_5_35b_a3b_config = PTConfig(**qwen3_5_35b_a3b_dict)  # pytype: disable=wrong-arg-types
   qwen3_5_397b_a17b_config = PTConfig(**qwen3_5_397b_a17b_dict)  # pytype: disable=wrong-arg-types
 
+qwen3_5_9b_dict = {
+    "architectures": ["Qwen3_5ForConditionalGeneration"],
+    "image_token_id": 248056,
+    "model_type": "qwen3_5",
+    "text_config": {
+        "attention_bias": False,
+        "attention_dropout": 0.0,
+        "attn_output_gate": True,
+        "bos_token_id": None,
+        "dtype": "bfloat16",
+        "eos_token_id": 248044,
+        "full_attention_interval": 4,
+        "head_dim": 256,
+        "hidden_act": "silu",
+        "hidden_size": 4096,
+        "initializer_range": 0.02,
+        "intermediate_size": 12288,
+        "layer_types": [
+            "linear_attention",
+            "linear_attention",
+            "linear_attention",
+            "full_attention",
+        ]
+        * 8,
+        "linear_conv_kernel_dim": 4,
+        "linear_key_head_dim": 128,
+        "linear_num_key_heads": 16,
+        "linear_num_value_heads": 32,
+        "linear_value_head_dim": 128,
+        "mamba_ssm_dtype": "float32",
+        "max_position_embeddings": 262144,
+        "mlp_only_layers": [],
+        "model_type": "qwen3_5_text",
+        "mtp_num_hidden_layers": 1,
+        "mtp_use_dedicated_embeddings": False,
+        "num_attention_heads": 16,
+        "num_hidden_layers": 32,
+        "num_key_value_heads": 4,
+        "pad_token_id": None,
+        "partial_rotary_factor": 0.25,
+        "rms_norm_eps": 1e-06,
+        "rope_parameters": {
+            "mrope_interleaved": True,
+            "mrope_section": [11, 11, 10],
+            "partial_rotary_factor": 0.25,
+            "rope_theta": 10000000,
+            "rope_type": "default",
+        },
+        "tie_word_embeddings": False,
+        "use_cache": True,
+        "vocab_size": 248320,
+    },
+    "tie_word_embeddings": False,
+    "transformers_version": "5.16.0.dev0",
+    "video_token_id": 248057,
+    "vision_config": {
+        "deepstack_visual_indexes": [],
+        "depth": 27,
+        "hidden_act": "gelu_pytorch_tanh",
+        "hidden_size": 1152,
+        "in_channels": 3,
+        "initializer_range": 0.02,
+        "intermediate_size": 4304,
+        "model_type": "qwen3_5_vision",
+        "num_heads": 16,
+        "num_position_embeddings": 2304,
+        "out_hidden_size": 4096,
+        "patch_size": 16,
+        "spatial_merge_size": 2,
+        "temporal_patch_size": 2,
+    },
+    "vision_end_token_id": 248054,
+    "vision_start_token_id": 248053,
+}
+
+try:
+  qwen3_5_9b_config = transformers.Qwen3_5Config(**qwen3_5_9b_dict)  # pyrefly: ignore[missing-attribute]
+except AttributeError:
+  qwen3_5_9b_config = PTConfig(**qwen3_5_9b_dict)  # pytype: disable=wrong-arg-types
+
 
 # from https://huggingface.co/mistralai/Mixtral-8x7B-Instruct-v0.1/blob/main/config.json
 mixtral_8x7b_dict = {
@@ -1883,9 +1963,9 @@ qwen3_vl_30b_a3b_dict = {
 }
 qwen3_vl_30b_a3b_config = PTConfig(**qwen3_vl_30b_a3b_dict)
 
-cosmos3_nano_reasoner_dict = {
-    "architectures": ["Cosmos3OmniForConditionalGeneration"],
-    "model_type": "cosmos3_omni",
+weaver_mini_dict = {
+    "architectures": ["WeaverOmniForConditionalGeneration"],
+    "model_type": "weaver_omni",
     "text_config": {
         "attention_bias": False,
         "attention_dropout": 0.0,
@@ -1931,11 +2011,11 @@ cosmos3_nano_reasoner_dict = {
         "temporal_patch_size": 2,
     },
 }
-cosmos3_nano_reasoner_config = PTConfig(**cosmos3_nano_reasoner_dict)
+weaver_mini_config = PTConfig(**weaver_mini_dict)
 
-cosmos3_super_reasoner_dict = {
-    "architectures": ["Cosmos3ForConditionalGeneration"],
-    "model_type": "cosmos3_omni",
+weaver_max_dict = {
+    "architectures": ["WeaverForConditionalGeneration"],
+    "model_type": "weaver_omni",
     "text_config": {
         "attention_bias": False,
         "attention_dropout": 0.0,
@@ -1981,8 +2061,58 @@ cosmos3_super_reasoner_dict = {
         "temporal_patch_size": 2,
     },
 }
-cosmos3_super_reasoner_config = PTConfig(**cosmos3_super_reasoner_dict)
+weaver_max_config = PTConfig(**weaver_max_dict)
 
+qwen3_8_2_4t_a95b_dict = {
+    "architectures": ["Qwen3_5MoeForCausalLM"],
+    "attention_bias": False,
+    "attention_dropout": 0.0,
+    "attn_output_gate": True,
+    "bos_token_id": 248044,
+    "dtype": "bfloat16",
+    "eos_token_id": 248044,
+    "full_attention_interval": 4,
+    "head_dim": 256,
+    "hidden_act": "silu",
+    "hidden_size": 8192,
+    "linear_conv_kernel_dim": 4,
+    "linear_key_head_dim": 128,
+    "linear_value_head_dim": 128,
+    "linear_num_key_heads": 16,
+    "linear_num_value_heads": 128,
+    "mamba_ssm_dtype": "float32",
+    "max_position_embeddings": 262144,
+    "model_type": "qwen3_5_moe_text",
+    "moe_intermediate_size": 2048,
+    "mtp_num_hidden_layers": 1,
+    "mtp_use_dedicated_embeddings": False,
+    "num_attention_heads": 64,
+    "num_experts": 512,
+    "num_experts_per_tok": 10,
+    "num_hidden_layers": 92,
+    "num_key_value_heads": 4,
+    "output_gate_type": "swish",
+    "partial_rotary_factor": 0.25,
+    "rms_norm_eps": 1.0e-6,
+    "rope_parameters": {
+        "partial_rotary_factor": 0.25,
+        "rope_theta": 10000000,
+        "rope_type": "default",
+    },
+    "shared_expert_intermediate_size": 2048,
+    "tie_word_embeddings": False,
+    "use_cache": True,
+    "vocab_size": 248320,
+}
+
+try:
+  # Will execute successfully if Transformers is updated with Qwen3.5 support
+  # pyrefly: ignore[missing-attribute]
+  qwen3_8_2_4t_a95b_config = transformers.Qwen3_5MoeTextConfig(**qwen3_8_2_4t_a95b_dict)
+  # Qwen3_5MoeTextConfig folds full_attention_interval into layer_types; keep it for HF_SHAPE and config.json.
+  qwen3_8_2_4t_a95b_config.full_attention_interval = qwen3_8_2_4t_a95b_dict["full_attention_interval"]
+except AttributeError:
+  qwen3_8_2_4t_a95b_config = PTConfig(**qwen3_8_2_4t_a95b_dict)  # pytype: disable=wrong-arg-types
 
 # {maxtext model name: hf model config}
 HF_MODEL_CONFIGS = {
@@ -2013,8 +2143,8 @@ HF_MODEL_CONFIGS = {
     "qwen3-vl-2b": qwen3_vl_2b_config,
     "qwen3-vl-4b": qwen3_vl_4b_config,
     "qwen3-vl-30b-a3b": qwen3_vl_30b_a3b_config,
-    "cosmos3-nano-reasoner": cosmos3_nano_reasoner_config,
-    "cosmos3-super-reasoner": cosmos3_super_reasoner_config,
+    "weaver-mini": weaver_mini_config,
+    "weaver-max": weaver_max_config,
     "llama3.1-8b": llama31_8b_config,
     "llama3.1-8b-Instruct": llama31_8b_config,
     "llama3.1-70b": llama31_70b_config,
@@ -2023,6 +2153,7 @@ HF_MODEL_CONFIGS = {
     "qwen3-30b-a3b-base": qwen3_30b_a3b_base_config,
     "qwen3-235b-a22b": qwen3_235b_a22b_thinking_2507_config,
     "qwen3-480b-a35b": qwen3_coder_480b_a35b_config,
+    "qwen3.8-2.4t-a95b": qwen3_8_2_4t_a95b_config,
     "deepseek2-16b": deepseek2_16b_config,
     "deepseek3-671b": deepseek3_671b_config,
     "deepseek3.2-671b": deepseek32_671b_config,
@@ -2032,7 +2163,11 @@ HF_MODEL_CONFIGS = {
     "qwen3-omni-30b-a3b": qwen3_omni_30b_a3b_config,
     "qwen3-next-80b-a3b": qwen3_next_80b_a3b_config,
     "qwen3.5-397b-a17b": qwen3_5_397b_a17b_config,
+    "qwen3.5-397b-a17b-fp8": qwen3_5_397b_a17b_config,
     "qwen3.5-35b-a3b": qwen3_5_35b_a3b_config,
+    "qwen3.5-35b-a3b-fp8": qwen3_5_35b_a3b_config,
+    "qwen3.5-35b-fp8": qwen3_5_35b_a3b_config,
+    "qwen3.5-9b": qwen3_5_9b_config,
     "mixtral-8x7b": mixtral_8x7b_config,
     "mixtral-8x22b": mixtral_8x22b_config,
     "olmo3-7b": olmo3_7b_config,
