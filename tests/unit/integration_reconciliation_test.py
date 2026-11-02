@@ -377,3 +377,27 @@ def test_named_eval_reports_literal_loss_accuracy_and_perplexity():
           "per_dataset_eval_perplexity/no_accuracy": 4.4816890703380645,
       }
   )
+
+
+def test_sft_masking_preserves_upstream_completion_mask_and_source_id():
+  transform = input_pipeline_utils.SFTPromptMasking("text", True, 8, training_objective="block_diffusion")
+  output = transform.map({"text": [[10, 11], [12, 13]], "is_prompt": [True, False], "dataset_id": 2})
+  np.testing.assert_array_equal(output["targets"], [10, 11, 12, 13])
+  np.testing.assert_array_equal(output["completion_mask"], [0, 0, 1, 1])
+  np.testing.assert_array_equal(output["dataset_id"], [2, 2, 2, 2])
+
+
+def test_named_eval_placeholder_hosts_use_evaluation_batch_shape():
+  config = _dataset_metrics_config(
+      use_sft=True,
+      per_dataset_eval_names="eval_uk,eval_en",
+      per_dataset_eval_files="uk*;en*",
+  )
+  with (
+      mock.patch.object(input_pipeline_interface, "get_process_loading_real_data", return_value=[0]),
+      mock.patch.object(input_pipeline_interface.jax, "process_index", return_value=1),
+      mock.patch.object(input_pipeline_interface, "PlaceHolderDataIterator") as placeholder,
+  ):
+    _, evaluation = input_pipeline_interface.create_data_iterator(config, object())
+  assert list(evaluation) == ["eval_uk", "eval_en"]
+  assert [call.kwargs["is_training"] for call in placeholder.call_args_list] == [True, False, False]

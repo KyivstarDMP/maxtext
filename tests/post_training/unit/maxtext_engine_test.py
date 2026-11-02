@@ -16,11 +16,13 @@
 # pylint: disable=protected-access
 
 import dataclasses
+import os
 import types
 from typing import Any
 from unittest import mock
 
 from absl.testing import absltest
+from absl.testing import parameterized
 from flax import nnx
 from flax import struct
 import jax
@@ -37,6 +39,7 @@ import orbax.checkpoint as ocp
 import pytest
 from tunix.experimental.common import datatypes
 from tunix.experimental.train import abstract_trainer
+from tunix.rl import algo_core
 from tunix.sft import utils as sft_utils
 
 # training_engine imports tunix, so these tests need the post-training dependency bundle.
@@ -66,6 +69,7 @@ class DummyStatefulNNXModel(nnx.Module):
 class DummyPayload(abstract_engine.TrainerPayload):
   token_ids: Any = dataclasses.field(default_factory=lambda: jnp.ones((2, 2)))
   token_mask: Any = dataclasses.field(default_factory=lambda: jnp.ones((2, 2)))
+  metadata: dict[str, Any] = struct.field(pytree_node=False, default_factory=dict)
 
 
 class MaxTextTrainingEngineTest(absltest.TestCase):
@@ -114,6 +118,7 @@ class MaxTextTrainingEngineTest(absltest.TestCase):
         "tensorboard_dir": self.create_tempdir().full_path,
         "skip_jax_distributed_system": True,
         "enable_checkpointing": enable_checkpointing,
+        "profiler_steps": 0,
     }
     if enable_checkpointing:
       overrides.update(
@@ -250,9 +255,14 @@ class MaxTextTrainingEngineTest(absltest.TestCase):
     self.assertEqual(recorded.shape, (1,), "one norm per update, not one per micro-batch")
     np.testing.assert_allclose(recorded[0], np.sqrt(2 * 0.25**2), rtol=1e-5)
 
+  @mock.patch("orbax.checkpoint.PyTreeCheckpointHandler")
   @mock.patch("orbax.checkpoint.CheckpointManager")
-  def test_max_text_trainer_checkpoint_manager_init(self, mock_create_mgr):
-    mock_config = self.setup_config(enable_checkpointing=True)
+  def test_max_text_trainer_checkpoint_manager_init(self, mock_create_mgr, mock_handler):
+    mock_config = self.setup_config(
+        enable_checkpointing=True,
+        checkpoint_storage_use_ocdbt=False,
+        checkpoint_storage_use_zarr3=False,
+    )
 
     _ = maxtext_engine.MaxTextTrainingEngine(mock_config)
     mock_create_mgr.assert_called_once_with(
@@ -262,6 +272,61 @@ class MaxTextTrainingEngineTest(absltest.TestCase):
             max_to_keep=mock_config.max_num_checkpoints_to_keep,
             enable_async_checkpointing=mock_config.async_checkpointing,
         ),
+        item_handlers={
+            "model_params": mock_handler.return_value,
+            "optimizer_state": mock_handler.return_value,
+            "accumulated_metrics": mock_handler.return_value,
+            "accumulated_grads": mock_handler.return_value,
+        },
+    )
+    self.assertEqual(mock_handler.call_count, 4)
+    mock_handler.assert_has_calls(
+        [
+            mock.call(
+                use_ocdbt=False,
+                use_zarr3=False,
+                save_device_host_concurrent_gb=mock_config.checkpoint_storage_device_host_concurrent_gb,
+            )
+        ]
+        * 4,
+    )
+
+  @mock.patch("orbax.checkpoint.PyTreeCheckpointHandler")
+  @mock.patch("orbax.checkpoint.CheckpointManager")
+  def test_max_text_trainer_checkpoint_manager_init_custom_device_host_concurrent_gb(self, mock_create_mgr, mock_handler):
+    mock_config = self.setup_config(
+        enable_checkpointing=True,
+        checkpoint_storage_use_ocdbt=True,
+        checkpoint_storage_use_zarr3=True,
+        checkpoint_storage_device_host_concurrent_gb=16,
+    )
+
+    _ = maxtext_engine.MaxTextTrainingEngine(mock_config)
+    self.assertEqual(mock_handler.call_count, 4)
+    mock_handler.assert_has_calls(
+        [
+            mock.call(
+                use_ocdbt=True,
+                use_zarr3=True,
+                save_device_host_concurrent_gb=16,
+            )
+        ]
+        * 4,
+    )
+
+  @mock.patch.dict("os.environ", {"ENABLE_PATHWAYS_PERSISTENCE": "1"})
+  @mock.patch("orbax.checkpoint.pathways.register_type_handlers")
+  def test_maybe_register_pathways_persistence(self, mock_register_type_handlers):
+    import orbax.checkpoint.pathways as ocp_pathways  # pylint: disable=import-outside-toplevel
+    from maxtext.training_engine import checkpointing as checkpointing_module  # pylint: disable=import-outside-toplevel
+
+    checkpointing_module._PATHWAYS_PERSISTENCE_REGISTERED = False
+    checkpointing_module._maybe_register_pathways_persistence()
+
+    mock_register_type_handlers.assert_called_once()
+    self.assertEqual(
+        mock_register_type_handlers.call_args.kwargs["checkpointing_impl"],
+        ocp_pathways.CheckpointingImpl.PERSISTENCE,
     )
 
   def test_save_checkpoint_called_after_update(self):
@@ -786,6 +851,94 @@ class MaxTextTrainingEngineTest(absltest.TestCase):
     self.assertTrue(seen["is_train"])
     # The payload's fields are auto-extracted into the positional `data`.
     self.assertIn("token_ids", seen["data"])
+    self.assertNotIn("metadata", seen["data"])
+
+  def test_prepare_batch_clears_metadata_on_dataclass(self):
+    """Payload metadata is cleared to {} on dataclasses so gen_model_input_fn receives empty metadata."""
+    t = maxtext_engine.MaxTextTrainingEngine(self.mock_config)
+    payload = DummyPayload(metadata={"request_id": 12345, "step": 1})
+
+    # With gen_model_input_fn: receives payload with metadata replaced by {}
+    received_payload = []
+    t.with_gen_model_input_fn(lambda p: received_payload.append(p) or {"tokens": p.token_ids})
+    t._prepare_batch(payload)
+    self.assertEqual(len(received_payload), 1)
+    self.assertEqual(received_payload[0].metadata, {})
+
+    # Without gen_model_input_fn: returns dict without metadata
+    t_no_gen = maxtext_engine.MaxTextTrainingEngine(self.mock_config)
+    prepared = t_no_gen._prepare_batch(payload)
+    self.assertIsInstance(prepared, dict)
+    self.assertNotIn("metadata", prepared)
+
+    # RLTrainerPayload from Tunix with non-empty metadata is also cleared
+    rl_payload = datatypes.RLTrainerPayload(
+        prompt_ids=jnp.zeros((1, 4)),
+        prompt_mask=jnp.ones((1, 4)),
+        completion_ids=jnp.zeros((1, 4)),
+        completion_mask=jnp.ones((1, 4)),
+        advantages=jnp.zeros((1,)),
+        metadata={"client_id": "worker-0"},
+    )
+    received_rl_payload = []
+    t.with_gen_model_input_fn(lambda p: received_rl_payload.append(p) or {"tokens": p.completion_ids})
+    t._prepare_batch(rl_payload)
+    self.assertEqual(len(received_rl_payload), 1)
+    self.assertEqual(received_rl_payload[0].metadata, {})
+
+    # Dataclass without a dataclass field for metadata (e.g. property) is not replaced
+    @dataclasses.dataclass
+    class _PayloadWithPropertyMetadata:
+      tokens: jax.Array
+
+      @property
+      def metadata(self):
+        return {"property": True}
+
+    prop_payload = _PayloadWithPropertyMetadata(tokens=jnp.ones((2, 2)))
+    prepared_prop = t_no_gen._prepare_batch(prop_payload)
+    self.assertIn("tokens", prepared_prop)
+
+  def test_prepare_batch_prevents_recompilation_on_metadata_change(self):
+    """Payload metadata changes must not alter the Treedef or trigger recompilation."""
+    t = maxtext_engine.MaxTextTrainingEngine(self.mock_config)
+    t.with_loss_fn(lambda model, **kwargs: (abstract_engine.WeightedMetric(jnp.array(1.0), jnp.array(1.0)), {}))
+    # Mirrors tunix algorithm_adapter._algo_model_input which passes the payload through.
+    t.with_gen_model_input_fn(lambda payload: {"train_example": payload})
+
+    payload1 = datatypes.RLTrainerPayload(
+        prompt_ids=jnp.zeros((1, 4)),
+        prompt_mask=jnp.ones((1, 4)),
+        completion_ids=jnp.zeros((1, 4)),
+        completion_mask=jnp.ones((1, 4)),
+        advantages=jnp.zeros((1,)),
+        metadata={"step": 0, "request_id": 100},
+    )
+    payload2 = datatypes.RLTrainerPayload(
+        prompt_ids=jnp.zeros((1, 4)),
+        prompt_mask=jnp.ones((1, 4)),
+        completion_ids=jnp.zeros((1, 4)),
+        completion_mask=jnp.ones((1, 4)),
+        advantages=jnp.zeros((1,)),
+        metadata={"step": 1, "request_id": 101},
+    )
+
+    with mock.patch.object(t, "_compile_for_batch", wraps=t._compile_for_batch) as mock_compile:
+      t.compile(payload1)
+      self.assertEqual(mock_compile.call_count, 1)
+      t.fwd_bwd(payload2)
+      self.assertEqual(mock_compile.call_count, 1)
+
+    dummy1 = DummyPayload(token_ids=jnp.ones((2, 2)), metadata={"step": 0})
+    dummy2 = DummyPayload(token_ids=jnp.ones((2, 2)), metadata={"step": 1})
+    t_dummy = maxtext_engine.MaxTextTrainingEngine(self.mock_config)
+    t_dummy.with_loss_fn(lambda model, **kwargs: (abstract_engine.WeightedMetric(jnp.array(1.0), jnp.array(1.0)), {}))
+    t_dummy.with_gen_model_input_fn(lambda payload: {"train_example": payload})
+    with mock.patch.object(t_dummy, "_compile_for_batch", wraps=t_dummy._compile_for_batch) as mock_dummy_compile:
+      t_dummy.compile(dummy1)
+      self.assertEqual(mock_dummy_compile.call_count, 1)
+      t_dummy.fwd_bwd(dummy2)
+      self.assertEqual(mock_dummy_compile.call_count, 1)
 
   def test_gen_model_input_fn_returning_a_non_dict_raises(self):
     """The adapter's contract is a dict of kwargs; anything else fails clearly."""
@@ -857,6 +1010,44 @@ class MaxTextTrainingEngineTest(absltest.TestCase):
     t.fwd_bwd(DummyPayload())
     self.assertTrue(t._compiled)
     np.testing.assert_allclose(t._accumulated_grads["weights"], jnp.array([8.0, 8.0]), rtol=1e-5)
+
+  def test_compile_expands_routed_experts_placeholder_from_config(self):
+    """`compile()` expands a `(B, S, 0, 0)` `routed_experts` placeholder using config."""
+    # pyconfig objects are read-only, so build a config with the routing dims instead
+    # of mutating `self.mock_config`.
+    config = self.setup_config(override_model_config=True, base_num_decoder_layers=3, num_experts_per_tok=4)
+    t = maxtext_engine.MaxTextTrainingEngine(config)
+    seen_shapes = []
+
+    def _loss_fn(model, routed_experts):
+      seen_shapes.append(routed_experts.shape)
+      return abstract_engine.WeightedMetric(
+          unreduced_sum=jnp.sum(model.weights[...]) * 8.0 + jnp.sum(routed_experts) * 0.0,
+          denominator=jnp.array(4.0),
+      )
+
+    t.with_loss_fn(_loss_fn)
+    t.with_gen_model_input_fn(lambda payload: {"routed_experts": payload.routed_experts})
+
+    dummy_payload = datatypes.RLTrainerPayload(
+        prompt_ids=np.zeros((2, 3), dtype=np.int32),
+        prompt_mask=np.ones((2, 3), dtype=np.int32),
+        completion_ids=np.zeros((2, 5), dtype=np.int32),
+        completion_mask=np.ones((2, 5), dtype=np.int32),
+        advantages=np.zeros((2,), dtype=np.float32),
+        routed_experts=np.empty((2, 8, 0, 0), dtype=np.int16),
+    )
+    t.compile(dummy_payload)
+    self.assertTrue(t._compiled)
+    self.assertIn((2, 8, 3, 4), seen_shapes)
+
+    real_payload = dataclasses.replace(
+        dummy_payload,
+        routed_experts=np.zeros((2, 8, 3, 4), dtype=np.int16),
+    )
+    with mock.patch.object(t, "_compile_for_batch", wraps=t._compile_for_batch) as mock_compile:
+      t.fwd_bwd(real_payload)
+      mock_compile.assert_not_called()
 
   def test_compiled_kernel_is_rebuilt_when_a_static_loss_argument_changes(self):
     """A changed non-traced loss argument must reach the loss, not the stale closure.
@@ -1002,6 +1193,7 @@ class MaxTextTrainingEngineTest(absltest.TestCase):
     self.assertIs(abstract_engine.LossOutput, sft_utils.LossOutput)
     self.assertIs(abstract_engine.WeightedMetric, sft_utils.WeightedMetric)
     self.assertIs(abstract_engine.TrainerPayload, datatypes.TrainerPayload)
+    self.assertIs(abstract_engine.RLTrainerPayload, datatypes.RLTrainerPayload)
 
     tunix_metric = sft_utils.WeightedMetric(unreduced_sum=jnp.array(4.0), denominator=jnp.array(2.0))
     self.assertIsInstance(tunix_metric, abstract_engine.WeightedMetric)
@@ -1014,12 +1206,14 @@ class MaxTextTrainingEngineTest(absltest.TestCase):
 
     # What actually arrives at fwd_bwd from GRPOAdapter.create_trainer_payloads.
     rl_payload = datatypes.RLTrainerPayload(
-        token_ids=jnp.zeros((1, 4)),
-        token_mask=jnp.ones((1, 4)),
+        prompt_ids=jnp.zeros((1, 4)),
+        prompt_mask=jnp.ones((1, 4)),
+        completion_ids=jnp.zeros((1, 4)),
+        completion_mask=jnp.ones((1, 4)),
         advantages=jnp.zeros((1,)),
-        loss_mask=jnp.ones((1, 4)),
     )
     self.assertIsInstance(rl_payload, abstract_engine.TrainerPayload)
+    self.assertIsInstance(rl_payload, abstract_engine.RLTrainerPayload)
 
   def test_unsupported_loss_return_raises_naming_the_type(self):
     """An unrecognised return fails loudly and says what it received."""
@@ -1348,6 +1542,327 @@ class MaxTextTrainingEngineTest(absltest.TestCase):
     self.assertAlmostEqual(processed["loss"], 6.0, places=4)
     self.assertIn("perplexity", processed)
     self.assertAlmostEqual(processed["perplexity"], float(np.exp(6.0)), places=3)
+
+  def test_prepare_weight_sync_rejects_an_unknown_transport(self):
+    """An unrecognised transport must name itself rather than return empty metadata."""
+    t = maxtext_engine.MaxTextTrainingEngine(self.mock_config)
+    with self.assertRaisesRegex(ValueError, "raidan"):
+      t.prepare_weight_sync(staging_transport="raidan")
+
+  def _sharded_batch_spec(self, engine, axis="data"):
+    """A data sharding whose batch dim is actually sharded.
+
+    The single-device test mesh makes `get_input_data_sharding` return a spec with `None`
+    in the batch position, so the replication branch is unreachable as configured -- an
+    earlier version of these tests asserted `spec[0] is None` and passed without ever
+    running the code under test. Stub a spec that shards the batch dim instead.
+    """
+    return jax.sharding.NamedSharding(engine._mesh, jax.sharding.PartitionSpec(axis, None))  # pylint: disable=protected-access
+
+  def test_indivisible_batch_dim_replicates_and_warns_once(self):
+    """Replicating the batch dim is an N-fold compute cliff, so it must be audible."""
+    t = maxtext_engine.MaxTextTrainingEngine(self.mock_config)
+    batch = {"a": jnp.zeros((1, 4)), "b": jnp.zeros((1, 4))}
+
+    # Batch dim 1 against a 2-wide axis: indivisible, so the dim must be replicated.
+    with mock.patch.object(maxtext_engine.sharding, "get_input_data_sharding", return_value=self._sharded_batch_spec(t)):
+      with mock.patch.object(type(t), "_batch_axis_size", return_value=2):
+        with self.assertLogs(level="WARNING") as logs:
+          shardings = t._batch_data_shardings(batch)  # pylint: disable=protected-access
+          t._batch_data_shardings(batch)  # pylint: disable=protected-access
+
+    for name, leaf_sharding in shardings.items():
+      self.assertIsNone(leaf_sharding.spec[0], f"{name} should have its batch dim replicated")
+
+    # Once per instance, not per leaf and not per call: two leaves over two calls is four
+    # chances to warn.
+    warnings = [line for line in logs.output if "does not divide mesh axis" in line]
+    self.assertLen(warnings, 1)
+    self.assertIn("2x the work", warnings[0])
+
+  def test_divisible_batch_dim_stays_sharded_and_is_silent(self):
+    """The normal case must neither replicate nor warn."""
+    t = maxtext_engine.MaxTextTrainingEngine(self.mock_config)
+
+    with mock.patch.object(maxtext_engine.sharding, "get_input_data_sharding", return_value=self._sharded_batch_spec(t)):
+      with mock.patch.object(type(t), "_batch_axis_size", return_value=2):
+        shardings = t._batch_data_shardings({"a": jnp.zeros((4, 4))})  # pylint: disable=protected-access
+
+    self.assertEqual(shardings["a"].spec[0], "data")
+    self.assertFalse(t._replicated_batch_warned)  # pylint: disable=protected-access
+
+  def test_fwd_only_passes_the_live_model_and_mutates_no_training_state(self):
+    """A read-only pass gets the engine's live model and leaves the in-flight step alone."""
+    t = maxtext_engine.MaxTextTrainingEngine(self.mock_config)
+    t.with_loss_fn(
+        lambda *args, **kwargs: (
+            abstract_engine.WeightedMetric(unreduced_sum=jnp.array(0.5), denominator=jnp.array(1.0)),
+            {},
+        )
+    )
+    t.fwd_bwd(DummyPayload())
+    grads_before = jax.tree.map(jnp.copy, t._accumulated_grads)  # pylint: disable=protected-access
+    micro_steps_before = t._micro_step_count  # pylint: disable=protected-access
+    train_step_before = t.train_step
+
+    def fn(model, x, *, pad_id):
+      return model, pad_id, jnp.sum(x)
+
+    model, pad_id, out = t.fwd_only(fn, np.ones((2, 4), np.int32), pad_id=0)
+
+    # The model comes off the train state, which is what `fwd_bwd` differentiates -- not
+    # `self._model`, which a restore or the `state` setter can leave behind.
+    self.assertIs(model, t.state.model)
+    # Python scalars must survive as scalars: callees take them as `static_argnames`, and
+    # a device array there is unhashable.
+    self.assertIsInstance(pad_id, int)
+    self.assertEqual(float(out), 8.0)
+
+    # Nothing about the in-flight training step moved.
+    self.assertEqual(t._micro_step_count, micro_steps_before)  # pylint: disable=protected-access
+    self.assertEqual(t.train_step, train_step_before)
+    jax.tree.map(np.testing.assert_array_equal, grads_before, t._accumulated_grads)  # pylint: disable=protected-access
+
+  def test_fwd_only_places_arrays_where_a_compiled_step_would(self):
+    """Inputs land on the engine's own batch shardings, per leaf rank."""
+    t = maxtext_engine.MaxTextTrainingEngine(self.mock_config)
+    # Zero-width: the empty prompt half of a sequence-packed row. There is nothing to
+    # split, so it must be passed through rather than made into a degenerate global array.
+    empty_prompt = np.zeros((2, 0), np.int32)
+
+    def fn(_, tokens, prompt, *, mask):
+      return tokens, prompt, mask
+
+    with mock.patch.object(maxtext_engine.sharding, "get_input_data_sharding", return_value=self._sharded_batch_spec(t)):
+      tokens, prompt, mask = t.fwd_only(fn, np.ones((2, 4), np.int32), empty_prompt, mask=np.ones((2,), np.int32))
+
+    self.assertEqual(tokens.sharding.spec, jax.sharding.PartitionSpec("data", None))
+    # A rank-1 leaf absorbs only the leading entry of the `[batch, sequence]` spec.
+    self.assertEqual(mask.sharding.spec, jax.sharding.PartitionSpec("data"))
+    self.assertIs(prompt, empty_prompt)
+
+  def test_fwd_only_holds_the_logical_axis_rules_open_for_fn(self):
+    """`fn` traces inside `fwd_only`, so the rules must still be in force there."""
+    t = maxtext_engine.MaxTextTrainingEngine(self.mock_config)
+
+    inside = t.fwd_only(lambda _: maxtext_engine.sharding.get_logical_axis_rules())
+
+    self.assertTrue(inside)
+    # And released on exit: the scope is a loan, not a global mode switch.
+    self.assertFalse(maxtext_engine.sharding.get_logical_axis_rules())
+
+  def test_fwd_only_throttles_consecutive_calls_and_flushes_pending_metrics(self):
+    """Consecutive `fwd_only` calls stay bounded by the throttler and flush stashed metrics."""
+    t = maxtext_engine.MaxTextTrainingEngine(self.mock_config)
+    t.with_loss_fn(
+        lambda *args, **kwargs: (
+            abstract_engine.WeightedMetric(unreduced_sum=jnp.array(0.5), denominator=jnp.array(1.0)),
+            {},
+        )
+    )
+    payload = DummyPayload()
+    t.fwd_bwd(payload)
+    t.update()
+    # Queue now holds [fwd_bwd loss, update grad_norm + step 0 metrics] (qsize=2, full).
+    self.assertTrue(t._throttler._inflight_queue.full())
+
+    with (
+        mock.patch.object(t._metrics_logger, "write_metrics") as write_metrics,
+        mock.patch("jax.block_until_ready", wraps=jax.block_until_ready) as mock_block,
+    ):
+      for _ in range(4):
+        _ = t.fwd_only(lambda _, x: jnp.sum(x), np.ones((2, 4), np.int32))
+        self.assertTrue(t._throttler._inflight_queue.full())
+
+      # Every iteration entered with a full queue, so all 4 popped and blocked.
+      self.assertEqual(mock_block.call_count, 4)
+      # The second iteration popped the `update` entry and flushed its stashed step-0 metrics
+      # when `fwd_only` queued its computation.
+      write_metrics.assert_called_once()
+      self.assertIsNone(t._throttler._pending_metrics)
+
+
+class MaxTextMoeRoutedExpertsPrecompileE2ETest(parameterized.TestCase):
+  """End-to-end MoE router-replay AOT precompilation tests for MaxTextTrainingEngine."""
+
+  def _build_moe_engine(self, num_layers: int = 1, top_k: int = 2):
+    """Builds a miniature MoE MaxTextTrainingEngine for precompilation testing."""
+    self.enterContext(mock.patch.dict(os.environ, {"NEW_MODEL_DESIGN": "1"}))
+    num_devices = jax.device_count()
+    data_parallelism = min(2, num_devices)
+    tensor_parallelism = num_devices // data_parallelism
+    cfg = pyconfig.initialize(
+        [None, get_test_config_path()],
+        model_name="qwen3.5-35b-a3b",
+        override_model_config=True,
+        base_num_decoder_layers=num_layers,
+        num_decoder_layers=num_layers,
+        num_experts=4,
+        num_experts_per_tok=top_k,
+        base_emb_dim=128,
+        base_num_query_heads=2,
+        base_num_kv_heads=2,
+        head_dim=128,
+        base_mlp_dim=128,
+        base_moe_mlp_dim=128,
+        vocab_size=256,
+        attention="dot_product",
+        use_mrope=False,
+        partial_rotary_factor=0.25,
+        scan_layers=False,
+        ici_data_parallelism=data_parallelism,
+        ici_fsdp_parallelism=1,
+        ici_tensor_parallelism=tensor_parallelism,
+        run_name="maxtext_moe_routed_experts_precompile_e2e_test",
+        base_output_directory=self.create_tempdir().full_path,
+        init_weights_seed=42,
+        micro_batch_size_to_train_on=2,
+        max_target_length=8,
+        gradient_accumulation_steps=1,
+        warmup_steps_fraction=0.0,
+        learning_rate=1e-2,
+        enable_dropout=False,
+        record_internal_nn_metrics=False,
+        enable_tensorboard=False,
+        tensorboard_dir=self.create_tempdir().full_path,
+        skip_jax_distributed_system=True,
+        enable_checkpointing=False,
+        profiler_steps=0,
+        use_weight_converter=False,
+        dtype="float32",
+        weight_dtype="float32",
+        grad_dtype="float32",
+    )
+    mesh = jax.sharding.Mesh(maxtext_utils.create_device_mesh(cfg), cfg.mesh_axes)
+    engine = maxtext_engine.MaxTextTrainingEngine(
+        cfg,
+        mesh=mesh,
+        wrap_with_tunix_adapter=True,
+        tokenizer_pad_id=0,
+    )
+    algo_config = types.SimpleNamespace(
+        beta=0.0,
+        epsilon=0.2,
+        epsilon_high=0.2,
+        loss_algo="grpo",
+        loss_agg_mode="token-mean",
+        temperature=1.0,
+        kl_loss_mode="low_var_kl",
+        kl_clamp_value=None,
+    )
+    engine.with_loss_fn(algo_core.grpo_loss_fn, has_aux=True)
+    engine.with_gen_model_input_fn(
+        lambda payload: {
+            "train_example": payload,
+            "algo_config": algo_config,
+            "pad_id": 0,
+            "eos_id": 2,
+        }
+    )
+    trace_counts = {"fwd_bwd": 0, "update": 0}
+    orig_fwd_bwd = engine._fwd_bwd_kernel
+    orig_update = engine._update_kernel
+
+    def traced_fwd_bwd(*args, **kwargs):
+      trace_counts["fwd_bwd"] += 1
+      return orig_fwd_bwd(*args, **kwargs)
+
+    def traced_update(*args, **kwargs):
+      trace_counts["update"] += 1
+      return orig_update(*args, **kwargs)
+
+    engine._fwd_bwd_kernel = traced_fwd_bwd
+    engine._update_kernel = traced_update
+    return engine, trace_counts
+
+  @parameterized.named_parameters(
+      ("padded_moe_routed_experts", "padded"),
+      ("packed_moe_routed_experts", "packed"),
+  )
+  def test_first_real_step_is_served_from_compiled_executables(self, layout: str):
+    num_layers, top_k = 1, 2
+    engine, trace_counts = self._build_moe_engine(num_layers=num_layers, top_k=top_k)
+
+    if layout == "padded":
+      dummy_payload = datatypes.RLTrainerPayload(
+          prompt_ids=np.zeros((2, 2), dtype=np.int32),
+          prompt_mask=np.zeros((2, 2), dtype=np.int32),
+          completion_ids=np.zeros((2, 3), dtype=np.int32),
+          completion_mask=np.zeros((2, 3), dtype=np.int32),
+          advantages=np.zeros((2,), dtype=np.float32),
+          old_per_token_logps=np.zeros((2, 3), dtype=np.float32),
+          routed_experts=np.empty((2, 5, 0, 0), dtype=np.int16),
+      )
+      real_payload = datatypes.RLTrainerPayload(
+          prompt_ids=np.array([[10, 11], [12, 0]], dtype=np.int32),
+          prompt_mask=np.array([[1, 1], [1, 0]], dtype=np.int32),
+          completion_ids=np.array([[20, 21, 2], [22, 2, 0]], dtype=np.int32),
+          completion_mask=np.array([[1, 1, 1], [1, 1, 0]], dtype=np.int32),
+          advantages=np.array([1.0, -1.0], dtype=np.float32),
+          old_per_token_logps=np.full((2, 3), -0.5, dtype=np.float32),
+          routed_experts=np.zeros((2, 5, num_layers, top_k), dtype=np.int16),
+      )
+    else:
+      dummy_payload = datatypes.RLTrainerPayload(
+          prompt_ids=np.zeros((2, 0), dtype=np.int32),
+          prompt_mask=np.zeros((2, 0), dtype=np.int32),
+          completion_ids=np.zeros((2, 8), dtype=np.int32),
+          completion_mask=np.zeros((2, 8), dtype=np.int32),
+          advantages=np.zeros((2, 8), dtype=np.float32),
+          old_per_token_logps=np.zeros((2, 8), dtype=np.float32),
+          routed_experts=np.empty((2, 8, 0, 0), dtype=np.int16),
+          segment_ids=np.zeros((2, 8), dtype=np.int32),
+          segment_positions=np.zeros((2, 8), dtype=np.int32),
+          num_segments=9,
+      )
+      real_payload = datatypes.RLTrainerPayload(
+          prompt_ids=np.zeros((2, 0), dtype=np.int32),
+          prompt_mask=np.zeros((2, 0), dtype=np.int32),
+          completion_ids=np.array(
+              [[10, 11, 20, 21, 2, 0, 0, 0], [12, 22, 2, 0, 0, 0, 0, 0]],
+              dtype=np.int32,
+          ),
+          completion_mask=np.array(
+              [[0, 0, 1, 1, 1, 0, 0, 0], [0, 1, 1, 0, 0, 0, 0, 0]],
+              dtype=np.int32,
+          ),
+          advantages=np.array(
+              [[0.0, 0.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0], [0.0, -1.0, -1.0, 0.0, 0.0, 0.0, 0.0, 0.0]],
+              dtype=np.float32,
+          ),
+          old_per_token_logps=np.full((2, 8), -0.5, dtype=np.float32),
+          routed_experts=np.zeros((2, 8, num_layers, top_k), dtype=np.int16),
+          segment_ids=np.array(
+              [[1, 1, 1, 1, 1, 0, 0, 0], [1, 1, 1, 0, 0, 0, 0, 0]],
+              dtype=np.int32,
+          ),
+          segment_positions=np.array(
+              [[0, 1, 2, 3, 4, 0, 0, 0], [0, 1, 2, 0, 0, 0, 0, 0]],
+              dtype=np.int32,
+          ),
+          num_segments=9,
+      )
+
+    engine.compile(dummy_payload)
+    self.assertTrue(engine._compiled)
+    self.assertEqual(trace_counts, {"fwd_bwd": 2, "update": 1})
+    traces_after_compile = dict(trace_counts)
+    params_before = jax.tree.map(np.asarray, nnx.state(engine.model, nnx.Param))
+
+    with mock.patch.object(engine, "_compile_for_batch", wraps=engine._compile_for_batch) as mock_compile:
+      engine.fwd_bwd(real_payload)
+      step = engine.update()
+      mock_compile.assert_not_called()
+
+    self.assertEqual(step, 1)
+    self.assertEqual(trace_counts, traces_after_compile)
+    params_after = nnx.state(engine.model, nnx.Param)
+    self.assertTrue(
+        any(
+            not np.allclose(a, b)
+            for a, b in zip(jax.tree.leaves(params_before), jax.tree.leaves(params_after), strict=True)
+        )
+    )
 
 
 if __name__ == "__main__":

@@ -22,9 +22,8 @@ from typing import Any, cast
 from flax import nnx
 import jax.numpy as jnp
 from jax.sharding import Mesh
-from maxtext.common.common_types import Array, Config, ShardMode
-from maxtext.layers import initializers as max_initializers
-from maxtext.layers import nnx_wrappers
+from maxtext.common.common_types import Array, Config, ShardMode, get_weight_dtype
+from maxtext.layers.linears import MlpBlock
 from maxtext.layers.normalizations import Qwen3NextRMSNorm
 from maxtext.layers.quantizations import AqtQuantization as Quant
 from maxtext.models.qwen3 import (
@@ -86,10 +85,16 @@ class Qwen3_5ScannableBlock(nnx.Module):
       model_mode: str,
       previous_chunk=None,
       slot: None | int = None,
+      kv_cache: None | tuple[Any, ...] = None,
+      attention_metadata: None | dict[str, Any] = None,
       forced_routed_experts: jnp.ndarray | None = None,
-  ) -> tuple[Array, None]:
+  ) -> tuple[Array, None | tuple[Any, ...]]:
     cfg = self.config
     x = carry
+    # Inference with externally-managed (vLLM) caches hands this block one
+    # entry per sub-layer of the cycle; the decoder groups the flat per-layer
+    # list before the scan and ungroups the returned tuple afterwards.
+    updated_kv_caches = []
 
     for i in range(cfg.inhomogeneous_layer_cycle_interval):
       layer = getattr(self, f"layer_{i}")
@@ -97,7 +102,8 @@ class Qwen3_5ScannableBlock(nnx.Module):
       # [inhomogeneous_layer_cycle_interval, batch, seq, top_k]: one slice per
       # sub-layer in this cycle (see nnx_decoders.py's scan wiring).
       layer_forced_routed_experts = forced_routed_experts[i] if forced_routed_experts is not None else None
-      x, _ = layer(
+      layer_kv_cache = kv_cache[i] if (kv_cache is not None and i < len(kv_cache)) else None
+      x, new_kv_cache = layer(
           x,
           decoder_segment_ids,
           decoder_positions,
@@ -105,10 +111,15 @@ class Qwen3_5ScannableBlock(nnx.Module):
           model_mode,
           previous_chunk,
           slot,
+          kv_cache=layer_kv_cache,
+          attention_metadata=attention_metadata,
           forced_routed_experts=layer_forced_routed_experts,
       )
+      updated_kv_caches.append(new_kv_cache)
 
-    return x, None
+    if kv_cache is None:
+      return x, None
+    return x, tuple(updated_kv_caches)
 
 
 class Qwen3_5DecoderLayer(nnx.Module):
@@ -153,7 +164,6 @@ class Qwen3_5DecoderLayer(nnx.Module):
           mesh=mesh,
           shard_mode=cfg.shard_mode,
           debug_sharding=cfg.debug_sharding,
-          extra_stack_level=1,
       )
     else:
       self.out_sharding = None
@@ -165,7 +175,7 @@ class Qwen3_5DecoderLayer(nnx.Module):
         num_features=cfg.emb_dim,
         epsilon=cfg.normalization_layer_epsilon,
         dtype=cfg.dtype,
-        weight_dtype=cfg.weight_dtype,
+        weight_dtype=get_weight_dtype(cfg, "norm"),
         shard_mode=cfg.shard_mode,
         rngs=rngs,
     )
@@ -187,21 +197,41 @@ class Qwen3_5DecoderLayer(nnx.Module):
       batch_size, seq_len = max_utils.get_batch_seq_len_for_mode(config, model_mode)
       dummy_inputs_shape = (batch_size, seq_len, config.emb_dim)
       self.attention = Qwen3_5GatedDeltaNet(
-          config=cfg, inputs_shape=dummy_inputs_shape, mesh=self.mesh, dtype=cfg.dtype, model_mode=model_mode, rngs=rngs
+          config=cfg,
+          inputs_shape=dummy_inputs_shape,
+          mesh=self.mesh,
+          dtype=cfg.dtype,
+          model_mode=model_mode,
+          quant=self.quant,
+          rngs=rngs,
       )
 
-    # Second LayerNorm, applied before the MoE block.
+    # Second LayerNorm, applied before the MoE / MLP block.
     self.post_attention_layernorm = Qwen3NextRMSNorm(
         num_features=cfg.emb_dim,
         epsilon=cfg.normalization_layer_epsilon,
         dtype=cfg.dtype,
-        weight_dtype=cfg.weight_dtype,
+        weight_dtype=get_weight_dtype(cfg, "norm"),
         shard_mode=cfg.shard_mode,
         rngs=rngs,
     )
 
-    # Instantiate our `Qwen3_5SparseMoEBlock`.
-    self.mlp = Qwen3_5SparseMoEBlock(config=cfg, mesh=self.mesh, quant=self.quant, rngs=rngs)
+    if getattr(cfg, "num_experts", 1) > 1:
+      self.mlp = Qwen3_5SparseMoEBlock(config=cfg, mesh=self.mesh, quant=self.quant, rngs=rngs)
+    else:
+      self.mlp = MlpBlock(
+          config=cfg,
+          mesh=self.mesh,
+          in_features=cfg.emb_dim,
+          intermediate_dim=cfg.mlp_dim,
+          activations=tuple(cfg.mlp_activations),
+          intermediate_dropout_rate=cfg.dropout_rate,
+          dtype=cfg.dtype,
+          weight_dtype=get_weight_dtype(cfg, "mlp"),
+          quant=self.quant,
+          model_mode=model_mode,
+          rngs=rngs,
+      )
 
   def __call__(
       self,
@@ -221,6 +251,9 @@ class Qwen3_5DecoderLayer(nnx.Module):
       inputs = inputs[0]
     inputs = self._maybe_shard_with_logical(inputs, self.activation_axis_names)
     residual = inputs
+
+    if isinstance(attention_metadata, dict):
+      attention_metadata = attention_metadata.get(f"layer.{self.layer_idx}", attention_metadata.get(self.layer_idx))
 
     # First LayerNorm, applied before the attention block.
     hidden_states = self.input_layernorm(inputs, out_sharding=self.out_sharding)
@@ -253,26 +286,34 @@ class Qwen3_5DecoderLayer(nnx.Module):
     hidden_states = residual + attention_output
     hidden_states = self._maybe_shard_with_logical(hidden_states, self.activation_axis_names)
 
-    # Prepare for the MoE block by capturing the new residual
+    # Prepare for the MoE / MLP block by capturing the new residual
     residual = hidden_states
 
-    # Second LayerNorm, applied before the MoE block.
+    # Second LayerNorm, applied before the MoE / MLP block.
     hidden_states = self.post_attention_layernorm(hidden_states, out_sharding=self.out_sharding)
     hidden_states = self._maybe_shard_with_logical(hidden_states, self.activation_axis_names)
 
-    # Instantiate and call our `Qwen3_5SparseMoEBlock`.
-    mlp_output, load_balance_loss = self.mlp(
-        hidden_states,
-        deterministic=deterministic,
-        forced_routed_experts=forced_routed_experts,
-        intermediate_sharding=self.mlp_intermediate_sharding,
-        out_sharding=self.out_sharding,
-    )
+    # Instantiate and call our `Qwen3_5SparseMoEBlock` or `MlpBlock`.
+    if getattr(self.config, "num_experts", 1) > 1:
+      mlp_output, load_balance_loss = self.mlp(
+          hidden_states,
+          deterministic=deterministic,
+          forced_routed_experts=forced_routed_experts,
+          intermediate_sharding=self.mlp_intermediate_sharding,
+          out_sharding=self.out_sharding,
+      )
 
-    # We sow the load balancing loss so it can be collected and added to the total loss
-    # during training.
-    if self.config.load_balance_loss_weight > 0.0 and load_balance_loss is not None:
-      self.sow(nnx.Intermediate, "moe_lb_loss", load_balance_loss)
+      # We sow the load balancing loss so it can be collected and added to the total loss
+      # during training.
+      if self.config.load_balance_loss_weight > 0.0 and load_balance_loss is not None:
+        self.sow(nnx.Intermediate, "moe_lb_loss", load_balance_loss)
+    else:
+      mlp_output = self.mlp(
+          hidden_states,
+          deterministic=deterministic,
+          intermediate_sharding=self.mlp_intermediate_sharding,
+          out_sharding=self.out_sharding,
+      )
 
     # Final residual connection (after the MoE block)
     mlp_output = self._maybe_shard_with_logical(mlp_output, self.activation_axis_names)
@@ -282,15 +323,3 @@ class Qwen3_5DecoderLayer(nnx.Module):
         self.activation_axis_names,
     )
     return layer_output, new_kv_cache
-
-
-Qwen3_5DecoderLayerToLinen = nnx_wrappers.to_linen_class(
-    Qwen3_5DecoderLayer,
-    base_metadata_fn=max_initializers.variable_to_logically_partitioned,
-)
-
-
-Qwen3_5ScannableBlockToLinen = nnx_wrappers.to_linen_class(
-    Qwen3_5ScannableBlock,
-    base_metadata_fn=max_initializers.variable_to_logically_partitioned,
-)

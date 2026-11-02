@@ -172,8 +172,11 @@ def _build_single_axis_stacked_tensor(
     target_dtype = target_leaf.dtype if hasattr(target_leaf, "dtype") else np.float32
 
   if config.scan_layers:
-    # If it's a standard scanned layer, we use the configured param_scan_axis.
-    axis_to_stack = config.param_scan_axis
+    # If the target tensor rank exceeds param_scan_axis (e.g., multidimensional weights or 2D block scales),
+    # stack along param_scan_axis (typically axis 1 in scanned layers). For 1D tensors (e.g., per-layer scalar
+    # quantization scales like Llama 3.1 FP8 `kernel_scale` with shape (num_layers,)), stack along axis 0
+    # because axis 1 does not exist on 1D tensors and stacking scalars along axis 0 produces the 1D vector.
+    axis_to_stack = config.param_scan_axis if len(target_shape) > config.param_scan_axis else 0
   else:
     # Otherwise, if an unscanned MoE layer, and we stack along the expert axis (0).
     axis_to_stack = 0
@@ -207,13 +210,28 @@ def _build_single_axis_stacked_tensor(
 
 
 def get_hf_loading_function(hf_source_keys_or_key, tensor_getter, hook_fn, mt_target_leaf, config, mt_key=""):
-  """Determine the loading function for HF keys."""
+  """Returns a function that builds one MaxText weight from its HF tensors.
+
+  The function takes no arguments. If `mt_target_leaf` has a sharding, the weight is returned in the
+  leaf's dtype and sharding.
+
+  Args:
+    hf_source_keys_or_key: A single HF key, or a list of HF keys to stack, nested once per stacked
+      axis.
+    tensor_getter: A function that returns the HF tensor for a key.
+    hook_fn: A hook function, or a list of them, applied to each HF tensor. None means no hook.
+    mt_target_leaf: The target leaf, for example a `jax.ShapeDtypeStruct` with a sharding.
+    config: The MaxText config.
+    mt_key: The MaxText parameter key, used to place the axes of nested block scans.
+  """
   if not isinstance(hf_source_keys_or_key, list):
     # Case 1: Single hf key (str)
     def _loader(getter, key, leaf, hook):
       if hasattr(leaf, "sharding"):
         array = apply_hook_fns(getter(key), leaf.shape, hook)
-        return jax.device_put(array, device=leaf.sharding)
+        # Cast to the target dtype, as the stacked cases do. Otherwise a bf16 checkpoint stays bf16
+        # even when weight_dtype is float32.
+        return jax.device_put(array.astype(leaf.dtype), device=leaf.sharding)
       else:
         return apply_hook_fns(getter(key), leaf, hook)
 

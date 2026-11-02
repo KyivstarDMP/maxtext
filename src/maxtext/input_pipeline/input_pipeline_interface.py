@@ -48,7 +48,9 @@ def get_process_loading_real_data(
   return list(process_loading_real_data)
 
 
-def create_process_specific_iterator(config: pyconfig.HyperParameters, mesh, process_indices, input_iterator):
+def create_process_specific_iterator(
+    config: pyconfig.HyperParameters, mesh, process_indices, input_iterator, is_training: bool = True
+):
   """
   If the current process's index is among the `process_indices`, a real
   data iterator is created. Otherwise, a placeholder iterator is returned.
@@ -57,7 +59,7 @@ def create_process_specific_iterator(config: pyconfig.HyperParameters, mesh, pro
     iterator_fn = functools.partial(input_iterator, config, mesh, process_indices)
     output_iterator = iterator_fn()
   else:
-    output_iterator = PlaceHolderDataIterator(config, mesh)
+    output_iterator = PlaceHolderDataIterator(config, mesh, is_training=is_training)
   return output_iterator
 
 
@@ -257,9 +259,12 @@ def create_data_iterator(config: pyconfig.HyperParameters, mesh):
               mesh,
               process_indices_eval,
               functools.partial(eval_iterator, eval_files_override=glob, force_padding_batch=True),
+              is_training=False,
           )
           for name, glob in zip(names, globs)
       }
     else:
-      output_eval_iterator = create_process_specific_iterator(config, mesh, process_indices_eval, eval_iterator)
+      output_eval_iterator = create_process_specific_iterator(
+          config, mesh, process_indices_eval, eval_iterator, is_training=False
+      )
   return output_train_iterator, output_eval_iterator

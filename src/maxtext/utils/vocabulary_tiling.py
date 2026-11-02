@@ -16,8 +16,7 @@
 
 import functools
 
-from flax import linen as nn
-from flax import nnx
+from flax import linen as nn, nnx
 
 import jax
 import jax.numpy as jnp
@@ -362,7 +361,7 @@ def vocab_tiling_linen_loss(
 def vocab_tiling_nnx_loss(model, hidden_states, data, config, is_train, *, return_total_correct=False):
   """Computes cross-entropy loss with vocab tiling for NNX models.
 
-  NNX equivalent of `vocab_tiling_linen_loss`. A `custom_vjp` runs the loss in
+  A `custom_vjp` runs the loss in
   vocab chunks via `jax.lax.scan` so the backward only holds one chunk's logits
   at a time, matching the Linen path's memory profile. `nnx.split` separates the
   output-head params (which the loss differentiates) from everything else; the
@@ -435,7 +434,6 @@ def vocab_tiling_nnx_loss(model, hidden_states, data, config, is_train, *, retur
       maybe_shard_with_name,
       shard_mode=config.shard_mode,
       debug_sharding=config.debug_sharding,
-      extra_stack_level=1,
   )
 
   def _reshape(inputs, out_shape, out_sharding):
